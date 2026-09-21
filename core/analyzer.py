@@ -65,26 +65,25 @@ class Analyzer:
   live_dn=micro_trend<0 and tick_momentum<0 and tick_momentum_fast<=max(1.,atrp*.08)
   context_up=(not have) or context_trend>=-atrp*.20
   context_dn=(not have) or context_trend<=atrp*.20
-  dmi_up=(not have) or adx<18 or dp>=dm*.85
-  dmi_dn=(not have) or adx<18 or dm>=dp*.85
-
-  bull=live_up and context_up and dmi_up
-  bear=live_dn and context_dn and dmi_dn
+  # Scalping entry stays live-first: M5 is context only; ADX/DI never blocks an entry.
+  bull=live_up and context_up
+  bear=live_dn and context_dn
   break_up=live>structure_hi and tick_momentum_fast>0
   break_dn=live<structure_lo and tick_momentum_fast<0
 
   sig=None; reg=Regime.RANGE; decision='waiting_live_momentum'
   if bull or bear:
    side=Side.BUY if bull else Side.SELL
-   strong=abs(micro_trend)>=max(1.5,atrp*.12) and abs(tick_momentum)>=max(1.5,atrp*.10)
+   # Lightweight trigger: aligned live momentum is enough once micro direction is established.
+   strong=abs(micro_trend)>=max(1.0,atrp*.07) and abs(tick_momentum)>=max(1.0,atrp*.06)
    breakout=(side==Side.BUY and break_up) or (side==Side.SELL and break_dn)
-   if breakout or strong:
-    strategy='micro_breakout' if breakout else 'micro_trend'
+   acceleration=(side==Side.BUY and tick_momentum_fast>0) or (side==Side.SELL and tick_momentum_fast<0)
+   if breakout or strong or acceleration:
+    strategy='micro_breakout' if breakout else 'micro_momentum'
     reg=Regime.BREAKOUT if breakout else Regime.TREND
-    score=68+min(12,abs(micro_trend)/max(atrp,1)*20)+min(10,abs(tick_momentum)/max(atrp,1)*15)
-    if have: score+=min(6,max(0,adx-15)/5)
+    score=65+min(15,abs(micro_trend)/max(atrp,1)*24)+min(12,abs(tick_momentum)/max(atrp,1)*18)
     slp=max(10.,min(2.0*atrp,max(.65*atrp,tick_range*.35)))
-    sig=Signal(side,strategy,min(.92,score/100.),slp,'live tick momentum + micro trend + M5 context')
+    sig=Signal(side,strategy,min(.92,score/100.),slp,'live micro trend + tick momentum; M5 context only')
     decision=strategy
    else:
     reg=Regime.TREND; decision='trend_wait_acceleration'
