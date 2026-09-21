@@ -129,12 +129,6 @@ async def main():
   e.consecutive_losses=max(0,int(await db.get('consecutive_losses',0)))
  except (TypeError,ValueError):
   pass
- # تشغيل مستقبل TradingView داخل نفس عملية البوت
- from api_server import app as api_app, attach_engine
- import uvicorn
- attach_engine(e)
- api_server=uvicorn.Server(uvicorn.Config(api_app,host=settings.webhook_host,port=settings.webhook_port,log_level='warning'))
- api_task=asyncio.create_task(api_server.serve())
 
  ui=TelegramUI(e,db)
 
@@ -149,9 +143,6 @@ async def main():
   while True:
    await asyncio.sleep(3600)
  finally:
-  api_server.should_exit=True
-  try: await api_task
-  except Exception: pass
   await app.updater.stop()
   await app.stop()
   await app.shutdown()
