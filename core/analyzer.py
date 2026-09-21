@@ -71,24 +71,49 @@ class Analyzer:
   break_up=live>structure_hi and tick_momentum_fast>0
   break_dn=live<structure_lo and tick_momentum_fast<0
 
+  # Lightweight TradingView-inspired scalp setups:
+  # EMA-style continuation, momentum breakout, and fast mean reversion.
+  micro_gap=abs(micro_fast-micro_slow)/point
+  local_mean=float(np.mean(mid[-30:]))
+  local_std=max(float(np.std(mid[-30:])),point)
+  micro_z=(live-local_mean)/local_std
+  range_ok=(not have) or adx<25
+
   sig=None; reg=Regime.RANGE; decision='waiting_live_momentum'
-  if bull or bear:
+  # 1) Fast structure breakout: designed for immediate expansion, not long holds.
+  if (break_up and context_up) or (break_dn and context_dn):
+   side=Side.BUY if break_up else Side.SELL
+   reg=Regime.BREAKOUT
+   score=72+min(14,abs(tick_momentum)/max(atrp,1)*20)
+   slp=max(10.,min(1.8*atrp,max(.60*atrp,tick_range*.30)))
+   sig=Signal(side,'scalp_breakout',min(.92,score/100.),slp,'live structure break + tick momentum')
+   decision='scalp_breakout'
+
+  # 2) EMA/micro-trend continuation: simple trend-following scalp.
+  elif bull or bear:
    side=Side.BUY if bull else Side.SELL
-   # Lightweight trigger: aligned live momentum is enough once micro direction is established.
-   strong=abs(micro_trend)>=max(1.0,atrp*.07) and abs(tick_momentum)>=max(1.0,atrp*.06)
-   breakout=(side==Side.BUY and break_up) or (side==Side.SELL and break_dn)
+   strong=micro_gap>=max(1.0,atrp*.05) and abs(tick_momentum)>=max(1.0,atrp*.05)
    acceleration=(side==Side.BUY and tick_momentum_fast>0) or (side==Side.SELL and tick_momentum_fast<0)
-   if breakout or strong or acceleration:
-    strategy='micro_breakout' if breakout else 'micro_momentum'
+   if strong or acceleration:
+    strategy='scalp_trend'
     reg=Regime.BREAKOUT if breakout else Regime.TREND
     score=65+min(15,abs(micro_trend)/max(atrp,1)*24)+min(12,abs(tick_momentum)/max(atrp,1)*18)
     slp=max(10.,min(2.0*atrp,max(.65*atrp,tick_range*.35)))
-    sig=Signal(side,strategy,min(.92,score/100.),slp,'live micro trend + tick momentum; M5 context only')
+    sig=Signal(side,strategy,min(.92,score/100.),slp,'EMA-style micro trend + live momentum; M5 context only')
     decision=strategy
    else:
     reg=Regime.TREND; decision='trend_wait_acceleration'
+  # 3) Fast range mean reversion: only near a clear short-term statistical extreme.
+  elif range_ok and abs(micro_z)>=1.65 and abs(tick_momentum_fast)>=1.0:
+   side=Side.SELL if micro_z>0 and tick_momentum_fast<0 else (Side.BUY if micro_z<0 and tick_momentum_fast>0 else None)
+   if side:
+    reg=Regime.RANGE
+    score=67+min(14,(abs(micro_z)-1.65)*14)
+    slp=max(10.,min(1.6*atrp,max(.60*atrp,tick_range*.28)))
+    sig=Signal(side,'scalp_reversion',min(.88,score/100.),slp,'short-term extreme + live reversal')
+    decision='scalp_reversion'
   elif abs(micro_trend)>max(1.5,atrp*.10):
-   reg=Regime.TREND; decision='direction_not_confirmed'
+   reg=Regime.TREND; decision='waiting_momentum'
   elif tick_range>max(8.,atrp*.8):
    reg=Regime.VOLATILE; decision='volatile_no_direction'
 
@@ -98,5 +123,5 @@ class Analyzer:
    'tick_momentum':round(float(tick_momentum),2),'micro_trend':round(float(micro_trend),2),
    'atr_points':round(float(atrp),2),'adx':round(float(adx),1),
    'di_plus':round(float(dp),1),'di_minus':round(float(dm),1),
-   'context_trend':round(float(context_trend),2),'live':True
+   'context_trend':round(float(context_trend),2),'micro_z':round(float(micro_z),2),'live':True
   }
