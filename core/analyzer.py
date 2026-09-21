@@ -145,14 +145,17 @@ class Analyzer:
   # Priority 3: trend continuation. EMA is baseline; ALMA slope/band adds conviction without duplicating momentum.
   elif (bull or bear):
    side=Side.BUY if bull else Side.SELL
-   alma_ok=(side==Side.BUY and alma_slope>=.08 and price>upper) or (side==Side.SELL and alma_slope<=-.08 and price<lower)
+   alma_ok=(side==Side.BUY and alma_slope>=.08) or (side==Side.SELL and alma_slope<=-.08)
+   band_ok=(side==Side.BUY and price>upper) or (side==Side.SELL and price<lower)
    continuation=(side==Side.BUY and mom10>=-vol*.25) or (side==Side.SELL and mom10<=vol*.25)
    st_ok=(super_dir in (0,1)) if side==Side.BUY else (super_dir in (0,-1))
-   if continuation and st_ok and (alma_ok or abs(trend)>=max(1.5,vol*1.2)):
+   trend_strength=abs(trend)/max(vol,1.0)
+   conviction=alma_ok or band_ok or trend_strength>=.65
+   if continuation and st_ok and conviction:
     reg=Regime.TREND; score=72+min(8,abs(alma_slope)*20)+min(8,adx/10 if have_rates else 0)
     ref=swing_lo if side==Side.BUY else swing_hi
     slp=max(.75*atrp,min(3.0*atrp,abs(price-ref)/point)) if have_rates else max(10.,vol*2.8)
-    sig=Signal(side,'trend_pullback',min(.94,score/100),slp,'EMA trend + ALMA conviction + ADX/DI + structure stop')
+    sig=Signal(side,'trend_pullback',min(.94,score/100),slp,'confirmed trend + continuation + ALMA/band/strength conviction')
 
   # Priority 4: mean reversion only when trend strength is weak. No trend indicators are reused here.
   elif abs(z)>=1.8 and (not have_rates or adx<20) and vol<max(8.,float(np.median(np.abs(np.diff(c[-50:]))))/point*4):
