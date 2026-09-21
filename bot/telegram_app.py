@@ -63,11 +63,15 @@ class TelegramUI:
      i=self.e.gw.info(symbol)
      if not i: continue
      reg,sig,meta=self.e.an.analyze(self.e.gw.ticks(symbol),i.point,self.e.gw.rates_m5(symbol,200))
+     tick=self.e.gw.tick(symbol)
+     tick_age=max(0.0,__import__('time').time()-float(getattr(tick,'time_msc',0) or 0)/1000.0) if tick else 9999.0
+     price=float(getattr(tick,'bid',0) or 0) if tick else float(meta.get('price',0) or 0)
+     decision=str(meta.get('decision','-'))
      if sig:
       direction='شراء' if sig.side.value=='BUY' else 'بيع'
-      lines.append(f'{symbol}: {direction} | {sig.strategy} | {sig.confidence*100:.0f}%')
+      lines.append(f'{symbol}: {direction} | {sig.strategy} | {sig.confidence*100:.0f}% | {price:g} | tick {tick_age:.1f}s')
      else:
-      lines.append(f'{symbol}: لا توجد فرصة')
+      lines.append(f'{symbol}: {reg.value} | {decision} | {price:g} | tick {tick_age:.1f}s')
     msg='\n'.join(lines)
   elif x=='symbols':
    symbols=self.e.gw.available_symbols()
