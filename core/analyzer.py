@@ -61,10 +61,11 @@ class Analyzer:
   if not np.all(np.isfinite(mid[-120:])):
    return Regime.NO_TRADE,None,{'reason':'bad_data'}
 
-  current_spread=float(spread[-1])
-  normal_spread=max(float(np.median(spread[-60:])),.01)
-  spread_ratio=current_spread/normal_spread
-  if spread_ratio>1.8:return Regime.NO_TRADE,None,{'reason':'spread_spike'}
+  valid_spreads=spread[-60:][np.isfinite(spread[-60:]) & (spread[-60:]>0)]
+  current_spread=float(spread[-1]) if np.isfinite(spread[-1]) and spread[-1]>0 else (float(valid_spreads[-1]) if len(valid_spreads) else 0.0)
+  normal_spread=float(np.median(valid_spreads)) if len(valid_spreads) else 0.0
+  spread_ratio=(current_spread/normal_spread) if normal_spread>0 else 1.0
+  if current_spread>0 and spread_ratio>1.8:return Regime.NO_TRADE,None,{'reason':'spread_spike','spread_points':round(current_spread,2),'spread_ratio':round(spread_ratio,2)}
 
   # Candle indicators use CLOSED M5 bars only. Tick logic remains as a fast confirmation layer.
   have_rates=rates is not None and len(rates)>=80
@@ -118,6 +119,7 @@ class Analyzer:
   price=float(c[-1]); vol=atrp
   bull=trend>0 and mom30>0 and (not have_rates or (di_plus>di_minus and adx>=20))
   bear=trend<0 and mom30<0 and (not have_rates or (di_minus>di_plus and adx>=20))
+  direction_reason='bull_confirmed' if bull else ('bear_confirmed' if bear else ('trend_momentum_conflict' if trend*mom30<=0 else ('dmi_conflict' if have_rates and ((trend>0 and di_plus<=di_minus) or (trend<0 and di_minus<=di_plus)) else ('weak_adx' if have_rates and adx<20 else 'no_setup'))))
   structure_up=price>swing_hi; structure_dn=price<swing_lo
   breakout_up=price>base_hi; breakout_dn=price<base_lo
 
@@ -166,9 +168,10 @@ class Analyzer:
   meta={
    'atr_points':round(atrp,2),'trend_points':round(float(trend),2),
    'momentum10':round(float(mom10),2),'momentum30':round(float(mom30),2),
-   'spread_ratio':round(spread_ratio,2),'zscore':round(float(z),2),
+   'spread_points':round(current_spread,2),'spread_ratio':round(spread_ratio,2),'zscore':round(float(z),2),
    'adx':round(float(adx),1),'di_plus':round(float(di_plus),1),'di_minus':round(float(di_minus),1),
    'alma_slope_atr':round(float(alma_slope),3),'squeeze':bool(squeeze_on),
-   'structure_up':bool(structure_up),'structure_down':bool(structure_dn),'score':round(float(score),1)
+   'structure_up':bool(structure_up),'structure_down':bool(structure_dn),'score':round(float(score),1),
+   'decision':(sig.strategy if sig else direction_reason)
   }
   return reg,sig,meta
