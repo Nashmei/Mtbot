@@ -501,6 +501,18 @@ class Engine:
 
  async def manage(self,t,tick,info):
   price=tick.bid if t.side==Side.BUY else tick.ask
+  # Scalping hard cap: no bot position may remain open beyond 10 minutes.
+  age=time.time()-t.opened_at
+  if age>=600:
+   pos=self.gw.position_by_ticket(t.ticket)
+   if pos:
+    res=self.gw.close(pos)
+    if res and res.retcode in (mt5.TRADE_RETCODE_DONE,mt5.TRADE_RETCODE_DONE_PARTIAL):
+     await self.db.log('MAX_DURATION_EXIT',t.symbol,ticket=t.ticket,age_seconds=age)
+     await self.notify(f'⏱ إغلاق حد 10 دقائق — {t.symbol}')
+     return
+    await self.db.log('MAX_DURATION_EXIT_FAILED',t.symbol,ticket=t.ticket,result=str(res))
+
   favorable=(price-t.entry) if t.side==Side.BUY else (t.entry-price)
   r=favorable/t.initial_r
   age=time.time()-t.opened_at
