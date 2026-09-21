@@ -94,8 +94,11 @@ class Analyzer:
    bb_up=bb_mid+2*bb_std; bb_dn=bb_mid-2*bb_std
    kc_up=bb_mid+1.5*atr; kc_dn=bb_mid-1.5*atr
    squeeze_on=(bb_up<kc_up and bb_dn>kc_dn)
+   prev_atr=float(atrs[-2]) if len(atrs)>1 and np.isfinite(atrs[-2]) else atr
    prev_std=float(np.std(c[-21:-1])); prev_mid=float(np.mean(c[-21:-1]))
-   squeeze_prev=(prev_mid+2*prev_std < prev_mid+1.5*atr and prev_mid-2*prev_std > prev_mid-1.5*atr)
+   prev_bb_up=prev_mid+2*prev_std; prev_bb_dn=prev_mid-2*prev_std
+   prev_kc_up=prev_mid+1.5*prev_atr; prev_kc_dn=prev_mid-1.5*prev_atr
+   squeeze_prev=(prev_bb_up<prev_kc_up and prev_bb_dn>prev_kc_dn)
    squeeze_release=squeeze_prev and not squeeze_on
 
    mom10=(c[-1]-c[-11])/point; mom30=(c[-1]-c[-31])/point
