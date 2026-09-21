@@ -96,7 +96,7 @@ class Analyzer:
    acceleration=(side==Side.BUY and tick_momentum_fast>0) or (side==Side.SELL and tick_momentum_fast<0)
    if strong or acceleration:
     strategy='scalp_trend'
-    reg=Regime.BREAKOUT if breakout else Regime.TREND
+    reg=Regime.TREND
     score=65+min(15,abs(micro_trend)/max(atrp,1)*24)+min(12,abs(tick_momentum)/max(atrp,1)*18)
     slp=max(10.,min(2.0*atrp,max(.65*atrp,tick_range*.35)))
     sig=Signal(side,strategy,min(.92,score/100.),slp,'EMA-style micro trend + live momentum; M5 context only')
