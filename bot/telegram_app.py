@@ -7,7 +7,7 @@ class TelegramUI:
  def allowed(self,u): return bool(u and u.id==settings.telegram_allowed_user_id)
  async def _edit(self,q,text,reply_markup=None):
   try:
-   await self._edit(q,text,reply_markup=reply_markup)
+   await q.edit_message_text(text,reply_markup=reply_markup)
   except (BadRequest,RetryAfter):
    return
  def kb(self):
