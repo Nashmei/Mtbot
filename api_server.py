@@ -2,6 +2,7 @@ import json
 import secrets
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
+import time
 from core.config import settings
 
 app = FastAPI(title="MT5 Bot API", docs_url=None, redoc_url=None)
@@ -21,6 +22,13 @@ def auth(authorization: str | None):
     if not secrets.compare_digest(supplied, expected):
         raise HTTPException(401, "Unauthorized")
 
+class TradingViewSignal(BaseModel):
+    secret: str
+    id: str
+    symbol: str
+    side: str
+    timestamp: float
+
 class BotSettings(BaseModel):
     symbols: list[str]
     risk_pct: float = Field(ge=0.25, le=50)
@@ -29,6 +37,28 @@ class BotSettings(BaseModel):
     max_positions: int = Field(ge=1, le=50)
     max_consecutive_losses: int = Field(ge=0, le=50)
     confidence_score: float = Field(default=75, ge=0, le=100)
+
+
+@app.post("/webhook/tradingview")
+async def tradingview(data: TradingViewSignal):
+    if engine is None:
+        raise HTTPException(503, "Engine unavailable")
+    expected=settings.tradingview_webhook_secret
+    if not expected:
+        raise HTTPException(503, "TradingView secret not configured")
+    if not secrets.compare_digest(data.secret,expected):
+        raise HTTPException(401, "Unauthorized")
+    if not engine.running:
+        raise HTTPException(409, "Bot is stopped")
+    account=engine.gw.account()
+    import MetaTrader5 as mt5
+    if not account or account.trade_mode!=mt5.ACCOUNT_TRADE_MODE_DEMO:
+        raise HTTPException(403, "DEMO account required")
+    ok,reason=await engine.enqueue_tradingview_signal(data.id,data.symbol,data.side,data.timestamp)
+    if not ok:
+        code=409 if reason=="duplicate" else 400
+        raise HTTPException(code,reason)
+    return {"ok":True,"status":"queued","id":data.id}
 
 @app.get("/health")
 async def health():
