@@ -3,12 +3,6 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 BASE_DIR = Path(__file__).resolve().parents[1]
 class Settings(BaseSettings):
     telegram_bot_token:str; telegram_allowed_user_id:int
-    app_api_token:str=''
-    tradingview_webhook_secret:str=''
-    tradingview_signal_max_age_seconds:int=120
-    signal_source:str='TRADINGVIEW'
-    webhook_host:str='0.0.0.0'
-    webhook_port:int=8000
     mt5_login:int|None=None; mt5_password:str=''; mt5_server:str=''; mt5_terminal_path:str|None=None
     app_mode:str='DEMO'; live_unlock_phrase:str='ENABLE LIVE'; default_symbol:str='EURUSD'
     risk_per_trade_pct:float=.25; daily_loss_limit_pct:float=2.; max_consecutive_losses:int=3; cooldown_after_losses_min:int=30
