@@ -277,7 +277,7 @@ class Engine:
    reg=Regime.NO_TRADE
    meta={'source':'tradingview','signal_id':match['id']}
   else:
-   reg,sig,meta=self.an.analyze(self.gw.ticks(symbol),info.point)
+   reg,sig,meta=self.an.analyze(self.gw.ticks(symbol),info.point,self.gw.rates_m5(symbol,200))
    if not sig:return
   confidence_score=float(sig.confidence)*100.0
 
