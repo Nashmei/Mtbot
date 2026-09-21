@@ -1,9 +1,15 @@
 from telegram import Update,InlineKeyboardButton,InlineKeyboardMarkup
 from telegram.ext import Application,CommandHandler,CallbackQueryHandler,MessageHandler,ContextTypes,filters
+from telegram.error import BadRequest,RetryAfter
 from core.config import settings
 class TelegramUI:
  def __init__(self,engine,db): self.e=engine;self.db=db;self.login_state={};self.input_state={};self.message_ids=set()
  def allowed(self,u): return bool(u and u.id==settings.telegram_allowed_user_id)
+ async def _edit(self,q,text,reply_markup=None):
+  try:
+   await self._edit(q,text,reply_markup=reply_markup)
+  except (BadRequest,RetryAfter):
+   return
  def kb(self):
   return InlineKeyboardMarkup([
    [InlineKeyboardButton('📊 الحالة',callback_data='status'),InlineKeyboardButton('🔎 تحليل الآن',callback_data='analyze')],
@@ -56,7 +62,7 @@ class TelegramUI:
     for symbol in self.e.symbols:
      i=self.e.gw.info(symbol)
      if not i: continue
-     reg,sig,meta=self.e.an.analyze(self.e.gw.ticks(symbol),i.point)
+     reg,sig,meta=self.e.an.analyze(self.e.gw.ticks(symbol),i.point,self.e.gw.rates_m5(symbol,200))
      if sig:
       direction='شراء' if sig.side.value=='BUY' else 'بيع'
       lines.append(f'{symbol}: {direction} | {sig.strategy} | {sig.confidence*100:.0f}%')
@@ -80,7 +86,7 @@ class TelegramUI:
     icon='🥇' if 'XAU' in n.upper() else '💵'
     rows.append([InlineKeyboardButton(f'{"☑️" if n in self.e.symbols else "⬜"} {n} • {pts:.1f} pts',callback_data=f'sym:{n}')])
    rows.append([InlineKeyboardButton('↩️ القائمة الرئيسية',callback_data='status')])
-   await q.edit_message_text('💱 الرموز المتاحة من MT5:',reply_markup=InlineKeyboardMarkup(rows))
+   await self._edit(q,'💱 الرموز المتاحة من MT5:',reply_markup=InlineKeyboardMarkup(rows))
    return
   elif x=='active':
    import time
@@ -110,7 +116,7 @@ class TelegramUI:
    rows.append([InlineKeyboardButton('↩️ الرموز',callback_data='symbols')])
    text='🔥 الأنشط الآن\nالترتيب حسب حركة السعر الأخيرة ÷ السبريد.\nهذا مقياس للنشاط فقط وليس توقعاً للربحية.'
    if not ranked: text='⚠️ لا توجد بيانات لحظية كافية حالياً.'
-   await q.edit_message_text(text,reply_markup=InlineKeyboardMarkup(rows))
+   await self._edit(q,text,reply_markup=InlineKeyboardMarkup(rows))
    return
   elif x.startswith('sym:'):
    symbol=x.split(':',1)[1]
@@ -122,7 +128,7 @@ class TelegramUI:
    import json
    await self.db.set('symbols',json.dumps(self.e.symbols))
    msg=f'✅ الأزواج المختارة: {", ".join(self.e.symbols) if self.e.symbols else "لا يوجد"}'
-   await q.edit_message_text(msg,reply_markup=self.kb())
+   await self._edit(q,msg,reply_markup=self.kb())
    return
    
   elif x=='risk':
@@ -145,7 +151,7 @@ class TelegramUI:
    msg='⚖️ أرسل الرقم فقط\nمثال: 3 يعني 1:3\nالمسموح: 0.5 إلى 10'
   elif x=='live': msg='🔒 التداول الحقيقي مقفل في نسخة الأمان الحالية.'
   else: msg='⚠️ هذا الزر غير مفعّل بعد.'
-  await q.edit_message_text(msg,reply_markup=self.kb())
+  await self._edit(q,msg,reply_markup=self.kb())
  async def cancel(self,u,c):
   if not self.allowed(u.effective_user): return
   from pathlib import Path
