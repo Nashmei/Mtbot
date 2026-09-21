@@ -1,7 +1,7 @@
 import asyncio,time
 import MetaTrader5 as mt5
 from .config import settings
-from .models import TradeState,Side,Signal,Regime
+from .models import TradeState,Side
 from .analyzer import Analyzer
 from .risk import Risk
 class Engine:
@@ -37,30 +37,9 @@ class Engine:
   self.last_analysis_key=None
   self.an=Analyzer()
   self.risk=Risk()
-  self.external_signals=[]
-  self.seen_signal_ids=set()
 
   # الإعدادات المحفوظة تُحمّل لاحقاً داخل سياق async
 
- async def enqueue_tradingview_signal(self,signal_id,symbol,side,signal_time):
-  signal_id=str(signal_id).strip()
-  symbol=str(symbol).strip().upper()
-  side=str(side).strip().upper()
-  if not signal_id or signal_id in self.seen_signal_ids:
-   return False,'duplicate'
-  if side not in ('BUY','SELL'):
-   return False,'bad_side'
-  if symbol not in [str(x).upper() for x in self.symbols]:
-   return False,'symbol_not_selected'
-  now=time.time()
-  if abs(now-float(signal_time))>float(settings.tradingview_signal_max_age_seconds):
-   return False,'stale'
-  self.seen_signal_ids.add(signal_id)
-  if len(self.seen_signal_ids)>2000:
-   self.seen_signal_ids=set(list(self.seen_signal_ids)[-1000:])
-  self.external_signals.append({'id':signal_id,'symbol':symbol,'side':side,'time':float(signal_time)})
-  await self.db.log('TRADINGVIEW_SIGNAL',symbol,signal_id=signal_id,side=side)
-  return True,'queued'
 
  async def load_settings(self):
   try:
@@ -261,24 +240,8 @@ class Engine:
   ok,sp,avg,lim=self.risk.spread_ok(tick,info)
   if not ok:return
 
-  if str(settings.signal_source).upper()=='TRADINGVIEW':
-   match=None
-   for x in list(self.external_signals):
-    if x['symbol']==symbol:
-     match=x; self.external_signals.remove(x); break
-   if not match:return
-   ticks=self.gw.ticks(symbol)
-   if ticks is None or len(ticks)<30:return
-   import numpy as np
-   bids=np.asarray(ticks['bid'][-60:],dtype=float)
-   moves=np.diff(bids)/float(info.point)
-   vol=max(float(np.std(moves)),1.0)
-   sig=Signal(Side.BUY if match['side']=='BUY' else Side.SELL,'tradingview',1.0,max(float(settings.min_sl_points),vol*3.0),'TradingView confirmed signal')
-   reg=Regime.NO_TRADE
-   meta={'source':'tradingview','signal_id':match['id']}
-  else:
-   reg,sig,meta=self.an.analyze(self.gw.ticks(symbol),info.point,self.gw.rates_m5(symbol,200))
-   if not sig:return
+  reg,sig,meta=self.an.analyze(self.gw.ticks(symbol),info.point,self.gw.rates_m5(symbol,200))
+  if not sig:return
   confidence_score=float(sig.confidence)*100.0
 
   last=self.last_entry_by_symbol.get(symbol,0)
