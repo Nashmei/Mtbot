@@ -251,15 +251,15 @@ class Engine:
 
   reg,sig,meta=self.an.analyze(self.gw.ticks(symbol),info.point,self.gw.rates_m5(symbol,200),symbol=symbol,rates_m15=self.gw.rates_m15(symbol,200))
   if not sig:
-   return
+    return
   confidence_score=float(sig.confidence)*100.0
   # Telegram confidence setting is a real hard entry filter.
   if confidence_score < self.min_confidence:
-   await self.db.log('CONFIDENCE_REJECT',symbol,strategy=sig.strategy,confidence=confidence_score,min_confidence=self.min_confidence)
-   return
+    await self.db.log('CONFIDENCE_REJECT',symbol,strategy=sig.strategy,confidence=confidence_score,min_confidence=self.min_confidence)
+    return
   if symbol in usd_group and any(t.symbol in usd_group and t.side==sig.side for t in self.trades.values()):
-   await self.db.log('CORRELATION_REJECT',symbol,side=sig.side.value,strategy=sig.strategy)
-   return
+    await self.db.log('CORRELATION_REJECT',symbol,side=sig.side.value,strategy=sig.strategy)
+    return
 
   # بعد الإغلاق: مهلة قصيرة، ثم يجب أن تتجدد الإشارة قبل تكرار نفس الاستراتيجية/الاتجاه.
   signal_key=(sig.strategy,sig.side.value)
@@ -341,11 +341,11 @@ class Engine:
   if margin_1lot is not None and margin_1lot>0:
   margin_capacity=(float(account.margin_free)*0.80)/float(margin_1lot)
   if margin_capacity < vmin:
-   await self.notify(
-    f'⛔ لم تنفذ {symbol}\n'
-    f'المارجن لا يسمح حتى بأقل لوت {vmin:g}'
-   )
-   return
+    await self.notify(
+     f'⛔ لم تنفذ {symbol}\n'
+     f'المارجن لا يسمح حتى بأقل لوت {vmin:g}'
+    )
+    return
   msteps=math.floor((margin_capacity-vmin)/vstep+1e-9)
   margin_vol=vmin+max(0,msteps)*vstep
   vol=min(vol,margin_vol,vmax)
@@ -407,17 +407,17 @@ class Engine:
   await asyncio.sleep(.1)
   pos=self.gw.find_new_bot_position(symbol,before)
   if pos:
-   break
+    break
 
   if not pos:
   await self.db.log('POSITION_LINK_FAILED',symbol,result=str(res))
   try:
-   await self.notify(
-    f'🚨 نُفذت صفقة {symbol} لكن تعذر ربطها آلياً. '
-    f'لن يتم فتح صفقة جديدة على الرمز حتى الفحص.'
-   )
-  except Exception:
-   pass
+    await self.notify(
+     f'🚨 نُفذت صفقة {symbol} لكن تعذر ربطها آلياً. '
+     f'لن يتم فتح صفقة جديدة على الرمز حتى الفحص.'
+    )
+   except Exception:
+    pass
   return
 
   # نعتمد القيم الفعلية التي سجلها MT5 بعد التنفيذ
