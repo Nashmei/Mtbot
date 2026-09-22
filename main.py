@@ -48,6 +48,11 @@ async def main():
     if pin:
      try:
       await app.bot.pin_chat_message(chat_id=chat_id,message_id=msg.message_id,disable_notification=True)
+     except RetryAfter as ex:
+      blocked_until['until']=time.monotonic()+float(ex.retry_after)+5
+      print(f'Telegram pin paused due to flood control: {ex.retry_after}')
+     except BadRequest as ex:
+      print('Telegram pin failed:',ex)
      except Exception as ex:
       print('Telegram pin failed:',ex)
     try:
@@ -68,7 +73,12 @@ async def main():
     state['last_edit']=now
     return
 
-   await app.bot.send_message(chat_id=chat_id,text=text)
+   msg=await app.bot.send_message(chat_id=chat_id,text=text)
+   async def expire():
+    await asyncio.sleep(30)
+    try: await app.bot.delete_message(chat_id=chat_id,message_id=msg.message_id)
+    except Exception: pass
+   asyncio.create_task(expire())
   except RetryAfter as ex:
    wait=float(ex.retry_after)
    blocked_until['until']=time.monotonic()+wait+5
