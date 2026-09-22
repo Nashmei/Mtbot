@@ -43,6 +43,7 @@ class Engine:
   self.risk=Risk()
   self.reject_log_at={}
   self.reject_log_interval=60.0
+  self.trade_alert_meta={}
 
   # الإعدادات المحفوظة تُحمّل لاحقاً داخل سياق async
 
@@ -463,6 +464,7 @@ class Engine:
    tp=actual_tp
    vol=float(pos.volume or vol)
    self.trades[pos.ticket]=t
+   self.trade_alert_meta[pos.ticket]={'risk_cash':actual_risk,'risk_pct':actual_risk_pct}
    # A successful trade resets this symbol to the normal spread baseline.
    self.risk.reset_spread_relaxation(symbol)
 
@@ -473,20 +475,36 @@ class Engine:
   info=self.gw.info(t.symbol)
   digits=int(getattr(info,'digits',5) or 5)
   side='شراء 🟢' if t.side==Side.BUY else 'بيع 🔴'
+  meta=self.trade_alert_meta.get(t.ticket,{})
+  risk_cash=float(meta.get('risk_cash',0) or 0)
+  risk_pct=float(meta.get('risk_pct',self.risk_pct) or self.risk_pct)
+
   if closed:
-   result=f'🟢 ربح +${pnl:.2f}' if pnl is not None and pnl>=0 else f'🔴 خسارة ${pnl:.2f}' if pnl is not None else '⚪ مغلقة'
-   live_line=f'🏁 النتيجة: {result}'
+   if pnl is None:
+    live_line='🏁 النتيجة: مغلقة'
+   elif pnl>=0:
+    live_line=f'🏁 النتيجة: +${pnl:.2f} 🟢'
+   else:
+    live_line=f'🏁 النتيجة: ${pnl:.2f} 🔴'
   else:
-   live_line=f'💹 السعر الآن: {current_price:.{digits}f}' if current_price is not None else '💹 السعر الآن: جاري التحديث'
+   pos=self.gw.position_by_ticket(t.ticket)
+   live_pnl=float(getattr(pos,'profit',0) or 0) if pos else 0.0
+   pnl_icon='🟢' if live_pnl>=0 else '🔴'
+   pnl_sign='+' if live_pnl>0 else ''
+   price_text=f'{current_price:.{digits}f}' if current_price is not None else 'جاري التحديث'
+   live_line=f'💹 السعر الآن: {price_text} ({pnl_sign}${live_pnl:.2f} {pnl_icon})'
+
   return (
    f'📊 {t.symbol} — {side}\n'
-   f'🧠 الاستراتيجية: {t.strategy} | 🎯 الثقة: {t.confidence*100:.0f}%\n'
-   f'🔎 السبب: {t.reason or "غير متاح"}\n'
-   f'🎫 الصفقة: {t.ticket} | 📦 اللوت: {t.volume:g}\n'
+   f'🧠 الاستراتيجية: {t.strategy}\n'
+   f'🎯 الثقة: {t.confidence*100:.0f}%\n'
+   f'🎫 الصفقة: {t.ticket}\n'
+   f'📦 اللوت: {t.volume:g}\n'
+   f'⚠️ المخاطرة: {risk_pct:.2f}% (${risk_cash:.2f})\n'
    f'➡️ الدخول: {t.entry:.{digits}f}\n'
-   f'{live_line}\n'
    f'🛑 الوقف: {t.sl:.{digits}f}\n'
    f'💰 الهدف: {t.tp:.{digits}f}\n'
+   f'{live_line}\n'
    f'🛡 الحماية: {t.protection_pct:g}% | ⚖️ R:R 1:{self.rr:g}'
   )
 
@@ -528,9 +546,14 @@ class Engine:
    ax.axhline(protection,color='#f59e0b',linewidth=1.2,linestyle=':',label=f'PROTECTION {t.protection_pct:g}%')
 
    side='BUY' if t.side==Side.BUY else 'SELL'
-   # Put the entry marker on the real M5 candle containing the execution time.
-   opened=datetime.fromtimestamp(t.opened_at)
-   entry_idx=min(range(len(xs)),key=lambda i:abs((xs[i]-opened).total_seconds()))
+   # MT5 rates and position time are Unix timestamps. Use the broker position
+   # timestamp directly so the marker is not affected by the Linux timezone.
+   pos=self.gw.position_by_ticket(t.ticket)
+   mt5_open_ts=int(getattr(pos,'time',0) or 0) if pos else 0
+   if not mt5_open_ts:
+    mt5_open_ts=int(t.opened_at)
+   rate_ts=[int(r['time']) for r in rates]
+   entry_idx=min(range(len(rate_ts)),key=lambda i:abs(rate_ts[i]-mt5_open_ts))
    entry_x=xnum[entry_idx]
    marker='^' if side=='BUY' else 'v'
    ax.scatter([entry_x],[t.entry],marker=marker,s=150,color='#111827',zorder=6)
@@ -688,6 +711,7 @@ class Engine:
    self.last_close_by_symbol[t.symbol]=time.time()
    self.blocked_signal_by_symbol[t.symbol]=(t.strategy,t.side.value)
    self.trades.pop(t.ticket,None)
+   self.trade_alert_meta.pop(t.ticket,None)
    return
 
   # تحديث نفس رسالة صورة الصفقة بالسعر والوقف الحاليين.
