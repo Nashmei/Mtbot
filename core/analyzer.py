@@ -60,7 +60,14 @@ class Analyzer:
    adx,dp,dm=self._dmi(h,l,c)
    structure_hi=float(np.max(h[-20:])); structure_lo=float(np.min(l[-20:]))
 
-  # M15 higher-timeframe bias for trend continuation.\n  m15_bias=0\n  if rates_m15 is not None and len(rates_m15)>=55:\n   c15=np.asarray(rates_m15['close'],float)\n   ema50_15=self._ema(c15[-55:],50)\n   m15_bias=1 if c15[-1]>ema50_15 else (-1 if c15[-1]<ema50_15 else 0)\n\n  # Closed M5 is context only. Entry direction is driven by live MT5 ticks.
+  # M15 higher-timeframe bias for trend continuation.
+  m15_bias=0
+  if rates_m15 is not None and len(rates_m15)>=55:
+   c15=np.asarray(rates_m15['close'],float)
+   ema50_15=self._ema(c15[-55:],50)
+   m15_bias=1 if c15[-1]>ema50_15 else (-1 if c15[-1]<ema50_15 else 0)
+
+  # Closed M5 is context only. Entry direction is driven by live MT5 ticks.
   live_up=micro_trend>0 and tick_momentum>0 and tick_momentum_fast>=-max(1.,atrp*.08)
   live_dn=micro_trend<0 and tick_momentum<0 and tick_momentum_fast<=max(1.,atrp*.08)
   context_up=(not have) or context_trend>=-atrp*.20
