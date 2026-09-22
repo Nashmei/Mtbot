@@ -20,7 +20,7 @@ class Engine:
   self.protection_pct=45.0
   self.trailing_gap_pct=5.0
   self.max_trade_minutes=10.0
-  self.reentry_cooldown_seconds=30.0
+  self.reentry_cooldown_seconds=120.0
   self.last_close_by_symbol={}
   self.blocked_signal_by_symbol={}
   self.max_positions=1
@@ -248,7 +248,6 @@ class Engine:
 
   reg,sig,meta=self.an.analyze(self.gw.ticks(symbol),info.point,self.gw.rates_m5(symbol,200))
   if not sig:
-   self.blocked_signal_by_symbol.pop(symbol,None)
    return
   confidence_score=float(sig.confidence)*100.0
 
