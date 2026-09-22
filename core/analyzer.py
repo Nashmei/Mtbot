@@ -30,7 +30,7 @@ class Analyzer:
    dx.append(100*abs(pp-mm)/max(pp+mm,1e-12))
   return (float(np.mean(dx[-n:])) if dx else 0.),p,m
 
- def analyze(self,ticks,point,rates=None):
+ def analyze(self,ticks,point,rates=None,symbol=None):
   if ticks is None or len(ticks)<80 or point<=0:
    return Regime.NO_TRADE,None,{'decision':'insufficient_ticks'}
 
@@ -80,6 +80,36 @@ class Analyzer:
   range_ok=(not have) or adx<25
 
   sig=None; reg=Regime.RANGE; decision='waiting_live_momentum'
+
+  # XAUUSD gets its own live-first setup. Gold is noisier than FX, so require
+  # stronger micro momentum plus either a real structure break or clear expansion.
+  is_gold=str(symbol or '').upper().startswith('XAUUSD')
+  if is_gold:
+   gold_up=micro_trend>0 and tick_momentum>0 and tick_momentum_fast>0 and context_up
+   gold_dn=micro_trend<0 and tick_momentum<0 and tick_momentum_fast<0 and context_dn
+   gold_gap=micro_gap>=max(2.0,atrp*.10)
+   gold_momentum=abs(tick_momentum)>=max(2.0,atrp*.10)
+   gold_fast=abs(tick_momentum_fast)>=max(1.5,atrp*.05)
+   gold_break=(break_up and gold_up) or (break_dn and gold_dn)
+   gold_expand=(gold_up or gold_dn) and gold_gap and gold_momentum and gold_fast and tick_range>=max(6.0,atrp*.45)
+   if gold_break or gold_expand:
+    side=Side.BUY if gold_up else Side.SELL
+    reg=Regime.BREAKOUT if gold_break else Regime.TREND
+    score=74+min(12,abs(tick_momentum)/max(atrp,1)*18)+min(8,micro_gap/max(atrp,1)*12)
+    slp=max(12.,min(1.8*atrp,max(.70*atrp,tick_range*.32)))
+    sig=Signal(side,'gold_scalp',min(.92,score/100.),slp,'XAUUSD strong live momentum + structure/expansion; M5 context only')
+    decision='gold_scalp'
+   else:
+    reg=Regime.VOLATILE if tick_range>max(8.,atrp*.8) else (Regime.TREND if abs(micro_trend)>max(1.5,atrp*.10) else Regime.RANGE)
+    decision='gold_wait_strong_setup'
+   return reg,sig,{
+    'decision':decision,'price':round(live,8),'spread_points':round(spread,1),
+    'spread_ratio':round(spread_ratio,2),'tick_momentum_fast':round(float(tick_momentum_fast),2),
+    'tick_momentum':round(float(tick_momentum),2),'micro_trend':round(float(micro_trend),2),
+    'atr_points':round(float(atrp),2),'adx':round(float(adx),1),
+    'di_plus':round(float(dp),1),'di_minus':round(float(dm),1),
+    'context_trend':round(float(context_trend),2),'micro_z':round(float(micro_z),2),'live':True
+   }
   # 1) Fast structure breakout: designed for immediate expansion, not long holds.
   if (break_up and context_up) or (break_dn and context_dn):
    side=Side.BUY if break_up else Side.SELL
