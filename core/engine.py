@@ -210,261 +210,261 @@ class Engine:
    except Exception as e: await self.db.log('ENGINE_ERROR',self.symbol,error=str(e))
    await asyncio.sleep(settings.poll_interval_ms/1000)
  async def step(self):
-   account=self.gw.account()
-   if not account or account.trade_mode!=mt5.ACCOUNT_TRADE_MODE_DEMO:
+  account=self.gw.account()
+  if not account or account.trade_mode!=mt5.ACCOUNT_TRADE_MODE_DEMO:
    self.running=False; await self.notify('🔒 الحساب التجريبي فقط.'); return
 
-   # إدارة كل الصفقات المفتوحة أولاً
-   for t in list(self.trades.values()):
+  # إدارة كل الصفقات المفتوحة أولاً
+  for t in list(self.trades.values()):
    info=self.gw.info(t.symbol); tick=self.gw.tick(t.symbol)
    if info and tick: await self.manage(t,tick,info)
 
-   # تحديث لوحة الصفقات المجمعة
-   if self.trades:
+  # تحديث لوحة الصفقات المجمعة
+  if self.trades:
    await self.live_dashboard()
 
-   # لا دخول جديد عند بلوغ الحدود
-   if len(self.trades)>=self.max_positions:return
-   if self.max_consecutive_losses > 0 and self.consecutive_losses>=self.max_consecutive_losses:
+  # لا دخول جديد عند بلوغ الحدود
+  if len(self.trades)>=self.max_positions:return
+  if self.max_consecutive_losses > 0 and self.consecutive_losses>=self.max_consecutive_losses:
    if not self.loss_limit_notified:
     self.loss_limit_notified=True
     await self.notify(f'🛑 توقف الدخول: {self.consecutive_losses} خسائر متتالية.')
    return
-   self.loss_limit_notified=False
-   if not self.symbols:return
+  self.loss_limit_notified=False
+  if not self.symbols:return
 
-   # فحص كل الرموز المختارة في كل دورة
-   for symbol in list(self.symbols):
+  # فحص كل الرموز المختارة في كل دورة
+  for symbol in list(self.symbols):
    if len(self.trades)>=self.max_positions: break
    await self._scan_symbol(symbol,account)
 
  async def _scan_symbol(self,symbol,account):
-   # صفقة واحدة كحد أقصى لكل رمز
-   if any(t.symbol==symbol for t in self.trades.values()):return
-   # Avoid stacking the same USD directional exposure across correlated FX pairs.
-   usd_group={'EURUSD','GBPUSD','AUDUSD','NZDUSD'}
-   if symbol in usd_group:
-   for t in self.trades.values():
-    if t.symbol in usd_group and t.side is not None:
-     # These symbols all quote USD, so the same BUY/SELL direction stacks USD exposure.
-     # Direction is checked again after a signal exists below.
-     pass
-
-
-   info=self.gw.info(symbol); tick=self.gw.tick(symbol)
-   if not info or not tick or not info.point or tick.bid<=0 or tick.ask<=tick.bid:return
-
-   ok,sp,avg,lim=self.risk.spread_ok(tick,info)
-   if not ok:return
-
-   reg,sig,meta=self.an.analyze(self.gw.ticks(symbol),info.point,self.gw.rates_m5(symbol,200),symbol=symbol,rates_m15=self.gw.rates_m15(symbol,200))
-   if not sig:
-   return
-   confidence_score=float(sig.confidence)*100.0
-   # Telegram confidence setting is a real hard entry filter.
-   if confidence_score < self.min_confidence:
-   await self.db.log('CONFIDENCE_REJECT',symbol,strategy=sig.strategy,confidence=confidence_score,min_confidence=self.min_confidence)
-   return
-   if symbol in usd_group and any(t.symbol in usd_group and t.side==sig.side for t in self.trades.values()):
-   await self.db.log('CORRELATION_REJECT',symbol,side=sig.side.value,strategy=sig.strategy)
-   return
-
-   # بعد الإغلاق: مهلة قصيرة، ثم يجب أن تتجدد الإشارة قبل تكرار نفس الاستراتيجية/الاتجاه.
-   signal_key=(sig.strategy,sig.side.value)
-   last_close=self.last_close_by_symbol.get(symbol,0)
-   if last_close and time.time()-last_close<self.reentry_cooldown_seconds:return
-   if self.blocked_signal_by_symbol.get(symbol)==signal_key:return
-
-   last=self.last_entry_by_symbol.get(symbol,0)
-   if time.time()-last<3:return
-
-   # مسافة SL: الاستراتيجية + الحد الأدنى الذي يفرضه الوسيط
-   broker_stop_points=max(
-   float(getattr(info,'trade_stops_level',0) or 0),
-   float(getattr(info,'trade_freeze_level',0) or 0)
-   )
-   sl_points=max(
-   float(sig.sl_points),
-   float(settings.min_sl_points),
-   broker_stop_points+2.0
-   )
-
-   price=tick.ask if sig.side==Side.BUY else tick.bid
-   typ=mt5.ORDER_TYPE_BUY if sig.side==Side.BUY else mt5.ORDER_TYPE_SELL
-
-   # MT5 يتحقق من الوقف مقابل جهة الإغلاق:
-   # BUY يغلق على Bid و SELL يغلق على Ask.
-   # نضيف السبريد + هامش نقطتين حتى لا يكون الوقف داخل السعر الحالي.
-   spread_points=max(0.0,(float(tick.ask)-float(tick.bid))/float(info.point))
-   valid_distance_points=max(
-   sl_points,
-   broker_stop_points+2.0,
-   spread_points+2.0
-   )
-   d=valid_distance_points*info.point
-
-   if sig.side==Side.BUY:
-   sl=float(tick.bid)-d
-   tp=price+abs(price-sl)*self.rr
-   else:
-   sl=float(tick.ask)+d
-   tp=price-abs(sl-price)*self.rr
-
-   sl=round(sl,int(info.digits))
-   tp=round(tp,int(info.digits))
-
-   # المخاطرة النقدية المستهدفة من Equity
-   risk_cash=float(account.equity)*(self.risk_pct/100.0)
-
-   # خسارة 1 لوت عند الوصول إلى SL - MT5 يحسبها حسب خصائص كل سوق
-   loss_1lot=mt5.order_calc_profit(typ,symbol,1.0,price,sl)
-   if loss_1lot is None or abs(loss_1lot)<=0:
-   await self.notify(f'❌ تعذر حساب المخاطرة — {symbol}')
-   return
-   loss_1lot=abs(float(loss_1lot))
-
-   vmin=float(info.volume_min)
-   vmax=float(info.volume_max)
-   vstep=float(info.volume_step)
-
-   # إذا أقل لوت يتجاوز الحد المالي، لا ندخل
-   min_risk=loss_1lot*vmin
-   if min_risk > risk_cash+0.01:
-   await self.notify(
-    f'⛔ لم تنفذ {symbol}\n'
-    f'أقل لوت يخاطر بـ ${min_risk:.2f}\n'
-    f'حدك المسموح: ${risk_cash:.2f} ({self.risk_pct:g}%)'
-   )
-   return
-
-   # أكبر لوت لا يتجاوز مبلغ المخاطرة
-   import math
-   raw_vol=risk_cash/loss_1lot
-   steps=math.floor((raw_vol-vmin)/vstep+1e-9)
-   vol=vmin+max(0,steps)*vstep
-   vol=min(vol,vmax)
-
-   # تقييد الحجم حسب المارجن المتاح
-   margin_1lot=mt5.order_calc_margin(typ,symbol,1.0,price)
-   if margin_1lot is not None and margin_1lot>0:
-   margin_capacity=(float(account.margin_free)*0.80)/float(margin_1lot)
-   if margin_capacity < vmin:
-    await self.notify(
-     f'⛔ لم تنفذ {symbol}\n'
-     f'المارجن لا يسمح حتى بأقل لوت {vmin:g}'
-    )
-    return
-   msteps=math.floor((margin_capacity-vmin)/vstep+1e-9)
-   margin_vol=vmin+max(0,msteps)*vstep
-   vol=min(vol,margin_vol,vmax)
-
-   # تثبيت الحجم على خطوة الوسيط وإعادة التحقق النهائي
-   steps=math.floor((vol-vmin)/vstep+1e-9)
-   vol=vmin+max(0,steps)*vstep
-   vol=max(vmin,min(vmax,vol))
-
-   actual_risk=loss_1lot*vol
-
-   # حاجز أمان: لا يسمح بتجاوز المخاطرة المحددة
-   while actual_risk > risk_cash+0.01 and vol-vstep >= vmin-1e-9:
-   vol=round(vol-vstep,8)
-   actual_risk=loss_1lot*vol
-
-   if actual_risk > risk_cash+0.01:
-   await self.notify(
-    f'⛔ لم تنفذ {symbol}\n'
-    f'المخاطرة المحسوبة ${actual_risk:.2f} تتجاوز حدك ${risk_cash:.2f}'
-   )
-   return
-
-   actual_risk_pct=(actual_risk/float(account.equity)*100.0) if account.equity else 0.0
-
-   before={p.ticket for p in (self.gw.positions(symbol) or ())}
-   req={'action':mt5.TRADE_ACTION_DEAL,'symbol':symbol,'volume':vol,'type':typ,
-       'price':price,'sl':sl,'tp':tp,'deviation':settings.max_slippage_points,
-       'magic':4009,'comment':f'TGSCALP:{sig.strategy}',
-       'type_time':mt5.ORDER_TIME_GTC,'type_filling':mt5.ORDER_FILLING_FOK}
-
-   chk=self.gw.order_check(req)
-   if not chk:
-   await self.notify(f'❌ لم تنفذ {symbol}\norder_check لم يرجع نتيجة\nMT5: {mt5.last_error()}')
-   return
-   if chk.retcode!=0:
-   await self.notify(
-    f'❌ رفض فحص الصفقة — {symbol}\n'
-    f'الكود: {chk.retcode}\n'
-    f'السبب: {getattr(chk,"comment","غير معروف")}\n'
-    f'اللوت: {vol:g} | المخاطرة: {actual_risk_pct:.2f}%'
-   )
-   return
-
-   res=self.gw.send(req)
-   self.last_entry_by_symbol[symbol]=time.time()
-   if not res or res.retcode not in (mt5.TRADE_RETCODE_DONE,mt5.TRADE_RETCODE_DONE_PARTIAL):
-   await self.notify(
-    f'❌ فشل تنفيذ الصفقة — {symbol}\n'
-    f'الكود: {getattr(res,"retcode","لا يوجد")}\n'
-    f'السبب: {getattr(res,"comment",mt5.last_error())}\n'
-    f'اللوت: {vol:g} | المخاطرة: {actual_risk_pct:.2f}%'
-   )
-   return
-
-   # MT5 قد يتأخر في إظهار المركز بعد نجاح التنفيذ
-   pos=None
-   for _ in range(50):
-   await asyncio.sleep(.1)
-   pos=self.gw.find_new_bot_position(symbol,before)
-   if pos:
-    break
-
-   if not pos:
-   await self.db.log('POSITION_LINK_FAILED',symbol,result=str(res))
-   try:
-    await self.notify(
-     f'🚨 نُفذت صفقة {symbol} لكن تعذر ربطها آلياً. '
-     f'لن يتم فتح صفقة جديدة على الرمز حتى الفحص.'
-    )
-   except Exception:
+  # صفقة واحدة كحد أقصى لكل رمز
+  if any(t.symbol==symbol for t in self.trades.values()):return
+  # Avoid stacking the same USD directional exposure across correlated FX pairs.
+  usd_group={'EURUSD','GBPUSD','AUDUSD','NZDUSD'}
+  if symbol in usd_group:
+  for t in self.trades.values():
+   if t.symbol in usd_group and t.side is not None:
+    # These symbols all quote USD, so the same BUY/SELL direction stacks USD exposure.
+    # Direction is checked again after a signal exists below.
     pass
-   return
 
-   # نعتمد القيم الفعلية التي سجلها MT5 بعد التنفيذ
-   fill=float(pos.price_open or res.price or price)
-   actual_sl=float(pos.sl or sl)
-   actual_tp=float(pos.tp or tp)
-   initial_r=abs(fill-actual_sl)
 
-   if initial_r<=0:
-   await self.db.log(
-    'INVALID_INITIAL_R',symbol,
-    ticket=pos.ticket,entry=fill,sl=actual_sl
-   )
-   return
+  info=self.gw.info(symbol); tick=self.gw.tick(symbol)
+  if not info or not tick or not info.point or tick.bid<=0 or tick.ask<=tick.bid:return
 
-   t=TradeState(
-   pos.ticket,symbol,sig.side,fill,actual_sl,actual_tp,initial_r,time.time(),
-   strategy=sig.strategy,regime=reg.value,confidence=sig.confidence,
-   reason=sig.reason,volume=float(pos.volume or vol),
-   protection_pct=self.protection_pct,trailing_gap_pct=self.trailing_gap_pct
-   )
+  ok,sp,avg,lim=self.risk.spread_ok(tick,info)
+  if not ok:return
 
-   sl=actual_sl
-   tp=actual_tp
-   vol=float(pos.volume or vol)
-   self.trades[pos.ticket]=t
+  reg,sig,meta=self.an.analyze(self.gw.ticks(symbol),info.point,self.gw.rates_m5(symbol,200),symbol=symbol,rates_m15=self.gw.rates_m15(symbol,200))
+  if not sig:
+  return
+  confidence_score=float(sig.confidence)*100.0
+  # Telegram confidence setting is a real hard entry filter.
+  if confidence_score < self.min_confidence:
+  await self.db.log('CONFIDENCE_REJECT',symbol,strategy=sig.strategy,confidence=confidence_score,min_confidence=self.min_confidence)
+  return
+  if symbol in usd_group and any(t.symbol in usd_group and t.side==sig.side for t in self.trades.values()):
+  await self.db.log('CORRELATION_REJECT',symbol,side=sig.side.value,strategy=sig.strategy)
+  return
 
-   await self.db.log('OPEN',symbol,ticket=pos.ticket,entry=fill,sl=sl,tp=tp,volume=vol,side=sig.side.value,strategy=sig.strategy,regime=reg.value,confidence=float(sig.confidence),reason=sig.reason)
-   side_icon='🟢' if sig.side==Side.BUY else '🔴'
-   side_text='شراء' if sig.side==Side.BUY else 'بيع'
+  # بعد الإغلاق: مهلة قصيرة، ثم يجب أن تتجدد الإشارة قبل تكرار نفس الاستراتيجية/الاتجاه.
+  signal_key=(sig.strategy,sig.side.value)
+  last_close=self.last_close_by_symbol.get(symbol,0)
+  if last_close and time.time()-last_close<self.reentry_cooldown_seconds:return
+  if self.blocked_signal_by_symbol.get(symbol)==signal_key:return
+
+  last=self.last_entry_by_symbol.get(symbol,0)
+  if time.time()-last<3:return
+
+  # مسافة SL: الاستراتيجية + الحد الأدنى الذي يفرضه الوسيط
+  broker_stop_points=max(
+  float(getattr(info,'trade_stops_level',0) or 0),
+  float(getattr(info,'trade_freeze_level',0) or 0)
+  )
+  sl_points=max(
+  float(sig.sl_points),
+  float(settings.min_sl_points),
+  broker_stop_points+2.0
+  )
+
+  price=tick.ask if sig.side==Side.BUY else tick.bid
+  typ=mt5.ORDER_TYPE_BUY if sig.side==Side.BUY else mt5.ORDER_TYPE_SELL
+
+  # MT5 يتحقق من الوقف مقابل جهة الإغلاق:
+  # BUY يغلق على Bid و SELL يغلق على Ask.
+  # نضيف السبريد + هامش نقطتين حتى لا يكون الوقف داخل السعر الحالي.
+  spread_points=max(0.0,(float(tick.ask)-float(tick.bid))/float(info.point))
+  valid_distance_points=max(
+  sl_points,
+  broker_stop_points+2.0,
+  spread_points+2.0
+  )
+  d=valid_distance_points*info.point
+
+  if sig.side==Side.BUY:
+  sl=float(tick.bid)-d
+  tp=price+abs(price-sl)*self.rr
+  else:
+  sl=float(tick.ask)+d
+  tp=price-abs(sl-price)*self.rr
+
+  sl=round(sl,int(info.digits))
+  tp=round(tp,int(info.digits))
+
+  # المخاطرة النقدية المستهدفة من Equity
+  risk_cash=float(account.equity)*(self.risk_pct/100.0)
+
+  # خسارة 1 لوت عند الوصول إلى SL - MT5 يحسبها حسب خصائص كل سوق
+  loss_1lot=mt5.order_calc_profit(typ,symbol,1.0,price,sl)
+  if loss_1lot is None or abs(loss_1lot)<=0:
+  await self.notify(f'❌ تعذر حساب المخاطرة — {symbol}')
+  return
+  loss_1lot=abs(float(loss_1lot))
+
+  vmin=float(info.volume_min)
+  vmax=float(info.volume_max)
+  vstep=float(info.volume_step)
+
+  # إذا أقل لوت يتجاوز الحد المالي، لا ندخل
+  min_risk=loss_1lot*vmin
+  if min_risk > risk_cash+0.01:
+  await self.notify(
+   f'⛔ لم تنفذ {symbol}\n'
+   f'أقل لوت يخاطر بـ ${min_risk:.2f}\n'
+   f'حدك المسموح: ${risk_cash:.2f} ({self.risk_pct:g}%)'
+  )
+  return
+
+  # أكبر لوت لا يتجاوز مبلغ المخاطرة
+  import math
+  raw_vol=risk_cash/loss_1lot
+  steps=math.floor((raw_vol-vmin)/vstep+1e-9)
+  vol=vmin+max(0,steps)*vstep
+  vol=min(vol,vmax)
+
+  # تقييد الحجم حسب المارجن المتاح
+  margin_1lot=mt5.order_calc_margin(typ,symbol,1.0,price)
+  if margin_1lot is not None and margin_1lot>0:
+  margin_capacity=(float(account.margin_free)*0.80)/float(margin_1lot)
+  if margin_capacity < vmin:
    await self.notify(
-   f'{side_icon} {side_text} — {symbol}\n\n'
-   f'📦 | اللوت: {vol:g}\n'
-   f'⚠️ | المخاطرة: ${actual_risk:.2f} ({actual_risk_pct:.2f}%)\n'
-   f'💰 | هدف TP تقريبي: ${actual_risk*self.rr:.2f}\n'
-   f'🛑 | وقف خسارة : ${actual_risk:.2f}\n'
-   f'🎯 | حماية الربح {t.protection_pct:g}٪ — [${actual_risk*self.rr*t.protection_pct/100.0:.2f}]\n'
-   f'🕔 | مدة اغلاق تلقائي [{self.max_trade_minutes:g} دقايق]'
+    f'⛔ لم تنفذ {symbol}\n'
+    f'المارجن لا يسمح حتى بأقل لوت {vmin:g}'
    )
+   return
+  msteps=math.floor((margin_capacity-vmin)/vstep+1e-9)
+  margin_vol=vmin+max(0,msteps)*vstep
+  vol=min(vol,margin_vol,vmax)
+
+  # تثبيت الحجم على خطوة الوسيط وإعادة التحقق النهائي
+  steps=math.floor((vol-vmin)/vstep+1e-9)
+  vol=vmin+max(0,steps)*vstep
+  vol=max(vmin,min(vmax,vol))
+
+  actual_risk=loss_1lot*vol
+
+  # حاجز أمان: لا يسمح بتجاوز المخاطرة المحددة
+  while actual_risk > risk_cash+0.01 and vol-vstep >= vmin-1e-9:
+  vol=round(vol-vstep,8)
+  actual_risk=loss_1lot*vol
+
+  if actual_risk > risk_cash+0.01:
+  await self.notify(
+   f'⛔ لم تنفذ {symbol}\n'
+   f'المخاطرة المحسوبة ${actual_risk:.2f} تتجاوز حدك ${risk_cash:.2f}'
+  )
+  return
+
+  actual_risk_pct=(actual_risk/float(account.equity)*100.0) if account.equity else 0.0
+
+  before={p.ticket for p in (self.gw.positions(symbol) or ())}
+  req={'action':mt5.TRADE_ACTION_DEAL,'symbol':symbol,'volume':vol,'type':typ,
+      'price':price,'sl':sl,'tp':tp,'deviation':settings.max_slippage_points,
+      'magic':4009,'comment':f'TGSCALP:{sig.strategy}',
+      'type_time':mt5.ORDER_TIME_GTC,'type_filling':mt5.ORDER_FILLING_FOK}
+
+  chk=self.gw.order_check(req)
+  if not chk:
+  await self.notify(f'❌ لم تنفذ {symbol}\norder_check لم يرجع نتيجة\nMT5: {mt5.last_error()}')
+  return
+  if chk.retcode!=0:
+  await self.notify(
+   f'❌ رفض فحص الصفقة — {symbol}\n'
+   f'الكود: {chk.retcode}\n'
+   f'السبب: {getattr(chk,"comment","غير معروف")}\n'
+   f'اللوت: {vol:g} | المخاطرة: {actual_risk_pct:.2f}%'
+  )
+  return
+
+  res=self.gw.send(req)
+  self.last_entry_by_symbol[symbol]=time.time()
+  if not res or res.retcode not in (mt5.TRADE_RETCODE_DONE,mt5.TRADE_RETCODE_DONE_PARTIAL):
+  await self.notify(
+   f'❌ فشل تنفيذ الصفقة — {symbol}\n'
+   f'الكود: {getattr(res,"retcode","لا يوجد")}\n'
+   f'السبب: {getattr(res,"comment",mt5.last_error())}\n'
+   f'اللوت: {vol:g} | المخاطرة: {actual_risk_pct:.2f}%'
+  )
+  return
+
+  # MT5 قد يتأخر في إظهار المركز بعد نجاح التنفيذ
+  pos=None
+  for _ in range(50):
+  await asyncio.sleep(.1)
+  pos=self.gw.find_new_bot_position(symbol,before)
+  if pos:
+   break
+
+  if not pos:
+  await self.db.log('POSITION_LINK_FAILED',symbol,result=str(res))
+  try:
+   await self.notify(
+    f'🚨 نُفذت صفقة {symbol} لكن تعذر ربطها آلياً. '
+    f'لن يتم فتح صفقة جديدة على الرمز حتى الفحص.'
+   )
+  except Exception:
+   pass
+  return
+
+  # نعتمد القيم الفعلية التي سجلها MT5 بعد التنفيذ
+  fill=float(pos.price_open or res.price or price)
+  actual_sl=float(pos.sl or sl)
+  actual_tp=float(pos.tp or tp)
+  initial_r=abs(fill-actual_sl)
+
+  if initial_r<=0:
+  await self.db.log(
+   'INVALID_INITIAL_R',symbol,
+   ticket=pos.ticket,entry=fill,sl=actual_sl
+  )
+  return
+
+  t=TradeState(
+  pos.ticket,symbol,sig.side,fill,actual_sl,actual_tp,initial_r,time.time(),
+  strategy=sig.strategy,regime=reg.value,confidence=sig.confidence,
+  reason=sig.reason,volume=float(pos.volume or vol),
+  protection_pct=self.protection_pct,trailing_gap_pct=self.trailing_gap_pct
+  )
+
+  sl=actual_sl
+  tp=actual_tp
+  vol=float(pos.volume or vol)
+  self.trades[pos.ticket]=t
+
+  await self.db.log('OPEN',symbol,ticket=pos.ticket,entry=fill,sl=sl,tp=tp,volume=vol,side=sig.side.value,strategy=sig.strategy,regime=reg.value,confidence=float(sig.confidence),reason=sig.reason)
+  side_icon='🟢' if sig.side==Side.BUY else '🔴'
+  side_text='شراء' if sig.side==Side.BUY else 'بيع'
+  await self.notify(
+  f'{side_icon} {side_text} — {symbol}\n\n'
+  f'📦 | اللوت: {vol:g}\n'
+  f'⚠️ | المخاطرة: ${actual_risk:.2f} ({actual_risk_pct:.2f}%)\n'
+  f'💰 | هدف TP تقريبي: ${actual_risk*self.rr:.2f}\n'
+  f'🛑 | وقف خسارة : ${actual_risk:.2f}\n'
+  f'🎯 | حماية الربح {t.protection_pct:g}٪ — [${actual_risk*self.rr*t.protection_pct/100.0:.2f}]\n'
+  f'🕔 | مدة اغلاق تلقائي [{self.max_trade_minutes:g} دقايق]'
+  )
 
  async def live_dashboard(self):
   lines=[]
