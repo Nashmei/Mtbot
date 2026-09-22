@@ -43,8 +43,7 @@ class Engine:
   self.risk=Risk()
   self.reject_log_at={}
   self.reject_log_interval=60.0
-  self.trade_alert_meta={}
-
+  self.trade_alert_meta={}\n  self.execution_notice_once=set()\n
   # الإعدادات المحفوظة تُحمّل لاحقاً داخل سياق async
 
 
@@ -369,10 +368,14 @@ class Engine:
    if margin_1lot is not None and margin_1lot>0:
     margin_capacity=(float(account.margin_free)*0.80)/float(margin_1lot)
     if margin_capacity < vmin:
-     await self.notify(
-      f'⛔ لم تنفذ {symbol}\n'
-      f'المارجن لا يسمح حتى بأقل لوت {vmin:g}'
-     )
+     notice_key=('margin_min',symbol)
+     if notice_key not in self.execution_notice_once:
+      self.execution_notice_once.add(notice_key)
+      await self.notify(
+       f'⛔ لم تنفذ {symbol}\n'
+       f'المارجن لا يسمح حتى بأقل لوت {vmin:g}'
+      )
+     await self._log_reject('MARGIN_REJECT',symbol,reason='BELOW_MIN_VOLUME',min_lot=vmin)
      return
     msteps=math.floor((margin_capacity-vmin)/vstep+1e-9)
     margin_vol=vmin+max(0,msteps)*vstep
@@ -473,7 +476,7 @@ class Engine:
    vol=float(pos.volume or vol)
    self.trades[pos.ticket]=t
    self.trade_alert_meta[pos.ticket]={'risk_cash':actual_risk,'risk_pct':actual_risk_pct}
-   # A successful trade resets this symbol to the normal spread baseline.
+   self.execution_notice_once.discard(('margin_min',symbol))\n   # A successful trade resets this symbol to the normal spread baseline.
    self.risk.reset_spread_relaxation(symbol)
 
    await self.db.log('OPEN',symbol,ticket=pos.ticket,entry=fill,sl=sl,tp=tp,volume=vol,side=sig.side.value,strategy=sig.strategy,regime=reg.value,confidence=float(sig.confidence),reason=sig.reason)
