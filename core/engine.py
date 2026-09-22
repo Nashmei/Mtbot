@@ -41,6 +41,8 @@ class Engine:
   self.last_analysis_key=None
   self.an=Analyzer()
   self.risk=Risk()
+  self.reject_log_at={}
+  self.reject_log_interval=60.0
 
   # الإعدادات المحفوظة تُحمّل لاحقاً داخل سياق async
 
