@@ -43,7 +43,9 @@ class Engine:
   self.risk=Risk()
   self.reject_log_at={}
   self.reject_log_interval=60.0
-  self.trade_alert_meta={}\n  self.execution_notice_once=set()\n
+  self.trade_alert_meta={}
+  self.execution_notice_once=set()
+
   # الإعدادات المحفوظة تُحمّل لاحقاً داخل سياق async
 
 
@@ -476,7 +478,8 @@ class Engine:
    vol=float(pos.volume or vol)
    self.trades[pos.ticket]=t
    self.trade_alert_meta[pos.ticket]={'risk_cash':actual_risk,'risk_pct':actual_risk_pct}
-   self.execution_notice_once.discard(('margin_min',symbol))\n   # A successful trade resets this symbol to the normal spread baseline.
+   self.execution_notice_once.discard(('margin_min',symbol))
+   # A successful trade resets this symbol to the normal spread baseline.
    self.risk.reset_spread_relaxation(symbol)
 
    await self.db.log('OPEN',symbol,ticket=pos.ticket,entry=fill,sl=sl,tp=tp,volume=vol,side=sig.side.value,strategy=sig.strategy,regime=reg.value,confidence=float(sig.confidence),reason=sig.reason)
