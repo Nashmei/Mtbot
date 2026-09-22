@@ -482,6 +482,71 @@ class Engine:
     f'🎯 | حماية الربح {t.protection_pct:g}٪ — [${actual_risk*self.rr*t.protection_pct/100.0:.2f}]\n'
     f'🕔 | مدة اغلاق تلقائي [{self.max_trade_minutes:g} دقايق]'
    )
+   asyncio.create_task(self._send_trade_chart(t,actual_risk,actual_risk_pct))
+
+ async def _send_trade_chart(self,t,actual_risk,actual_risk_pct):
+  try:
+   import os,tempfile
+   import matplotlib
+   matplotlib.use('Agg')
+   import matplotlib.pyplot as plt
+   import matplotlib.dates as mdates
+   from datetime import datetime
+
+   rates=self.gw.rates_m5(t.symbol,80)
+   if rates is None or len(rates)<10:
+    await self.db.log('TRADE_CHART_FAILED',t.symbol,ticket=t.ticket,error='not enough M5 candles')
+    return
+
+   xs=[datetime.fromtimestamp(int(r['time'])) for r in rates]
+   opens=[float(r['open']) for r in rates]
+   highs=[float(r['high']) for r in rates]
+   lows=[float(r['low']) for r in rates]
+   closes=[float(r['close']) for r in rates]
+
+   fig,ax=plt.subplots(figsize=(11,6.2),dpi=130)
+   xnum=mdates.date2num(xs)
+   width=(5/(24*60))*0.68
+   for x,o,h,l,cl in zip(xnum,opens,highs,lows,closes):
+    up=cl>=o
+    color='#16a34a' if up else '#dc2626'
+    ax.vlines(x,l,h,color=color,linewidth=1)
+    body_low=min(o,cl)
+    body_h=max(abs(cl-o),max(highs)*1e-7)
+    ax.add_patch(plt.Rectangle((x-width/2,body_low),width,body_h,facecolor=color,edgecolor=color,linewidth=.8))
+
+   ax.axhline(t.entry,color='#2563eb',linewidth=1.5,label=f'ENTRY {t.entry:g}')
+   ax.axhline(t.sl,color='#dc2626',linewidth=1.3,linestyle='--',label=f'SL {t.sl:g}')
+   ax.axhline(t.tp,color='#16a34a',linewidth=1.3,linestyle='--',label=f'TP {t.tp:g}')
+   protection=t.entry+(t.tp-t.entry)*(t.protection_pct/100.0)
+   ax.axhline(protection,color='#f59e0b',linewidth=1.2,linestyle=':',label=f'PROTECTION {t.protection_pct:g}%')
+
+   side='BUY' if t.side==Side.BUY else 'SELL'
+   ax.set_title(f'{t.symbol}  {side}  |  {t.strategy}  |  Confidence {t.confidence*100:.0f}%')
+   ax.set_ylabel('Price')
+   ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
+   ax.grid(alpha=.18)
+   ax.legend(loc='best',fontsize=8)
+   fig.autofmt_xdate()
+   fig.tight_layout()
+
+   fd,path=tempfile.mkstemp(prefix=f'mtbot_{t.symbol}_',suffix='.png')
+   os.close(fd)
+   fig.savefig(path,bbox_inches='tight')
+   plt.close(fig)
+
+   caption=(
+    f'📊 {t.symbol} — {side}\n'
+    f'🎫 {t.ticket} | 📦 {t.volume:g}\n'
+    f'🧠 {t.strategy} | 🎯 {t.confidence*100:.0f}%\n'
+    f'➡️ Entry: {t.entry:g}\n🛑 SL: {t.sl:g}\n💰 TP: {t.tp:g}\n'
+    f'⚠️ Risk: ${actual_risk:.2f} ({actual_risk_pct:.2f}%) | R:R 1:{self.rr:g}\n'
+    f'🛡 Protection: {t.protection_pct:g}%'
+   )
+   await self.notify(caption,photo_path=path,caption=caption)
+   await self.db.log('TRADE_CHART_SENT',t.symbol,ticket=t.ticket)
+  except Exception as ex:
+   await self.db.log('TRADE_CHART_FAILED',t.symbol,ticket=t.ticket,error=str(ex))
 
  async def live_dashboard(self):
   lines=[]
