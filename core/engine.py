@@ -239,7 +239,16 @@ class Engine:
     break
    await self._scan_symbol(symbol,account)
 
- async def _log_reject(self,event,symbol,**details):\n  # Keep diagnostics useful without writing the same rejection every scan.\n  key=(event,symbol,details.get('reason',''))\n  now=time.time()\n  if now-self.reject_log_at.get(key,0)<self.reject_log_interval:\n   return\n  self.reject_log_at[key]=now\n  await self.db.log(event,symbol,**details)\n\n async def _scan_symbol(self,symbol,account):
+ async def _log_reject(self,event,symbol,**details):
+  # Keep diagnostics useful without writing the same rejection every scan.
+  key=(event,symbol,details.get('reason',''))
+  now=time.time()
+  if now-self.reject_log_at.get(key,0)<self.reject_log_interval:
+   return
+  self.reject_log_at[key]=now
+  await self.db.log(event,symbol,**details)
+
+ async def _scan_symbol(self,symbol,account):
    # صفقة واحدة كحد أقصى لكل رمز
    if any(t.symbol==symbol for t in self.trades.values()):return
    # Avoid stacking the same USD directional exposure across correlated FX pairs.
