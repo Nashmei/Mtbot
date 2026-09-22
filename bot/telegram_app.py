@@ -144,7 +144,7 @@ class TelegramUI:
    msg='🛡️ أرسل نسبة بدء الحماية فقط\nمثال: 20\nالمسموح: 5 إلى 90'
   elif x=='maxduration':
    self.input_state[q.from_user.id]='maxduration'
-   msg=f'⏱ الحد الحالي: {self.e.max_trade_minutes:g} دقيقة\nأرسل عدد الدقائق\nالمسموح: 1 إلى 10'
+   msg=f'⏱ الحد الحالي: {self.e.max_trade_minutes:g} دقيقة\nأرسل عدد الدقائق\nالمسموح: 3 إلى 240'
   elif x=='maxpos':
    self.input_state[q.from_user.id]='maxpos'
    msg='📂 أرسل أقصى عدد مراكز فقط\nمثال: 5\nالمسموح: 1 إلى 10'
@@ -193,7 +193,7 @@ class TelegramUI:
      self.e.protection_pct=v; await self.db.set('protection_pct',v); msg=f'✅ الحماية: {v:g}%'
     elif key=='maxduration':
      v=float(value)
-     if not 1<=v<=10: raise ValueError()
+     if not 3<=v<=240: raise ValueError()
      self.e.max_trade_minutes=v; await self.db.set('max_trade_minutes',v); msg=f'✅ حد مدة الصفقة: {v:g} دقيقة'
     elif key=='rr':
      v=float(value)
