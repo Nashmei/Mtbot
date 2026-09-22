@@ -243,14 +243,6 @@ class Engine:
   if any(t.symbol==symbol for t in self.trades.values()):return
   # Avoid stacking the same USD directional exposure across correlated FX pairs.
   usd_group={'EURUSD','GBPUSD','AUDUSD','NZDUSD'}
-  if symbol in usd_group:
-  for t in self.trades.values():
-   if t.symbol in usd_group and t.side is not None:
-    # These symbols all quote USD, so the same BUY/SELL direction stacks USD exposure.
-    # Direction is checked again after a signal exists below.
-    pass
-
-
   info=self.gw.info(symbol); tick=self.gw.tick(symbol)
   if not info or not tick or not info.point or tick.bid<=0 or tick.ask<=tick.bid:return
 
@@ -259,15 +251,15 @@ class Engine:
 
   reg,sig,meta=self.an.analyze(self.gw.ticks(symbol),info.point,self.gw.rates_m5(symbol,200),symbol=symbol,rates_m15=self.gw.rates_m15(symbol,200))
   if not sig:
-  return
+   return
   confidence_score=float(sig.confidence)*100.0
   # Telegram confidence setting is a real hard entry filter.
   if confidence_score < self.min_confidence:
-  await self.db.log('CONFIDENCE_REJECT',symbol,strategy=sig.strategy,confidence=confidence_score,min_confidence=self.min_confidence)
-  return
+   await self.db.log('CONFIDENCE_REJECT',symbol,strategy=sig.strategy,confidence=confidence_score,min_confidence=self.min_confidence)
+   return
   if symbol in usd_group and any(t.symbol in usd_group and t.side==sig.side for t in self.trades.values()):
-  await self.db.log('CORRELATION_REJECT',symbol,side=sig.side.value,strategy=sig.strategy)
-  return
+   await self.db.log('CORRELATION_REJECT',symbol,side=sig.side.value,strategy=sig.strategy)
+   return
 
   # بعد الإغلاق: مهلة قصيرة، ثم يجب أن تتجدد الإشارة قبل تكرار نفس الاستراتيجية/الاتجاه.
   signal_key=(sig.strategy,sig.side.value)
