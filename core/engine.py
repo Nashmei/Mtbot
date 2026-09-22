@@ -239,47 +239,47 @@ class Engine:
     break
    await self._scan_symbol(symbol,account)
 
- async def _scan_symbol(self,symbol,account):
+ async def _log_reject(self,event,symbol,**details):\n  # Keep diagnostics useful without writing the same rejection every scan.\n  key=(event,symbol,details.get('reason',''))\n  now=time.time()\n  if now-self.reject_log_at.get(key,0)<self.reject_log_interval:\n   return\n  self.reject_log_at[key]=now\n  await self.db.log(event,symbol,**details)\n\n async def _scan_symbol(self,symbol,account):
    # صفقة واحدة كحد أقصى لكل رمز
    if any(t.symbol==symbol for t in self.trades.values()):return
    # Avoid stacking the same USD directional exposure across correlated FX pairs.
    usd_group={'EURUSD','GBPUSD','AUDUSD','NZDUSD'}
    info=self.gw.info(symbol); tick=self.gw.tick(symbol)
    if not info or not tick or not info.point or tick.bid<=0 or tick.ask<=tick.bid:
-    await self.db.log('SCAN_REJECT',symbol,reason='INVALID_MARKET_DATA')
+    await self._log_reject('SCAN_REJECT',symbol,reason='INVALID_MARKET_DATA')
     return
 
    ok,sp,avg,lim=self.risk.spread_ok(tick,info)
    if not ok:
-    await self.db.log('SPREAD_REJECT',symbol,spread=sp,average=avg,limit=lim)
+    await self._log_reject('SPREAD_REJECT',symbol,spread=sp,average=avg,limit=lim)
     return
 
    reg,sig,meta=self.an.analyze(self.gw.ticks(symbol),info.point,self.gw.rates_m5(symbol,200),symbol=symbol,rates_m15=self.gw.rates_m15(symbol,200))
    if not sig:
-    await self.db.log('NO_SIGNAL',symbol,regime=reg.value)
+    await self._log_reject('NO_SIGNAL',symbol,regime=reg.value)
     return
    confidence_score=float(sig.confidence)*100.0
    # Telegram confidence setting is a real hard entry filter.
    if confidence_score < self.min_confidence:
-    await self.db.log('CONFIDENCE_REJECT',symbol,strategy=sig.strategy,confidence=confidence_score,min_confidence=self.min_confidence)
+    await self._log_reject('CONFIDENCE_REJECT',symbol,strategy=sig.strategy,confidence=confidence_score,min_confidence=self.min_confidence)
     return
    if symbol in usd_group and any(t.symbol in usd_group and t.side==sig.side for t in self.trades.values()):
-    await self.db.log('CORRELATION_REJECT',symbol,side=sig.side.value,strategy=sig.strategy)
+    await self._log_reject('CORRELATION_REJECT',symbol,side=sig.side.value,strategy=sig.strategy)
     return
 
    # بعد الإغلاق: مهلة قصيرة، ثم يجب أن تتجدد الإشارة قبل تكرار نفس الاستراتيجية/الاتجاه.
    signal_key=(sig.strategy,sig.side.value)
    last_close=self.last_close_by_symbol.get(symbol,0)
    if last_close and time.time()-last_close<self.reentry_cooldown_seconds:
-    await self.db.log('REENTRY_REJECT',symbol,reason='COOLDOWN',strategy=sig.strategy,side=sig.side.value)
+    await self._log_reject('REENTRY_REJECT',symbol,reason='COOLDOWN',strategy=sig.strategy,side=sig.side.value)
     return
    if self.blocked_signal_by_symbol.get(symbol)==signal_key:
-    await self.db.log('REENTRY_REJECT',symbol,reason='SAME_SIGNAL_BLOCKED',strategy=sig.strategy,side=sig.side.value)
+    await self._log_reject('REENTRY_REJECT',symbol,reason='SAME_SIGNAL_BLOCKED',strategy=sig.strategy,side=sig.side.value)
     return
 
    last=self.last_entry_by_symbol.get(symbol,0)
    if time.time()-last<3:
-    await self.db.log('REENTRY_REJECT',symbol,reason='ENTRY_THROTTLE',strategy=sig.strategy,side=sig.side.value)
+    await self._log_reject('REENTRY_REJECT',symbol,reason='ENTRY_THROTTLE',strategy=sig.strategy,side=sig.side.value)
     return
 
    # مسافة SL: الاستراتيجية + الحد الأدنى الذي يفرضه الوسيط
