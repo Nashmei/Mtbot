@@ -81,72 +81,70 @@ class Analyzer:
 
   sig=None; reg=Regime.RANGE; decision='waiting_live_momentum'
 
-  # XAUUSD gets its own live-first setup. Gold is noisier than FX, so require
-  # stronger micro momentum plus either a real structure break or clear expansion.
-  is_gold=str(symbol or '').upper().startswith('XAUUSD')
-  if is_gold:
-   gold_up=micro_trend>0 and tick_momentum>0 and tick_momentum_fast>0 and context_up
-   gold_dn=micro_trend<0 and tick_momentum<0 and tick_momentum_fast<0 and context_dn
-   gold_gap=micro_gap>=max(2.0,atrp*.10)
-   gold_momentum=abs(tick_momentum)>=max(2.0,atrp*.10)
-   gold_fast=abs(tick_momentum_fast)>=max(1.5,atrp*.05)
-   gold_break=(break_up and gold_up) or (break_dn and gold_dn)
-   gold_expand=(gold_up or gold_dn) and gold_gap and gold_momentum and gold_fast and tick_range>=max(6.0,atrp*.45)
-   if gold_break or gold_expand:
-    side=Side.BUY if gold_up else Side.SELL
-    reg=Regime.BREAKOUT if gold_break else Regime.TREND
-    score=74+min(12,abs(tick_momentum)/max(atrp,1)*18)+min(8,micro_gap/max(atrp,1)*12)
-    slp=max(12.,min(1.8*atrp,max(.70*atrp,tick_range*.32)))
-    sig=Signal(side,'gold_scalp',min(.92,score/100.),slp,'XAUUSD strong live momentum + structure/expansion; M5 context only')
-    decision='gold_scalp'
-   else:
-    reg=Regime.VOLATILE if tick_range>max(8.,atrp*.8) else (Regime.TREND if abs(micro_trend)>max(1.5,atrp*.10) else Regime.RANGE)
-    decision='gold_wait_strong_setup'
-   return reg,sig,{
-    'decision':decision,'price':round(live,8),'spread_points':round(spread,1),
-    'spread_ratio':round(spread_ratio,2),'tick_momentum_fast':round(float(tick_momentum_fast),2),
-    'tick_momentum':round(float(tick_momentum),2),'micro_trend':round(float(micro_trend),2),
-    'atr_points':round(float(atrp),2),'adx':round(float(adx),1),
-    'di_plus':round(float(dp),1),'di_minus':round(float(dm),1),
-    'context_trend':round(float(context_trend),2),'micro_z':round(float(micro_z),2),'live':True
-   }
-  # 1) Fast structure breakout: designed for immediate expansion, not long holds.
-  if (break_up and context_up) or (break_dn and context_dn):
-   side=Side.BUY if break_up else Side.SELL
+  # Breakout is the first-priority setup for every symbol. Require live
+  # micro-direction confirmation so a one-tick poke is less likely to trigger.
+  breakout_up=break_up and context_up and micro_trend>0 and tick_momentum>0
+  breakout_dn=break_dn and context_dn and micro_trend<0 and tick_momentum<0
+  if breakout_up or breakout_dn:
+   side=Side.BUY if breakout_up else Side.SELL
    reg=Regime.BREAKOUT
-   score=72+min(14,abs(tick_momentum)/max(atrp,1)*20)
-   slp=max(10.,min(1.8*atrp,max(.60*atrp,tick_range*.30)))
-   sig=Signal(side,'scalp_breakout',min(.92,score/100.),slp,'live structure break + tick momentum')
+   score=74+min(12,abs(tick_momentum)/max(atrp,1)*18)+min(6,micro_gap/max(atrp,1)*10)
+   slp=max(10.,min(1.7*atrp,max(.65*atrp,tick_range*.30)))
+   sig=Signal(side,'scalp_breakout',min(.92,score/100.),slp,'priority live structure breakout + confirmed micro momentum')
    decision='scalp_breakout'
 
-  # 2) EMA/micro-trend continuation: simple trend-following scalp.
-  elif bull or bear:
-   side=Side.BUY if bull else Side.SELL
-   strong=micro_gap>=max(1.0,atrp*.05) and abs(tick_momentum)>=max(1.0,atrp*.05)
-   acceleration=(side==Side.BUY and tick_momentum_fast>0) or (side==Side.SELL and tick_momentum_fast<0)
-   if strong or acceleration:
-    strategy='scalp_trend'
+  # Gold-specific momentum/expansion is a fallback, not an exclusive early
+  # return. This fixes XAUUSD being locked out of the generic scalp fallbacks.
+  is_gold=str(symbol or '').upper().startswith('XAUUSD')
+  if sig is None and is_gold:
+   gold_up=micro_trend>0 and tick_momentum>0 and tick_momentum_fast>0 and context_up
+   gold_dn=micro_trend<0 and tick_momentum<0 and tick_momentum_fast<0 and context_dn
+   gold_gap=micro_gap>=max(1.5,atrp*.07)
+   gold_momentum=abs(tick_momentum)>=max(1.5,atrp*.07)
+   gold_fast=abs(tick_momentum_fast)>=max(1.0,atrp*.035)
+   gold_expand=(gold_up or gold_dn) and gold_gap and gold_momentum and gold_fast and tick_range>=max(5.0,atrp*.35)
+   if gold_expand:
+    side=Side.BUY if gold_up else Side.SELL
     reg=Regime.TREND
-    score=65+min(15,abs(micro_trend)/max(atrp,1)*24)+min(12,abs(tick_momentum)/max(atrp,1)*18)
-    slp=max(10.,min(2.0*atrp,max(.65*atrp,tick_range*.35)))
-    sig=Signal(side,strategy,min(.92,score/100.),slp,'EMA-style micro trend + live momentum; M5 context only')
-    decision=strategy
+    score=72+min(12,abs(tick_momentum)/max(atrp,1)*18)+min(8,micro_gap/max(atrp,1)*12)
+    slp=max(12.,min(1.7*atrp,max(.70*atrp,tick_range*.32)))
+    sig=Signal(side,'gold_scalp',min(.92,score/100.),slp,'XAUUSD confirmed live expansion; breakout remains first priority')
+    decision='gold_scalp'
+
+  # Trend continuation is deliberately stricter than before: the latest demo
+  # session showed many weak trend entries expiring at the time limit.
+  if sig is None and (bull or bear):
+   side=Side.BUY if bull else Side.SELL
+   strong=micro_gap>=max(1.25,atrp*.07) and abs(tick_momentum)>=max(1.25,atrp*.07)
+   acceleration=((side==Side.BUY and tick_momentum_fast>=max(1.0,atrp*.035)) or
+                 (side==Side.SELL and tick_momentum_fast<=-max(1.0,atrp*.035)))
+   if strong and acceleration:
+    reg=Regime.TREND
+    score=67+min(14,abs(micro_trend)/max(atrp,1)*22)+min(11,abs(tick_momentum)/max(atrp,1)*17)
+    slp=max(10.,min(1.8*atrp,max(.70*atrp,tick_range*.33)))
+    sig=Signal(side,'scalp_trend',min(.90,score/100.),slp,'confirmed micro trend + live acceleration; M5 context only')
+    decision='scalp_trend'
    else:
-    reg=Regime.TREND; decision='trend_wait_acceleration'
-  # 3) Fast range mean reversion: only near a clear short-term statistical extreme.
-  elif range_ok and abs(micro_z)>=1.65 and abs(tick_momentum_fast)>=1.0:
+    reg=Regime.TREND; decision='trend_wait_confirmation'
+
+  # Mean reversion remains last priority and needs a clearer extreme/reversal.
+  if sig is None and not (bull or bear) and range_ok and abs(micro_z)>=1.80 and abs(tick_momentum_fast)>=1.25:
    side=Side.SELL if micro_z>0 and tick_momentum_fast<0 else (Side.BUY if micro_z<0 and tick_momentum_fast>0 else None)
    if side:
     reg=Regime.RANGE
-    score=67+min(14,(abs(micro_z)-1.65)*14)
-    slp=max(10.,min(1.6*atrp,max(.60*atrp,tick_range*.28)))
-    sig=Signal(side,'scalp_reversion',min(.88,score/100.),slp,'short-term extreme + live reversal')
+    score=69+min(13,(abs(micro_z)-1.80)*13)
+    slp=max(10.,min(1.5*atrp,max(.65*atrp,tick_range*.28)))
+    sig=Signal(side,'scalp_reversion',min(.88,score/100.),slp,'strong short-term extreme + confirmed live reversal')
     decision='scalp_reversion'
-  elif abs(micro_trend)>max(1.5,atrp*.10):
-   reg=Regime.TREND; decision='waiting_momentum'
-  elif tick_range>max(8.,atrp*.8):
-   reg=Regime.VOLATILE; decision='volatile_no_direction'
 
+  if sig is None:
+   if is_gold:
+    reg=Regime.VOLATILE if tick_range>max(8.,atrp*.8) else (Regime.TREND if abs(micro_trend)>max(1.5,atrp*.10) else Regime.RANGE)
+    decision='gold_wait_confirmation'
+   elif abs(micro_trend)>max(1.5,atrp*.10):
+    reg=Regime.TREND; decision='waiting_momentum'
+   elif tick_range>max(8.,atrp*.8):
+    reg=Regime.VOLATILE; decision='volatile_no_direction'
   return reg,sig,{
    'decision':decision,'price':round(live,8),'spread_points':round(spread,1),
    'spread_ratio':round(spread_ratio,2),'tick_momentum_fast':round(float(tick_momentum_fast),2),
