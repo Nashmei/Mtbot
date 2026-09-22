@@ -81,6 +81,38 @@ class Analyzer:
 
   sig=None; reg=Regime.RANGE; decision='waiting_live_momentum'
 
+  # Closed-candle M5 reversal scalp helpers. The just-closed candle must form
+  # at nearby prior support/resistance; entry is evaluated on the new M5 bar.
+  m5_reversal_side=None; m5_reversal_reason=''
+  m5_doji=False; m5_sideways=False
+  if have and len(rates)>=25:
+   o=np.asarray(rates['open'],float); h=np.asarray(rates['high'],float)
+   l=np.asarray(rates['low'],float); c=np.asarray(rates['close'],float)
+   # MT5 rates may include the forming bar: use -2 as the confirmed closed bar.
+   i=-2
+   body=abs(c[i]-o[i]); candle_range=max(h[i]-l[i],point)
+   upper=h[i]-max(o[i],c[i]); lower=min(o[i],c[i])-l[i]
+   m5_doji=body<=candle_range*.12
+   hammer=body>0 and lower>=body*2.0 and upper<=body*.8 and c[i]>=o[i]
+   shooting=body>0 and upper>=body*2.0 and lower<=body*.8 and c[i]<=o[i]
+   prev_body_hi=max(o[i-1],c[i-1]); prev_body_lo=min(o[i-1],c[i-1])
+   bull_engulf=c[i]>o[i] and c[i-1]<o[i-1] and o[i]<=prev_body_lo and c[i]>=prev_body_hi
+   bear_engulf=c[i]<o[i] and c[i-1]>o[i-1] and o[i]>=prev_body_hi and c[i]<=prev_body_lo
+   prior_low=float(np.min(l[-22:-2])); prior_high=float(np.max(h[-22:-2]))
+   sr_tol=max(atrp*.18*point,4*point)
+   at_support=l[i]<=prior_low+sr_tol
+   at_resistance=h[i]>=prior_high-sr_tol
+   recent_ranges=h[-8:-2]-l[-8:-2]
+   overlap=sum(1 for j in range(-7,-2) if h[j]>=l[j-1] and l[j]<=h[j-1])
+   m5_sideways=(float(np.mean(recent_ranges))/max(atrp*point,point)<.55 and overlap>=4)
+   if not m5_doji and not m5_sideways:
+    if at_support and (hammer or bull_engulf):
+     m5_reversal_side=Side.BUY
+     m5_reversal_reason='M5 support + '+('hammer' if hammer else 'bullish engulfing')
+    elif at_resistance and (shooting or bear_engulf):
+     m5_reversal_side=Side.SELL
+     m5_reversal_reason='M5 resistance + '+('shooting star' if shooting else 'bearish engulfing')
+
   # Breakout is the first-priority setup for every symbol. Require live
   # micro-direction confirmation so a one-tick poke is less likely to trigger.
   breakout_up=break_up and context_up and micro_trend>0 and tick_momentum>0
@@ -92,6 +124,15 @@ class Analyzer:
    slp=max(10.,min(1.7*atrp,max(.65*atrp,tick_range*.30)))
    sig=Signal(side,'scalp_breakout',min(.92,score/100.),slp,'priority live structure breakout + confirmed micro momentum')
    decision='scalp_breakout'
+
+  # Second priority: confirmed M5 support/resistance reversal pattern.
+  if sig is None and m5_reversal_side is not None:
+   side=m5_reversal_side
+   reg=Regime.RANGE
+   score=76
+   slp=max(10.,min(1.6*atrp,max(.65*atrp,tick_range*.30)))
+   sig=Signal(side,'scalp_m5_reversal',score/100.,slp,m5_reversal_reason+'; enter on new candle')
+   decision='scalp_m5_reversal'
 
   # Gold-specific momentum/expansion is a fallback, not an exclusive early
   # return. This fixes XAUUSD being locked out of the generic scalp fallbacks.
@@ -138,7 +179,11 @@ class Analyzer:
     decision='scalp_reversion'
 
   if sig is None:
-   if is_gold:
+   if m5_doji:
+    reg=Regime.NO_TRADE; decision='m5_doji_no_trade'
+   elif m5_sideways:
+    reg=Regime.NO_TRADE; decision='m5_sideways_no_trade'
+   elif is_gold:
     reg=Regime.VOLATILE if tick_range>max(8.,atrp*.8) else (Regime.TREND if abs(micro_trend)>max(1.5,atrp*.10) else Regime.RANGE)
     decision='gold_wait_confirmation'
    elif abs(micro_trend)>max(1.5,atrp*.10):
