@@ -671,17 +671,22 @@ class Engine:
   # Position disappeared: determine the real MT5 close reason.
   if not pos:
    deals=self.gw.history_deals_by_position(t.ticket)
-   exit_deal=None
-   for d in deals:
-    if getattr(d,'entry',None) in (getattr(mt5,'DEAL_ENTRY_OUT',1),getattr(mt5,'DEAL_ENTRY_OUT_BY',3)):
-     exit_deal=d
+   exit_deals=[
+    d for d in deals
+    if getattr(d,'entry',None) in (getattr(mt5,'DEAL_ENTRY_OUT',1),getattr(mt5,'DEAL_ENTRY_OUT_BY',3))
+   ]
+   exit_deal=exit_deals[-1] if exit_deals else None
 
    if exit_deal:
     reason=getattr(exit_deal,'reason',None)
-    profit=float(getattr(exit_deal,'profit',0) or 0)
-    swap=float(getattr(exit_deal,'swap',0) or 0)
-    commission=float(getattr(exit_deal,'commission',0) or 0)
-    pnl=profit+swap+commission
+    # MT5 is the source of truth. Sum every closing fill/deal.
+    pnl=sum(
+     float(getattr(d,'profit',0) or 0)
+     +float(getattr(d,'swap',0) or 0)
+     +float(getattr(d,'commission',0) or 0)
+     +float(getattr(d,'fee',0) or 0)
+     for d in exit_deals
+    )
     exit_price=float(getattr(exit_deal,'price',0) or 0)
 
     if reason==mt5.DEAL_REASON_TP:
