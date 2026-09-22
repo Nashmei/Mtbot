@@ -30,7 +30,7 @@ class Analyzer:
    dx.append(100*abs(pp-mm)/max(pp+mm,1e-12))
   return (float(np.mean(dx[-n:])) if dx else 0.),p,m
 
- def analyze(self,ticks,point,rates=None,symbol=None):
+ def analyze(self,ticks,point,rates=None,symbol=None,rates_m15=None):
   if ticks is None or len(ticks)<80 or point<=0:
    return Regime.NO_TRADE,None,{'decision':'insufficient_ticks'}
 
@@ -60,7 +60,7 @@ class Analyzer:
    adx,dp,dm=self._dmi(h,l,c)
    structure_hi=float(np.max(h[-20:])); structure_lo=float(np.min(l[-20:]))
 
-  # Closed M5 is context only. Entry direction is driven by live MT5 ticks.
+  # M15 higher-timeframe bias for trend continuation.\n  m15_bias=0\n  if rates_m15 is not None and len(rates_m15)>=55:\n   c15=np.asarray(rates_m15['close'],float)\n   ema50_15=self._ema(c15[-55:],50)\n   m15_bias=1 if c15[-1]>ema50_15 else (-1 if c15[-1]<ema50_15 else 0)\n\n  # Closed M5 is context only. Entry direction is driven by live MT5 ticks.
   live_up=micro_trend>0 and tick_momentum>0 and tick_momentum_fast>=-max(1.,atrp*.08)
   live_dn=micro_trend<0 and tick_momentum<0 and tick_momentum_fast<=max(1.,atrp*.08)
   context_up=(not have) or context_trend>=-atrp*.20
@@ -125,17 +125,29 @@ class Analyzer:
    sig=Signal(side,'scalp_breakout',min(.92,score/100.),slp,'priority live structure breakout + confirmed micro momentum')
    decision='scalp_breakout'
 
-  # Second priority: confirmed M5 support/resistance reversal pattern.
-  if sig is None and m5_reversal_side is not None:
-   side=m5_reversal_side
-   reg=Regime.RANGE
-   score=76
-   slp=max(10.,min(1.6*atrp,max(.65*atrp,tick_range*.30)))
-   sig=Signal(side,'scalp_m5_reversal',score/100.,slp,m5_reversal_reason+'; enter on new candle')
-   decision='scalp_m5_reversal'
+  # Second priority: trend continuation, but only with M15 bias and an M5
+  # pullback/retest instead of chasing an already extended impulse.
+  if sig is None and (bull or bear) and have:
+   side=Side.BUY if bull else Side.SELL
+   strong=micro_gap>=max(1.25,atrp*.07) and abs(tick_momentum)>=max(1.25,atrp*.07)
+   acceleration=((side==Side.BUY and tick_momentum_fast>=max(1.0,atrp*.035)) or
+                 (side==Side.SELL and tick_momentum_fast<=-max(1.0,atrp*.035)))
+   c5=np.asarray(rates['close'],float); h5=np.asarray(rates['high'],float); l5=np.asarray(rates['low'],float)
+   ema20_5=self._ema(c5[-30:],20)
+   pull_tol=max(atrp*.22*point,4*point)
+   pullback=((side==Side.BUY and l5[-1]<=ema20_5+pull_tol and live>ema20_5) or
+             (side==Side.SELL and h5[-1]>=ema20_5-pull_tol and live<ema20_5))
+   htf_ok=((side==Side.BUY and m15_bias>0) or (side==Side.SELL and m15_bias<0))
+   if strong and acceleration and pullback and htf_ok:
+    reg=Regime.TREND
+    score=70+min(12,abs(micro_trend)/max(atrp,1)*20)+min(10,abs(tick_momentum)/max(atrp,1)*15)
+    slp=max(10.,min(1.8*atrp,max(.70*atrp,tick_range*.33)))
+    sig=Signal(side,'scalp_trend',min(.92,score/100.),slp,'M15 bias + M5 EMA20 pullback + live acceleration')
+    decision='scalp_trend'
+   else:
+    reg=Regime.TREND; decision='trend_wait_pullback'
 
-  # Gold-specific momentum/expansion is a fallback, not an exclusive early
-  # return. This fixes XAUUSD being locked out of the generic scalp fallbacks.
+  # Third priority: dedicated gold expansion setup.
   is_gold=str(symbol or '').upper().startswith('XAUUSD')
   if sig is None and is_gold:
    gold_up=micro_trend>0 and tick_momentum>0 and tick_momentum_fast>0 and context_up
@@ -152,21 +164,15 @@ class Analyzer:
     sig=Signal(side,'gold_scalp',min(.92,score/100.),slp,'XAUUSD confirmed live expansion; breakout remains first priority')
     decision='gold_scalp'
 
-  # Trend continuation is deliberately stricter than before: the latest demo
-  # session showed many weak trend entries expiring at the time limit.
-  if sig is None and (bull or bear):
-   side=Side.BUY if bull else Side.SELL
-   strong=micro_gap>=max(1.25,atrp*.07) and abs(tick_momentum)>=max(1.25,atrp*.07)
-   acceleration=((side==Side.BUY and tick_momentum_fast>=max(1.0,atrp*.035)) or
-                 (side==Side.SELL and tick_momentum_fast<=-max(1.0,atrp*.035)))
-   if strong and acceleration:
-    reg=Regime.TREND
-    score=67+min(14,abs(micro_trend)/max(atrp,1)*22)+min(11,abs(tick_momentum)/max(atrp,1)*17)
-    slp=max(10.,min(1.8*atrp,max(.70*atrp,tick_range*.33)))
-    sig=Signal(side,'scalp_trend',min(.90,score/100.),slp,'confirmed micro trend + live acceleration; M5 context only')
-    decision='scalp_trend'
-   else:
-    reg=Regime.TREND; decision='trend_wait_confirmation'
+  # Fourth priority: M5 reversal only in a ranging/non-trending context.
+  strong_trend=(have and adx>=25) or abs(context_trend)>max(2.0,atrp*.18)
+  if sig is None and m5_reversal_side is not None and range_ok and not strong_trend:
+   side=m5_reversal_side
+   reg=Regime.RANGE
+   score=76
+   slp=max(10.,min(1.6*atrp,max(.65*atrp,tick_range*.30)))
+   sig=Signal(side,'scalp_m5_reversal',score/100.,slp,m5_reversal_reason+'; range-only reversal on new candle')
+   decision='scalp_m5_reversal'
 
   # Mean reversion remains last priority and needs a clearer extreme/reversal.
   if sig is None and not (bull or bear) and range_ok and abs(micro_z)>=1.80 and abs(tick_momentum_fast)>=1.25:
@@ -196,5 +202,5 @@ class Analyzer:
    'tick_momentum':round(float(tick_momentum),2),'micro_trend':round(float(micro_trend),2),
    'atr_points':round(float(atrp),2),'adx':round(float(adx),1),
    'di_plus':round(float(dp),1),'di_minus':round(float(dm),1),
-   'context_trend':round(float(context_trend),2),'micro_z':round(float(micro_z),2),'live':True
+   'context_trend':round(float(context_trend),2),'m15_bias':m15_bias,'micro_z':round(float(micro_z),2),'live':True
   }
