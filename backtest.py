@@ -84,6 +84,7 @@ def main():
      x=future_ticks[-1]; exitp=float(x['bid'] if sig.side==Side.BUY else x['ask'])
    r=((exitp-entry)/(entry-sl) if sig.side==Side.BUY else (entry-exitp)/(sl-entry))
    rows.append((symbol,sig.strategy,sig.side.value,r,reason,sig.confidence*100))
+   print(f"TRADE | {datetime.fromtimestamp(ts,timezone.utc).isoformat()} | {symbol} | {sig.side.value} | {sig.strategy} | conf={sig.confidence*100:.1f}% | R={r:+.2f} | exit={reason}", flush=True)
    last_exit=ts+MAX_MINUTES*60
   print(f'[{symbol}] done | total qualifying trades so far: {len(rows)}', flush=True)
  mt5.shutdown()
@@ -100,6 +101,10 @@ def main():
  for s in SYMBOLS:
   z=[x for x in rows if x[0]==s]
   if z: print(f'{s}: {len(z)} trades | {sum(x[3] for x in z):+.2f}R')
+ print('By exit reason:')
+ for reason in sorted(set(x[4] for x in rows)):
+  z=[x for x in rows if x[4]==reason]
+  print(f'  {reason}: {len(z)} | {sum(x[3] for x in z):+.2f}R')
  print('By strategy:')
  for st in sorted(set(x[1] for x in rows)):
   z=[x for x in rows if x[1]==st]
