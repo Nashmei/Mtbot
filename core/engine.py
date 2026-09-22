@@ -270,7 +270,7 @@ class Engine:
     await self._log_reject('SPREAD_REJECT',symbol,spread=sp,average=avg,limit=lim)
     return
 
-   reg,sig,meta=self.an.analyze(self.gw.ticks(symbol),info.point,self.gw.rates_m5(symbol,200),symbol=symbol,rates_m15=self.gw.rates_m15(symbol,200),rates_h1=self.gw.rates_h1(symbol,200))
+   reg,sig,meta=self.an.analyze(self.gw.ticks(symbol),info.point,self.gw.rates_m5(symbol,200),symbol=symbol,rates_m15=self.gw.rates_m15(symbol,200),rates_h1=self.gw.rates_h1(symbol,200),rates_m1=self.gw.rates_m1(symbol,200))
    if not sig:
     await self._log_reject('NO_SIGNAL',symbol,regime=reg.value)
     return
