@@ -64,7 +64,17 @@ class TelegramUI:
  async def cb(self,u,c):
   q=u.callback_query
   if not self.allowed(q.from_user):return
-  try: await q.answer()\n  except BadRequest: pass\n  self._cancel_menu_expiry(); self.menu_chat_id=q.message.chat_id; self.menu_message_id=q.message.message_id\n  x=q.data\n  if x=='dashboard': return await self._edit(q,'🤖 MT5 BOT • لوحة التحكم\n━━━━━━━━━━━━━━\nاختر القسم:',self.kb())\n  if x=='trade_menu': return await self._edit(q,'🤖 التداول وإدارة المحرك',self.trade_kb())\n  if x=='analysis_menu': return await self._edit(q,'🔎 التحليل والأسواق',self.analysis_kb())\n  if x=='settings_menu': return await self._edit(q,'⚙️ إعدادات الاستراتيجية والمخاطر',self.settings_kb())\n  if x=='account_menu': return await self._edit(q,'👤 حساب MT5 والإحصائيات',self.account_kb())
+  try: await q.answer()
+  except BadRequest: pass
+  self._cancel_menu_expiry()
+  self.menu_chat_id=q.message.chat_id
+  self.menu_message_id=q.message.message_id
+  x=q.data
+  if x=='dashboard': return await self._edit(q,'🤖 MT5 BOT • لوحة التحكم\n━━━━━━━━━━━━━━\nاختر القسم:',self.kb())
+  if x=='trade_menu': return await self._edit(q,'🤖 التداول وإدارة المحرك',self.trade_kb())
+  if x=='analysis_menu': return await self._edit(q,'🔎 التحليل والأسواق',self.analysis_kb())
+  if x=='settings_menu': return await self._edit(q,'⚙️ إعدادات الاستراتيجية والمخاطر',self.settings_kb())
+  if x=='account_menu': return await self._edit(q,'👤 حساب MT5 والإحصائيات',self.account_kb())
   if x=='mt5login':
    self.login_state[q.from_user.id]={'step':'block'}; msg='🔐 تسجيل دخول MT5 التجريبي\n\nأرسل Server و Login و Password في رسالة واحدة.\nاستخدم /cancel للإلغاء.'
   elif x=='start':
