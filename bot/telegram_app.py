@@ -17,7 +17,7 @@ class TelegramUI:
    [InlineKeyboardButton('▶️ تشغيل',callback_data='start'),InlineKeyboardButton('⏹ إيقاف',callback_data='stop')],
    [InlineKeyboardButton('💱 الأزواج',callback_data='symbols'),InlineKeyboardButton('⚖️ R:R',callback_data='rr')],
    [InlineKeyboardButton('⚠️ المخاطرة',callback_data='risk'),InlineKeyboardButton('🛡 الحماية',callback_data='protection')],
-   [InlineKeyboardButton('🎯 الثقة',callback_data='confidence')],
+   [InlineKeyboardButton('🎯 الثقة',callback_data='confidence'),InlineKeyboardButton('⏱ مدة الصفقة',callback_data='maxduration')],
    [InlineKeyboardButton('📂 حد المراكز',callback_data='maxpos'),InlineKeyboardButton('❌ حد الخسائر',callback_data='maxloss')],
    [InlineKeyboardButton('🔐 حساب MT5',callback_data='mt5login')],
    [InlineKeyboardButton('🔒 الحقيقي مقفل',callback_data='live')]
@@ -142,6 +142,9 @@ class TelegramUI:
   elif x=='protection':
    self.input_state[q.from_user.id]='protection'
    msg='🛡️ أرسل نسبة بدء الحماية فقط\nمثال: 20\nالمسموح: 5 إلى 90'
+  elif x=='maxduration':
+   self.input_state[q.from_user.id]='maxduration'
+   msg=f'⏱ الحد الحالي: {self.e.max_trade_minutes:g} دقيقة\nأرسل عدد الدقائق\nالمسموح: 1 إلى 10'
   elif x=='maxpos':
    self.input_state[q.from_user.id]='maxpos'
    msg='📂 أرسل أقصى عدد مراكز فقط\nمثال: 5\nالمسموح: 1 إلى 10'
@@ -188,6 +191,10 @@ class TelegramUI:
      v=float(value)
      if not 5<=v<=90: raise ValueError()
      self.e.protection_pct=v; await self.db.set('protection_pct',v); msg=f'✅ الحماية: {v:g}%'
+    elif key=='maxduration':
+     v=float(value)
+     if not 1<=v<=10: raise ValueError()
+     self.e.max_trade_minutes=v; await self.db.set('max_trade_minutes',v); msg=f'✅ حد مدة الصفقة: {v:g} دقيقة'
     elif key=='rr':
      v=float(value)
      if not .5<=v<=10: raise ValueError()

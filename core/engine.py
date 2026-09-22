@@ -19,6 +19,10 @@ class Engine:
   self.min_confidence=75.0
   self.protection_pct=45.0
   self.trailing_gap_pct=5.0
+  self.max_trade_minutes=10.0
+  self.reentry_cooldown_seconds=30.0
+  self.last_close_by_symbol={}
+  self.blocked_signal_by_symbol={}
   self.max_positions=1
   self.max_consecutive_losses=settings.max_consecutive_losses
   self.consecutive_losses=0
@@ -48,6 +52,7 @@ class Engine:
    self.min_confidence=float(await self.db.get('min_confidence',self.min_confidence))
    self.protection_pct=float(await self.db.get('protection_pct',self.protection_pct))
    self.trailing_gap_pct=float(await self.db.get('trailing_gap_pct',self.trailing_gap_pct))
+   self.max_trade_minutes=float(await self.db.get('max_trade_minutes',self.max_trade_minutes))
    self.max_positions=int(await self.db.get('max_positions',self.max_positions))
    self.max_consecutive_losses=int(await self.db.get('max_consecutive_losses',self.max_consecutive_losses))
    self.consecutive_losses=max(0,int(await self.db.get('consecutive_losses',0)))
@@ -68,6 +73,7 @@ class Engine:
    f'📂 المراكز: {len(self.trades)} / {self.max_positions}\n'
    f'⚠️ المخاطرة: {self.risk_pct:g}% لكل صفقة\n'
    f'🛡 الحماية: {self.protection_pct:g}%\n'
+   f'⏱ حد الصفقة: {self.max_trade_minutes:g} دقيقة\n'
    f'❌ الخسائر المتتالية: {self.consecutive_losses} / {self.max_consecutive_losses}\n'
    f'⚖️ العائد/المخاطرة: 1:{self.rr:g}\n'
    f'💰 Equity: {a.equity:.2f} {a.currency}'
@@ -241,8 +247,16 @@ class Engine:
   if not ok:return
 
   reg,sig,meta=self.an.analyze(self.gw.ticks(symbol),info.point,self.gw.rates_m5(symbol,200))
-  if not sig:return
+  if not sig:
+   self.blocked_signal_by_symbol.pop(symbol,None)
+   return
   confidence_score=float(sig.confidence)*100.0
+
+  # بعد الإغلاق: مهلة قصيرة، ثم يجب أن تتجدد الإشارة قبل تكرار نفس الاستراتيجية/الاتجاه.
+  signal_key=(sig.strategy,sig.side.value)
+  last_close=self.last_close_by_symbol.get(symbol,0)
+  if last_close and time.time()-last_close<self.reentry_cooldown_seconds:return
+  if self.blocked_signal_by_symbol.get(symbol)==signal_key:return
 
   last=self.last_entry_by_symbol.get(symbol,0)
   if time.time()-last<3:return
@@ -422,7 +436,7 @@ class Engine:
   vol=float(pos.volume or vol)
   self.trades[pos.ticket]=t
 
-  await self.db.log('OPEN',symbol,ticket=pos.ticket,entry=fill,sl=sl,tp=tp,volume=vol)
+  await self.db.log('OPEN',symbol,ticket=pos.ticket,entry=fill,sl=sl,tp=tp,volume=vol,side=sig.side.value,strategy=sig.strategy,regime=reg.value,confidence=float(sig.confidence),reason=sig.reason)
   await self.notify(
    f'🟢 {"شراء" if sig.side==Side.BUY else "بيع"} — {symbol}\n'
    f'🎫 {pos.ticket} | 🛡 {t.protection_pct:g}%\n'
@@ -501,15 +515,16 @@ class Engine:
 
  async def manage(self,t,tick,info):
   price=tick.bid if t.side==Side.BUY else tick.ask
-  # Scalping hard cap: no bot position may remain open beyond 10 minutes.
+  # حد مدة الصفقة قابل للتحكم من Telegram.
   age=time.time()-t.opened_at
-  if age>=600:
+  max_age=max(60.0,float(self.max_trade_minutes)*60.0)
+  if age>=max_age:
    pos=self.gw.position_by_ticket(t.ticket)
    if pos:
     res=self.gw.close(pos)
     if res and res.retcode in (mt5.TRADE_RETCODE_DONE,mt5.TRADE_RETCODE_DONE_PARTIAL):
-     await self.db.log('MAX_DURATION_EXIT',t.symbol,ticket=t.ticket,age_seconds=age)
-     await self.notify(f'⏱ إغلاق حد 10 دقائق — {t.symbol}')
+     await self.db.log('MAX_DURATION_EXIT',t.symbol,ticket=t.ticket,age_seconds=age,max_trade_minutes=self.max_trade_minutes)
+     await self.notify(f'⏱ إغلاق حد {self.max_trade_minutes:g} دقيقة — {t.symbol}')
      return
     await self.db.log('MAX_DURATION_EXIT_FAILED',t.symbol,ticket=t.ticket,result=str(res))
 
@@ -561,6 +576,8 @@ class Engine:
     await self.db.log('POSITION_CLOSED',t.symbol,reason='history_not_found')
     await self.notify(f'🏁 تم إغلاق الصفقة — {t.symbol}\n⚠️ سبب الإغلاق غير متاح في سجل MT5.')
 
+   self.last_close_by_symbol[t.symbol]=time.time()
+   self.blocked_signal_by_symbol[t.symbol]=(t.strategy,t.side.value)
    self.trades.pop(t.ticket,None)
    return
 
