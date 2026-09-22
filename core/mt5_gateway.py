@@ -81,6 +81,9 @@ class MT5Gateway:
     def rates_m15(self, s, count=200):
         return self.rates(s, mt5.TIMEFRAME_M15, count)
 
+    def rates_h1(self, s, count=200):
+        return self.rates(s, mt5.TIMEFRAME_H1, count)
+
     def symbols(self):
         return mt5.symbols_get() or ()
 
