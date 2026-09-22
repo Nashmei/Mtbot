@@ -30,7 +30,7 @@ class Analyzer:
    dx.append(100*abs(pp-mm)/max(pp+mm,1e-12))
   return (float(np.mean(dx[-n:])) if dx else 0.),p,m
 
- def analyze(self,ticks,point,rates=None,symbol=None,rates_m15=None,rates_h1=None):
+ def analyze(self,ticks,point,rates=None,symbol=None,rates_m15=None,rates_h1=None,rates_m1=None):
   if ticks is None or len(ticks)<80 or point<=0:
    return Regime.NO_TRADE,None,{'decision':'insufficient_ticks'}
 
@@ -100,6 +100,26 @@ class Analyzer:
 
   sig=None; reg=Regime.RANGE; decision='waiting_live_momentum'
 
+  # Frequent EMA crossover scalp. Use CLOSED candles only so a forming candle
+  # cannot create/disappear a crossover. M1 is primary; M5 is fallback.
+  ema_cross_side=None; ema_cross_tf=None; ema_cross_gap=0.0
+  cross_rates=rates_m1 if rates_m1 is not None and len(rates_m1)>=30 else rates
+  if cross_rates is not None and len(cross_rates)>=30:
+   cc=np.asarray(cross_rates['close'],float)
+   # rates() already returns closed candles; compare the last two closed bars.
+   ema9_now=self._ema(cc[-24:],9); ema21_now=self._ema(cc[-30:],21)
+   ema9_prev=self._ema(cc[-25:-1],9); ema21_prev=self._ema(cc[-30:-1],21)
+   cross_up=ema9_prev<=ema21_prev and ema9_now>ema21_now
+   cross_dn=ema9_prev>=ema21_prev and ema9_now<ema21_now
+   ema_cross_gap=abs(ema9_now-ema21_now)/point
+   ema_cross_tf='M1' if cross_rates is rates_m1 else 'M5'
+   # M15 blocks obvious counter-trend crosses, but H1 is not required here
+   # so this setup can add opportunities instead of becoming too restrictive.
+   if cross_up and m15_bias>=0 and tick_momentum_fast>0:
+    ema_cross_side=Side.BUY
+   elif cross_dn and m15_bias<=0 and tick_momentum_fast<0:
+    ema_cross_side=Side.SELL
+
   # Closed-candle M5 reversal scalp helpers. The just-closed candle must form
   # at nearby prior support/resistance; entry is evaluated on the new M5 bar.
   m5_reversal_side=None; m5_reversal_reason=''
@@ -162,6 +182,15 @@ class Analyzer:
    slp=max(10.,min(1.7*atrp,max(.65*atrp,tick_range*.30)))
    sig=Signal(side,'scalp_breakout',min(.92,score/100.),slp,'M5 breakout + direct retest + M15/H1 trend confirmation')
    decision='scalp_breakout_retest'
+
+  # Frequent EMA 9/21 crossover setup. Breakout/retest keeps first priority.
+  if sig is None and ema_cross_side is not None:
+   side=ema_cross_side
+   reg=Regime.TREND
+   score=72+min(10,ema_cross_gap/max(atrp*.05,1.)*4)+min(8,abs(tick_momentum_fast)/max(atrp,1)*12)
+   slp=max(10.,min(1.6*atrp,max(.60*atrp,tick_range*.28)))
+   sig=Signal(side,'ema_cross_scalp',min(.88,score/100.),slp,f'EMA 9/21 {ema_cross_tf} closed-candle cross + live momentum + M15 guard')
+   decision='ema_cross_scalp'
 
   # Second priority: trend continuation, but only with M15 bias and an M5
   # pullback/retest instead of chasing an already extended impulse.
@@ -241,5 +270,5 @@ class Analyzer:
    'tick_momentum':round(float(tick_momentum),2),'micro_trend':round(float(micro_trend),2),
    'atr_points':round(float(atrp),2),'adx':round(float(adx),1),
    'di_plus':round(float(dp),1),'di_minus':round(float(dm),1),
-   'context_trend':round(float(context_trend),2),'m15_bias':m15_bias,'h1_bias':h1_bias,'retest_level':retest_level,'micro_z':round(float(micro_z),2),'live':True
+   'context_trend':round(float(context_trend),2),'m15_bias':m15_bias,'h1_bias':h1_bias,'retest_level':retest_level,'ema_cross_tf':ema_cross_tf,'ema_cross_gap':round(float(ema_cross_gap),2),'micro_z':round(float(micro_z),2),'live':True
   }
