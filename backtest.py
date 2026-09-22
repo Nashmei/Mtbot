@@ -48,7 +48,9 @@ def main():
    spread=float(tk['ask'][-1]-tk['bid'][-1])
    d=max(float(sig.sl_points),10.0)*info.point+spread
    sl=entry-d if sig.side==Side.BUY else entry+d
-   tp=entry+abs(entry-sl)*RR if sig.side==Side.BUY else entry-abs(entry-sl)*RR
+   original_sl=sl
+   risk_distance=abs(entry-original_sl)
+   tp=entry+risk_distance*RR if sig.side==Side.BUY else entry-risk_distance*RR
    # Tick-level exit simulation: original SL/TP, protection trigger,
    # 5% of original entry-to-TP trailing gap, and 60s no-new-best exit.
    ex0=np.searchsorted(tt,ts,side='right'); ex1=np.searchsorted(tt,ts+MAX_MINUTES*60,side='right')
@@ -82,7 +84,7 @@ def main():
    else:
     if len(future_ticks):
      x=future_ticks[-1]; exitp=float(x['bid'] if sig.side==Side.BUY else x['ask'])
-   r=((exitp-entry)/(entry-sl) if sig.side==Side.BUY else (entry-exitp)/(sl-entry))
+   r=((exitp-entry)/risk_distance if sig.side==Side.BUY else (entry-exitp)/risk_distance)
    rows.append((symbol,sig.strategy,sig.side.value,r,reason,sig.confidence*100))
    print(f"TRADE | {datetime.fromtimestamp(ts,timezone.utc).isoformat()} | {symbol} | {sig.side.value} | {sig.strategy} | conf={sig.confidence*100:.1f}% | R={r:+.2f} | exit={reason}", flush=True)
    last_exit=ts+MAX_MINUTES*60
