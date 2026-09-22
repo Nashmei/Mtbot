@@ -91,31 +91,34 @@ class TelegramUI:
    await self._edit(q,'💱 الرموز المتاحة من MT5:',reply_markup=InlineKeyboardMarkup(rows))
    return
   elif x=='active':
+   # Fast full-market scan: use the latest MT5 tick only. Avoid downloading
+   # tick history for every symbol, which blocks Telegram on large servers.
    import time
-   # Scan the complete symbol universe exposed by the connected MT5 server.
-   # Ranking is activity only: recent price range divided by current spread.
    names=list(dict.fromkeys(z.name for z in self.e.gw.available_symbols()))
    ranked=[]
+   now=time.time()
    for n in names:
     info=self.e.gw.info(n); t=self.e.gw.tick(n)
-    ticks=self.e.gw.ticks(n,180)
-    if not info or not t or not info.point or ticks is None or len(ticks)<2: continue
-    bids=[float(z['bid']) for z in ticks if float(z['bid'])>0]
-    if len(bids)<2: continue
-    move=(max(bids)-min(bids))/info.point
+    if not info or not t or not info.point or t.bid<=0 or t.ask<=0: continue
     spread=(t.ask-t.bid)/info.point
-    if spread <= 0:
-     continue
-    score=move/spread
-    ranked.append((score,n,move,spread))
+    if spread<=0: continue
+    tick_time=float(getattr(t,'time_msc',0) or 0)/1000.0
+    if not tick_time: tick_time=float(getattr(t,'time',0) or 0)
+    age=max(0.0,now-tick_time) if tick_time else 999999.0
+    # Ignore stale/closed instruments. Rank fresh symbols by current tick
+    # activity (volume when supplied) adjusted for spread.
+    if age>120: continue
+    volume=float(getattr(t,'volume_real',0) or getattr(t,'volume',0) or 0)
+    score=(1.0+volume)/spread
+    ranked.append((score,n,spread,age,volume))
    ranked.sort(reverse=True)
    rows=[]
-   for score,n,move,spread in ranked[:10]:
+   for score,n,spread,age,volume in ranked[:10]:
     icon='🥇' if 'XAU' in n.upper() else '🔥'
-    rows.append([InlineKeyboardButton(f'{icon} {n} • move {move:.0f} • spread {spread:.1f}',callback_data=f'sym:{n}')])
+    rows.append([InlineKeyboardButton(f'{icon} {n} • spread {spread:.1f} • {age:.0f}s',callback_data=f'sym:{n}')])
    rows.append([InlineKeyboardButton('↩️ الرموز',callback_data='symbols')])
-   text=f'🔥 الأنشط الآن — كامل سوق MT5\nتم فحص {len(names)} رمزاً، وعرض أعلى 10 حسب حركة السعر الأخيرة ÷ السبريد.\nهذا مقياس للنشاط فقط وليس توقعاً للربحية.'
-   if not ranked: text='⚠️ لا توجد بيانات لحظية كافية حالياً.'
+   text=f'🔥 الأنشط الآن — كامل سوق MT5\\nتم فحص {len(names)} رمزاً بسرعة، وعرض أعلى 10 من الرموز ذات الأسعار اللحظية الحديثة.\\nالترتيب نشاط لحظي/سبريد وليس توقعاً للربحية.'
+   if not ranked: text='⚠️ لا توجد أسعار لحظية حديثة كافية حالياً.'
    await self._edit(q,text,reply_markup=InlineKeyboardMarkup(rows))
    return
   elif x.startswith('sym:'):
