@@ -221,10 +221,6 @@ class Engine:
    info=self.gw.info(t.symbol); tick=self.gw.tick(t.symbol)
    if info and tick: await self.manage(t,tick,info)
 
-  # تحديث لوحة الصفقات المجمعة
-  if self.trades:
-   await self.live_dashboard()
-
   # لا دخول جديد عند بلوغ الحدود
   if len(self.trades)>=self.max_positions:return
   if self.max_consecutive_losses > 0 and self.consecutive_losses>=self.max_consecutive_losses:
@@ -471,18 +467,28 @@ class Engine:
    self.risk.reset_spread_relaxation(symbol)
 
    await self.db.log('OPEN',symbol,ticket=pos.ticket,entry=fill,sl=sl,tp=tp,volume=vol,side=sig.side.value,strategy=sig.strategy,regime=reg.value,confidence=float(sig.confidence),reason=sig.reason)
-   side_icon='🟢' if sig.side==Side.BUY else '🔴'
-   side_text='شراء' if sig.side==Side.BUY else 'بيع'
-   await self.notify(
-    f'{side_icon} {side_text} — {symbol}\n\n'
-    f'📦 | اللوت: {vol:g}\n'
-    f'⚠️ | المخاطرة: ${actual_risk:.2f} ({actual_risk_pct:.2f}%)\n'
-    f'💰 | هدف TP تقريبي: ${actual_risk*self.rr:.2f}\n'
-    f'🛑 | وقف خسارة : ${actual_risk:.2f}\n'
-    f'🎯 | حماية الربح {t.protection_pct:g}٪ — [${actual_risk*self.rr*t.protection_pct/100.0:.2f}]\n'
-    f'🕔 | مدة اغلاق تلقائي [{self.max_trade_minutes:g} دقايق]'
-   )
    asyncio.create_task(self._send_trade_chart(t,actual_risk,actual_risk_pct))
+
+ async def _trade_caption(self,t,current_price=None,pnl=None,closed=False):
+  info=self.gw.info(t.symbol)
+  digits=int(getattr(info,'digits',5) or 5)
+  side='شراء 🟢' if t.side==Side.BUY else 'بيع 🔴'
+  if closed:
+   result=f'🟢 ربح +${pnl:.2f}' if pnl is not None and pnl>=0 else f'🔴 خسارة ${pnl:.2f}' if pnl is not None else '⚪ مغلقة'
+   live_line=f'🏁 النتيجة: {result}'
+  else:
+   live_line=f'💹 السعر الآن: {current_price:.{digits}f}' if current_price is not None else '💹 السعر الآن: جاري التحديث'
+  return (
+   f'📊 {t.symbol} — {side}\n'
+   f'🧠 الاستراتيجية: {t.strategy} | 🎯 الثقة: {t.confidence*100:.0f}%\n'
+   f'🔎 السبب: {t.reason or "غير متاح"}\n'
+   f'🎫 الصفقة: {t.ticket} | 📦 اللوت: {t.volume:g}\n'
+   f'➡️ الدخول: {t.entry:.{digits}f}\n'
+   f'{live_line}\n'
+   f'🛑 الوقف: {t.sl:.{digits}f}\n'
+   f'💰 الهدف: {t.tp:.{digits}f}\n'
+   f'🛡 الحماية: {t.protection_pct:g}% | ⚖️ R:R 1:{self.rr:g}'
+  )
 
  async def _send_trade_chart(self,t,actual_risk,actual_risk_pct):
   try:
@@ -493,7 +499,6 @@ class Engine:
    import matplotlib.dates as mdates
    from datetime import datetime
 
-   # Focus the review chart around the entry instead of showing many hours.
    rates=self.gw.rates_m5(t.symbol,18)
    if rates is None or len(rates)<10:
     await self.db.log('TRADE_CHART_FAILED',t.symbol,ticket=t.ticket,error='not enough M5 candles')
@@ -504,9 +509,9 @@ class Engine:
    highs=[float(r['high']) for r in rates]
    lows=[float(r['low']) for r in rates]
    closes=[float(r['close']) for r in rates]
+   xnum=mdates.date2num(xs)
 
    fig,ax=plt.subplots(figsize=(11,6.2),dpi=130)
-   xnum=mdates.date2num(xs)
    width=(5/(24*60))*0.68
    for x,o,h,l,cl in zip(xnum,opens,highs,lows,closes):
     up=cl>=o
@@ -523,23 +528,17 @@ class Engine:
    ax.axhline(protection,color='#f59e0b',linewidth=1.2,linestyle=':',label=f'PROTECTION {t.protection_pct:g}%')
 
    side='BUY' if t.side==Side.BUY else 'SELL'
-   entry_x=xnum[-1]
+   # Put the entry marker on the real M5 candle containing the execution time.
+   opened=datetime.fromtimestamp(t.opened_at)
+   entry_idx=min(range(len(xs)),key=lambda i:abs((xs[i]-opened).total_seconds()))
+   entry_x=xnum[entry_idx]
    marker='^' if side=='BUY' else 'v'
    ax.scatter([entry_x],[t.entry],marker=marker,s=150,color='#111827',zorder=6)
-   ax.annotate(
-    f'{side} ENTRY',
-    xy=(entry_x,t.entry),xytext=(0,18 if side=='BUY' else -28),
+   ax.annotate(f'{side} ENTRY',xy=(entry_x,t.entry),xytext=(0,18 if side=='BUY' else -28),
     textcoords='offset points',ha='center',fontsize=9,fontweight='bold',
-    arrowprops=dict(arrowstyle='->',linewidth=1)
-   )
+    arrowprops=dict(arrowstyle='->',linewidth=1))
 
-   tick=self.gw.tick(t.symbol)
-   info=self.gw.info(t.symbol)
-   spread_points=None
-   if tick and info and getattr(info,'point',0):
-    spread_points=(float(tick.ask)-float(tick.bid))/float(info.point)
-
-   entry_time=datetime.fromtimestamp(t.opened_at).strftime('%Y-%m-%d %H:%M:%S')
+   ax.axvline(entry_x,color='#6b7280',linewidth=1,linestyle=':',alpha=.7)
    ax.set_title(f'{t.symbol}  {side}  |  {t.strategy}  |  Confidence {t.confidence*100:.0f}%')
    ax.set_ylabel('Price')
    ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
@@ -553,21 +552,11 @@ class Engine:
    fig.savefig(path,bbox_inches='tight')
    plt.close(fig)
 
-   spread_text=f'{spread_points:.1f} pts' if spread_points is not None else 'N/A'
-   reason_text=str(t.reason or 'N/A')
-   caption=(
-    f'📊 {t.symbol} — {side}\n'
-    f'🕒 Entry time: {entry_time}\n'
-    f'🎫 {t.ticket} | 📦 {t.volume:g}\n'
-    f'🧠 {t.strategy} | 🎯 {t.confidence*100:.0f}%\n'
-    f'🔎 Reason: {reason_text}\n'
-    f'↔️ Spread: {spread_text}\n'
-    f'➡️ Entry: {t.entry:g}\n🛑 SL: {t.sl:g}\n💰 TP: {t.tp:g}\n'
-    f'⚠️ Risk: ${actual_risk:.2f} ({actual_risk_pct:.2f}%) | R:R 1:{self.rr:g}\n'
-    f'🛡 Protection: {t.protection_pct:g}%'
-   )
-   await self.notify(caption,photo_path=path,caption=caption)
-   await self.db.log('TRADE_CHART_SENT',t.symbol,ticket=t.ticket,spread=spread_points,entry_time=entry_time)
+   tick=self.gw.tick(t.symbol)
+   current=float(tick.bid if t.side==Side.BUY else tick.ask) if tick else t.entry
+   caption=await self._trade_caption(t,current_price=current)
+   await self.notify(caption,photo_path=path,caption=caption,trade_ticket=t.ticket,pin=True)
+   await self.db.log('TRADE_CHART_SENT',t.symbol,ticket=t.ticket)
   except Exception as ex:
    await self.db.log('TRADE_CHART_FAILED',t.symbol,ticket=t.ticket,error=str(ex))
 
@@ -648,7 +637,6 @@ class Engine:
     res=self.gw.close(pos)
     if res and res.retcode in (mt5.TRADE_RETCODE_DONE,mt5.TRADE_RETCODE_DONE_PARTIAL):
      await self.db.log('MAX_DURATION_EXIT',t.symbol,ticket=t.ticket,age_seconds=age,max_trade_minutes=self.max_trade_minutes)
-     await self.notify(f'⏱ إغلاق حد {self.max_trade_minutes:g} دقيقة — {t.symbol}')
      return
     await self.db.log('MAX_DURATION_EXIT_FAILED',t.symbol,ticket=t.ticket,result=str(res))
 
@@ -690,23 +678,21 @@ class Engine:
     await self.db.set("consecutive_losses",self.consecutive_losses)
 
     await self.db.log(event,t.symbol,exit_price=exit_price,pnl=pnl,reason=reason)
-    await self.notify(
-     f'{icon} {event} — {t.symbol}\n'
-     f'🚪 سعر الخروج: {exit_price}\n'
-     f'P/L: {pnl:.2f}\n'
-     f'Duration: {age:.1f}s'
-    )
+    caption=await self._trade_caption(t,pnl=pnl,closed=True)
+    await self.notify(caption,trade_ticket=t.ticket,trade_update=True)
    else:
     await self.db.log('POSITION_CLOSED',t.symbol,reason='history_not_found')
-    await self.notify(f'🏁 تم إغلاق الصفقة — {t.symbol}\n⚠️ سبب الإغلاق غير متاح في سجل MT5.')
+    caption=await self._trade_caption(t,pnl=None,closed=True)
+    await self.notify(caption,trade_ticket=t.ticket,trade_update=True)
 
    self.last_close_by_symbol[t.symbol]=time.time()
    self.blocked_signal_by_symbol[t.symbol]=(t.strategy,t.side.value)
    self.trades.pop(t.ticket,None)
    return
 
-  # تحديث لوحة Telegram الحية أثناء وجود الصفقة.
-  # live panel handled centrally
+  # تحديث نفس رسالة صورة الصفقة بالسعر والوقف الحاليين.
+  caption=await self._trade_caption(t,current_price=float(price))
+  await self.notify(caption,trade_ticket=t.ticket,trade_update=True)
 
   # حماية الربح: تبدأ فقط بعد تحقيق 45% من المسافة إلى TP.
   target_distance=abs(t.tp-t.entry)
@@ -732,11 +718,7 @@ class Engine:
      'PROTECTION_ACTIVATED',t.symbol,
      sl=level45,price=price,target_progress=target_progress
     )
-    await self.notify(
-     f'🛡 تفعيل حماية {t.protection_pct:g}% — {t.symbol}\n'
-     f'🛑 الوقف: {level45:.{info.digits}f}\n'
-     f'⏱ بدأ عداد الخمول 60 ثانية'
-    )
+
    else:
     await self.db.log('PROTECTION_FAILED',t.symbol,result=str(res))
 
@@ -800,11 +782,7 @@ class Engine:
      'PROFIT_STALL_EXIT',t.symbol,
      idle_seconds=idle,result=str(res)
     )
-    await self.notify(
-     f'⏱ إغلاق حماية الربح — {t.symbol}\n'
-     f'📌 60 ثانية بدون تقدم جديد\n'
-     f'🛡 تم الإغلاق لحماية الربح'
-    )
+
    else:
     await self.db.log(
      'PROFIT_STALL_EXIT_FAILED',t.symbol,
