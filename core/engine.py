@@ -245,13 +245,18 @@ class Engine:
    # Avoid stacking the same USD directional exposure across correlated FX pairs.
    usd_group={'EURUSD','GBPUSD','AUDUSD','NZDUSD'}
    info=self.gw.info(symbol); tick=self.gw.tick(symbol)
-   if not info or not tick or not info.point or tick.bid<=0 or tick.ask<=tick.bid:return
+   if not info or not tick or not info.point or tick.bid<=0 or tick.ask<=tick.bid:
+    await self.db.log('SCAN_REJECT',symbol,reason='INVALID_MARKET_DATA')
+    return
 
    ok,sp,avg,lim=self.risk.spread_ok(tick,info)
-   if not ok:return
+   if not ok:
+    await self.db.log('SPREAD_REJECT',symbol,spread=sp,average=avg,limit=lim)
+    return
 
    reg,sig,meta=self.an.analyze(self.gw.ticks(symbol),info.point,self.gw.rates_m5(symbol,200),symbol=symbol,rates_m15=self.gw.rates_m15(symbol,200))
    if not sig:
+    await self.db.log('NO_SIGNAL',symbol,regime=reg.value)
     return
    confidence_score=float(sig.confidence)*100.0
    # Telegram confidence setting is a real hard entry filter.
@@ -265,11 +270,17 @@ class Engine:
    # بعد الإغلاق: مهلة قصيرة، ثم يجب أن تتجدد الإشارة قبل تكرار نفس الاستراتيجية/الاتجاه.
    signal_key=(sig.strategy,sig.side.value)
    last_close=self.last_close_by_symbol.get(symbol,0)
-   if last_close and time.time()-last_close<self.reentry_cooldown_seconds:return
-   if self.blocked_signal_by_symbol.get(symbol)==signal_key:return
+   if last_close and time.time()-last_close<self.reentry_cooldown_seconds:
+    await self.db.log('REENTRY_REJECT',symbol,reason='COOLDOWN',strategy=sig.strategy,side=sig.side.value)
+    return
+   if self.blocked_signal_by_symbol.get(symbol)==signal_key:
+    await self.db.log('REENTRY_REJECT',symbol,reason='SAME_SIGNAL_BLOCKED',strategy=sig.strategy,side=sig.side.value)
+    return
 
    last=self.last_entry_by_symbol.get(symbol,0)
-   if time.time()-last<3:return
+   if time.time()-last<3:
+    await self.db.log('REENTRY_REJECT',symbol,reason='ENTRY_THROTTLE',strategy=sig.strategy,side=sig.side.value)
+    return
 
    # مسافة SL: الاستراتيجية + الحد الأدنى الذي يفرضه الوسيط
    broker_stop_points=max(
