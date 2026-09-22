@@ -465,6 +465,8 @@ class Engine:
    tp=actual_tp
    vol=float(pos.volume or vol)
    self.trades[pos.ticket]=t
+   # A successful trade resets this symbol to the normal spread baseline.
+   self.risk.reset_spread_relaxation(symbol)
 
    await self.db.log('OPEN',symbol,ticket=pos.ticket,entry=fill,sl=sl,tp=tp,volume=vol,side=sig.side.value,strategy=sig.strategy,regime=reg.value,confidence=float(sig.confidence),reason=sig.reason)
    side_icon='🟢' if sig.side==Side.BUY else '🔴'
