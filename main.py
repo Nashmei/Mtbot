@@ -27,93 +27,61 @@ async def main():
   print('Telegram: starting - MT5 login available from Telegram')
 
  app_holder={}
- panel={'message_id':None,'text':None,'last_edit':0.0,'last_attempt':0.0,'blocked_until':0.0}
+ trade_messages={}
+ blocked_until={'until':0.0}
 
- async def notify(text,photo_path=None,caption=None):
+ async def notify(text,photo_path=None,caption=None,trade_ticket=None,trade_update=False,pin=False):
   import time
   app=app_holder.get('app')
   if not app:return
   chat_id=settings.telegram_allowed_user_id
-
-  # أثناء Flood Control لا نحاول الاتصال بتيليجرام إطلاقاً
   now=time.monotonic()
-  if now < panel.get('blocked_until',0.0):
+  if now < blocked_until['until']:
    return
 
-  is_live=('↺ الصفقات المباشرة' in text) or text.startswith('🤖 التداول المباشر')
-
-  if photo_path:
-   try:
+  try:
+   if photo_path:
     with open(photo_path,'rb') as photo:
-     await app.bot.send_photo(chat_id=chat_id,photo=photo,caption=caption or text)
-   except RetryAfter as ex:
-    wait=float(ex.retry_after)
-    panel['blocked_until']=time.monotonic()+wait+5
-    print(f'Telegram paused for {wait:.0f}s due to flood control')
-   except Exception as ex:
-    print(f'Telegram photo failed: {ex}')
-   finally:
+     msg=await app.bot.send_photo(chat_id=chat_id,photo=photo,caption=caption or text)
+    if trade_ticket is not None:
+     trade_messages[int(trade_ticket)]={'message_id':msg.message_id,'caption':caption or text,'last_edit':0.0}
+    if pin:
+     try:
+      await app.bot.pin_chat_message(chat_id=chat_id,message_id=msg.message_id,disable_notification=True)
+     except Exception as ex:
+      print('Telegram pin failed:',ex)
     try:
      Path(photo_path).unlink(missing_ok=True)
     except Exception:
      pass
-   return
-
-  if not is_live:
-   try:
-    m=await app.bot.send_message(chat_id=chat_id,text=text)
-   except RetryAfter as ex:
-    wait=float(ex.retry_after)
-    panel['blocked_until']=time.monotonic()+wait+5
-    print(f'Telegram paused for {wait:.0f}s due to flood control')
     return
-   except Exception as ex:
-    print(f'Telegram notify failed: {ex}')
+
+   if trade_update and trade_ticket is not None:
+    state=trade_messages.get(int(trade_ticket))
+    if not state:return
+    # Live price updates are intentionally throttled to avoid Telegram flood control.
+    if now-state.get('last_edit',0.0)<5.0:return
+    if state.get('caption')==text:return
+    await app.bot.edit_message_caption(chat_id=chat_id,message_id=state['message_id'],caption=text)
+    state['caption']=text
+    state['last_edit']=now
     return
-   async def delete_later(message_id):
-    await asyncio.sleep(60)
-    try:
-     await app.bot.delete_message(chat_id=chat_id,message_id=message_id)
-    except Exception:
-     pass
-   asyncio.create_task(delete_later(m.message_id))
-   return
 
-  now=time.monotonic()
-
-  # منع Flood: لوحة التداول لا تُحدّث أكثر من مرة كل 10 ثوانٍ
-  if now-panel.get('last_attempt',0.0)<10.0:
-   return
-  panel['last_attempt']=now
-
-  if panel['message_id'] is None:
-   m=await app.bot.send_message(chat_id=chat_id,text=text)
-   panel['message_id']=m.message_id
-   panel['text']=text
-   panel['last_edit']=now
-   try:
-    await app.bot.pin_chat_message(
-     chat_id=chat_id,
-     message_id=m.message_id,
-     disable_notification=True
-    )
-   except Exception as ex:
-    print('Telegram pin failed:',ex)
-   return
-
-  if panel['text']==text or now-panel['last_edit']<1.0:return
-
-  try:
-   await app.bot.edit_message_text(
-    chat_id=chat_id,message_id=panel['message_id'],text=text)
-   panel['text']=text
-   panel['last_edit']=now
+   await app.bot.send_message(chat_id=chat_id,text=text)
   except RetryAfter as ex:
    wait=float(ex.retry_after)
-   panel['blocked_until']=time.monotonic()+wait+5
+   blocked_until['until']=time.monotonic()+wait+5
    print(f'Telegram paused for {wait:.0f}s due to flood control')
-  except BadRequest:
-   pass
+  except BadRequest as ex:
+   print(f'Telegram update failed: {ex}')
+  except Exception as ex:
+   print(f'Telegram notify failed: {ex}')
+  finally:
+   if photo_path:
+    try:
+     Path(photo_path).unlink(missing_ok=True)
+    except Exception:
+     pass
 
  e=Engine(gw,db,notify)
  await e.load_settings()
