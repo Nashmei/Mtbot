@@ -29,7 +29,7 @@ async def main():
  app_holder={}
  panel={'message_id':None,'text':None,'last_edit':0.0,'last_attempt':0.0,'blocked_until':0.0}
 
- async def notify(text):
+ async def notify(text,photo_path=None,caption=None):
   import time
   app=app_holder.get('app')
   if not app:return
@@ -41,6 +41,23 @@ async def main():
    return
 
   is_live=('↺ الصفقات المباشرة' in text) or text.startswith('🤖 التداول المباشر')
+
+  if photo_path:
+   try:
+    with open(photo_path,'rb') as photo:
+     await app.bot.send_photo(chat_id=chat_id,photo=photo,caption=caption or text)
+   except RetryAfter as ex:
+    wait=float(ex.retry_after)
+    panel['blocked_until']=time.monotonic()+wait+5
+    print(f'Telegram paused for {wait:.0f}s due to flood control')
+   except Exception as ex:
+    print(f'Telegram photo failed: {ex}')
+   finally:
+    try:
+     Path(photo_path).unlink(missing_ok=True)
+    except Exception:
+     pass
+   return
 
   if not is_live:
    try:
