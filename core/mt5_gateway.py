@@ -54,6 +54,19 @@ class MT5Gateway:
                 time.sleep(self.RETRY_DELAY)
         return None
 
+    def terminal(self):
+        return mt5.terminal_info()
+
+    def algo_status(self):
+        t = self.terminal()
+        a = self.account()
+        return {
+            'connected': bool(getattr(t, 'connected', False)) if t else False,
+            'trade_allowed': bool(getattr(t, 'trade_allowed', False)) if t else False,
+            'account_trade_allowed': bool(getattr(a, 'trade_allowed', False)) if a else False,
+            'trade_expert': bool(getattr(a, 'trade_expert', False)) if a else False,
+        }
+
     def tick(self, s):
         return mt5.symbol_info_tick(s)
 
