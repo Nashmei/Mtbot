@@ -30,13 +30,10 @@ def main():
   m15=mt5.copy_rates_range(symbol,mt5.TIMEFRAME_M15,start,end)
   ticks=mt5.copy_ticks_range(symbol,start,end,mt5.COPY_TICKS_ALL)
   if m1 is None or m5 is None or m15 is None or ticks is None: continue
-  # Sample once per minute; feed only information available at that moment.
-  last_exit=0
-  for bar in m1[60:]:
+  # Pre-index time arrays so each minute slices data in O(log n), not full-array scans.\n  tt=ticks['time']; t5=m5['time']; t15=m15['time']; t1=m1['time']\n  print(f'[{symbol}] loaded: {len(m1)} M1 bars, {len(ticks)} ticks', flush=True)\n  last_exit=0\n  for bar in m1[60:]:
    ts=int(bar['time'])
    if ts<last_exit: continue
-   tk=ticks[(ticks['time']<=ts)&(ticks['time']>=ts-1800)]
-   r5=m5[m5['time']<ts][-200:]; r15=m15[m15['time']<ts][-200:]
+   lo=np.searchsorted(tt,ts-1800,side='left'); hi=np.searchsorted(tt,ts,side='right')\n   i5=np.searchsorted(t5,ts,side='left'); i15=np.searchsorted(t15,ts,side='left')\n   tk=ticks[lo:hi]\n   r5=m5[max(0,i5-200):i5]; r15=m15[max(0,i15-200):i15]
    if len(tk)<80 or len(r5)<60: continue
    reg,sig,meta=an.analyze(tk,info.point,r5,symbol=symbol,rates_m15=r15)
    if not sig or sig.confidence*100<MIN_CONFIDENCE: continue
@@ -45,7 +42,7 @@ def main():
    d=max(float(sig.sl_points),10.0)*info.point+spread
    sl=entry-d if sig.side==Side.BUY else entry+d
    tp=entry+abs(entry-sl)*RR if sig.side==Side.BUY else entry-abs(entry-sl)*RR
-   future=m1[(m1['time']>ts)&(m1['time']<=ts+MAX_MINUTES*60)]
+   i1=np.searchsorted(t1,ts,side='right'); j1=np.searchsorted(t1,ts+MAX_MINUTES*60,side='right')\n   future=m1[i1:j1]
    exitp=float(future[-1]['close']) if len(future) else entry
    reason='TIME'
    for b in future:
@@ -58,8 +55,7 @@ def main():
      if lo<=tp: exitp=tp; reason='TP'; break
    r=((exitp-entry)/(entry-sl) if sig.side==Side.BUY else (entry-exitp)/(sl-entry))
    rows.append((symbol,sig.strategy,sig.side.value,r,reason,sig.confidence*100))
-   last_exit=ts+MAX_MINUTES*60
- mt5.shutdown()
+   last_exit=ts+MAX_MINUTES*60\n  print(f'[{symbol}] done | total qualifying trades so far: {len(rows)}', flush=True)\n mt5.shutdown()
  print(f'BACKTEST {a.days} days | risk={RISK_PCT}% | RR=1:{RR} | protection={PROTECTION_PCT}% | max={MAX_MINUTES}m | positions={MAX_POSITIONS} | confidence={MIN_CONFIDENCE}%')
  if not rows:
   print('No qualifying trades.'); return
