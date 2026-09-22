@@ -460,7 +460,7 @@ class Engine:
    f'⚠️ | المخاطرة: ${actual_risk:.2f} ({actual_risk_pct:.2f}%)\n'
    f'💰 | هدف TP تقريبي: ${actual_risk*self.rr:.2f}\n'
    f'🛑 | وقف خسارة : ${actual_risk:.2f}\n'
-   f'🎯 | حماية الربح {t.protection_pct:g}٪ — [${actual_risk + (actual_risk*self.rr*t.protection_pct/100.0):.2f}]\n'
+   f'🎯 | حماية الربح {t.protection_pct:g}٪ — [${actual_risk*self.rr*t.protection_pct/100.0:.2f}]\n'
    f'🕔 | مدة اغلاق تلقائي [{self.max_trade_minutes:g} دقايق]'
   )
 
