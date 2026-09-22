@@ -30,7 +30,7 @@ class Analyzer:
    dx.append(100*abs(pp-mm)/max(pp+mm,1e-12))
   return (float(np.mean(dx[-n:])) if dx else 0.),p,m
 
- def analyze(self,ticks,point,rates=None,symbol=None,rates_m15=None):
+ def analyze(self,ticks,point,rates=None,symbol=None,rates_m15=None,rates_h1=None):
   if ticks is None or len(ticks)<80 or point<=0:
    return Regime.NO_TRADE,None,{'decision':'insufficient_ticks'}
 
@@ -66,6 +66,18 @@ class Analyzer:
    c15=np.asarray(rates_m15['close'],float)
    ema50_15=self._ema(c15[-55:],50)
    m15_bias=1 if c15[-1]>ema50_15 else (-1 if c15[-1]<ema50_15 else 0)
+
+  # H1 is an additional higher-timeframe guard. M15 must agree with the
+  # entry direction, and H1 must not be clearly opposite.
+  h1_bias=0
+  if rates_h1 is not None and len(rates_h1)>=55:
+   c60=np.asarray(rates_h1['close'],float)
+   ema50_60=self._ema(c60[-55:],50)
+   h1_bias=1 if c60[-1]>ema50_60 else (-1 if c60[-1]<ema50_60 else 0)
+
+  def htf_allows(side):
+   want=1 if side==Side.BUY else -1
+   return m15_bias==want and h1_bias in (0,want)
 
   # Closed M5 is context only. Entry direction is driven by live MT5 ticks.
   live_up=micro_trend>0 and tick_momentum>0 and tick_momentum_fast>=-max(1.,atrp*.08)
@@ -120,17 +132,36 @@ class Analyzer:
      m5_reversal_side=Side.SELL
      m5_reversal_reason='M5 resistance + '+('shooting star' if shooting else 'bearish engulfing')
 
-  # Breakout is the first-priority setup for every symbol. Require live
-  # micro-direction confirmation so a one-tick poke is less likely to trigger.
-  breakout_up=break_up and context_up and micro_trend>0 and tick_momentum>0
-  breakout_dn=break_dn and context_dn and micro_trend<0 and tick_momentum<0
+  # Breakout entry requires a real retest instead of chasing the impulse.
+  # The previous CLOSED M5 candle must have broken prior structure, then live
+  # price must return to the broken level and resume in the breakout direction.
+  breakout_up=breakout_dn=False
+  retest_level=None
+  if have and len(rates)>=25:
+   o5=np.asarray(rates['open'],float); h5=np.asarray(rates['high'],float)
+   l5=np.asarray(rates['low'],float); c5=np.asarray(rates['close'],float)
+   prior_hi=float(np.max(h5[-22:-2])); prior_lo=float(np.min(l5[-22:-2]))
+   closed_hi=float(h5[-2]); closed_lo=float(l5[-2]); closed_close=float(c5[-2])
+   retest_tol=max(3.0*point,atrp*.15*point)
+   broke_up=closed_hi>prior_hi and closed_close>prior_hi
+   broke_dn=closed_lo<prior_lo and closed_close<prior_lo
+   retest_up=(live>=prior_hi-retest_tol and live<=prior_hi+retest_tol and tick_momentum_fast>0 and micro_trend>0)
+   retest_dn=(live<=prior_lo+retest_tol and live>=prior_lo-retest_tol and tick_momentum_fast<0 and micro_trend<0)
+   breakout_up=broke_up and retest_up and context_up and htf_allows(Side.BUY)
+   breakout_dn=broke_dn and retest_dn and context_dn and htf_allows(Side.SELL)
+   if broke_up or broke_dn:
+    retest_level=prior_hi if broke_up else prior_lo
+    if not (breakout_up or breakout_dn):
+     reg=Regime.BREAKOUT
+     decision='breakout_wait_retest_or_htf'
+
   if breakout_up or breakout_dn:
    side=Side.BUY if breakout_up else Side.SELL
    reg=Regime.BREAKOUT
-   score=74+min(12,abs(tick_momentum)/max(atrp,1)*18)+min(6,micro_gap/max(atrp,1)*10)
+   score=76+min(10,abs(tick_momentum)/max(atrp,1)*14)+min(6,micro_gap/max(atrp,1)*9)
    slp=max(10.,min(1.7*atrp,max(.65*atrp,tick_range*.30)))
-   sig=Signal(side,'scalp_breakout',min(.92,score/100.),slp,'priority live structure breakout + confirmed micro momentum')
-   decision='scalp_breakout'
+   sig=Signal(side,'scalp_breakout',min(.92,score/100.),slp,'M5 breakout + direct retest + M15/H1 trend confirmation')
+   decision='scalp_breakout_retest'
 
   # Second priority: trend continuation, but only with M15 bias and an M5
   # pullback/retest instead of chasing an already extended impulse.
@@ -144,7 +175,7 @@ class Analyzer:
    pull_tol=max(atrp*.22*point,4*point)
    pullback=((side==Side.BUY and l5[-1]<=ema20_5+pull_tol and live>ema20_5) or
              (side==Side.SELL and h5[-1]>=ema20_5-pull_tol and live<ema20_5))
-   htf_ok=((side==Side.BUY and m15_bias>0) or (side==Side.SELL and m15_bias<0))
+   htf_ok=htf_allows(side)
    if strong and acceleration and pullback and htf_ok:
     reg=Regime.TREND
     score=70+min(12,abs(micro_trend)/max(atrp,1)*20)+min(10,abs(tick_momentum)/max(atrp,1)*15)
@@ -162,7 +193,8 @@ class Analyzer:
    gold_gap=micro_gap>=max(1.5,atrp*.07)
    gold_momentum=abs(tick_momentum)>=max(1.5,atrp*.07)
    gold_fast=abs(tick_momentum_fast)>=max(1.0,atrp*.035)
-   gold_expand=(gold_up or gold_dn) and gold_gap and gold_momentum and gold_fast and tick_range>=max(5.0,atrp*.35)
+   gold_side=Side.BUY if gold_up else (Side.SELL if gold_dn else None)
+   gold_expand=(gold_up or gold_dn) and gold_gap and gold_momentum and gold_fast and tick_range>=max(5.0,atrp*.35) and gold_side is not None and htf_allows(gold_side)
    if gold_expand:
     side=Side.BUY if gold_up else Side.SELL
     reg=Regime.TREND
@@ -209,5 +241,5 @@ class Analyzer:
    'tick_momentum':round(float(tick_momentum),2),'micro_trend':round(float(micro_trend),2),
    'atr_points':round(float(atrp),2),'adx':round(float(adx),1),
    'di_plus':round(float(dp),1),'di_minus':round(float(dm),1),
-   'context_trend':round(float(context_trend),2),'m15_bias':m15_bias,'micro_z':round(float(micro_z),2),'live':True
+   'context_trend':round(float(context_trend),2),'m15_bias':m15_bias,'h1_bias':h1_bias,'retest_level':retest_level,'micro_z':round(float(micro_z),2),'live':True
   }
