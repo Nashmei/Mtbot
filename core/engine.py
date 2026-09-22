@@ -493,7 +493,8 @@ class Engine:
    import matplotlib.dates as mdates
    from datetime import datetime
 
-   rates=self.gw.rates_m5(t.symbol,80)
+   # Focus the review chart around the entry instead of showing many hours.
+   rates=self.gw.rates_m5(t.symbol,18)
    if rates is None or len(rates)<10:
     await self.db.log('TRADE_CHART_FAILED',t.symbol,ticket=t.ticket,error='not enough M5 candles')
     return
@@ -522,6 +523,23 @@ class Engine:
    ax.axhline(protection,color='#f59e0b',linewidth=1.2,linestyle=':',label=f'PROTECTION {t.protection_pct:g}%')
 
    side='BUY' if t.side==Side.BUY else 'SELL'
+   entry_x=xnum[-1]
+   marker='^' if side=='BUY' else 'v'
+   ax.scatter([entry_x],[t.entry],marker=marker,s=150,color='#111827',zorder=6)
+   ax.annotate(
+    f'{side} ENTRY',
+    xy=(entry_x,t.entry),xytext=(0,18 if side=='BUY' else -28),
+    textcoords='offset points',ha='center',fontsize=9,fontweight='bold',
+    arrowprops=dict(arrowstyle='->',linewidth=1)
+   )
+
+   tick=self.gw.tick(t.symbol)
+   info=self.gw.info(t.symbol)
+   spread_points=None
+   if tick and info and getattr(info,'point',0):
+    spread_points=(float(tick.ask)-float(tick.bid))/float(info.point)
+
+   entry_time=datetime.fromtimestamp(t.opened_at).strftime('%Y-%m-%d %H:%M:%S')
    ax.set_title(f'{t.symbol}  {side}  |  {t.strategy}  |  Confidence {t.confidence*100:.0f}%')
    ax.set_ylabel('Price')
    ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
@@ -535,16 +553,21 @@ class Engine:
    fig.savefig(path,bbox_inches='tight')
    plt.close(fig)
 
+   spread_text=f'{spread_points:.1f} pts' if spread_points is not None else 'N/A'
+   reason_text=str(t.reason or 'N/A')
    caption=(
     f'📊 {t.symbol} — {side}\n'
+    f'🕒 Entry time: {entry_time}\n'
     f'🎫 {t.ticket} | 📦 {t.volume:g}\n'
     f'🧠 {t.strategy} | 🎯 {t.confidence*100:.0f}%\n'
+    f'🔎 Reason: {reason_text}\n'
+    f'↔️ Spread: {spread_text}\n'
     f'➡️ Entry: {t.entry:g}\n🛑 SL: {t.sl:g}\n💰 TP: {t.tp:g}\n'
     f'⚠️ Risk: ${actual_risk:.2f} ({actual_risk_pct:.2f}%) | R:R 1:{self.rr:g}\n'
     f'🛡 Protection: {t.protection_pct:g}%'
    )
    await self.notify(caption,photo_path=path,caption=caption)
-   await self.db.log('TRADE_CHART_SENT',t.symbol,ticket=t.ticket)
+   await self.db.log('TRADE_CHART_SENT',t.symbol,ticket=t.ticket,spread=spread_points,entry_time=entry_time)
   except Exception as ex:
    await self.db.log('TRADE_CHART_FAILED',t.symbol,ticket=t.ticket,error=str(ex))
 
