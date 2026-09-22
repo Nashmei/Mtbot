@@ -436,14 +436,14 @@ class Engine:
   self.trades[pos.ticket]=t
 
   await self.db.log('OPEN',symbol,ticket=pos.ticket,entry=fill,sl=sl,tp=tp,volume=vol,side=sig.side.value,strategy=sig.strategy,regime=reg.value,confidence=float(sig.confidence),reason=sig.reason)
+  side_icon='🟢' if sig.side==Side.BUY else '🔴'
+  side_text='شراء' if sig.side==Side.BUY else 'بيع'
   await self.notify(
-   f'🟢 {"شراء" if sig.side==Side.BUY else "بيع"} — {symbol}\n'
-   f'🎫 {pos.ticket} | 🛡 {t.protection_pct:g}%\n'
-   f'📦 اللوت: {vol:g}\n'
-   f'⚠️ المخاطرة: ${actual_risk:.2f} ({actual_risk_pct:.2f}%) | المطلوب {self.risk_pct:g}%\n'
-   f'💰 هدف TP تقريبي: ${actual_risk*self.rr:.2f}\n'
-   f'🎯 الثقة: {sig.confidence*100:.0f}% | الحد {self.min_confidence:g}%\n'
-   f'🛑 {sl} | 🎯 {tp}'
+   f'{side_icon} {side_text} — {symbol}\n\n'
+   f'📦 | اللوت: {vol:g}\n'
+   f'⚠️ | المخاطرة: ${actual_risk:.2f} ({actual_risk_pct:.2f}%)\n'
+   f'💰 | هدف TP تقريبي: ${actual_risk*self.rr:.2f}\n'
+   f'🕔 | مدة اغلاق تلقائي [{self.max_trade_minutes:g} دقايق]'
   )
 
  async def live_dashboard(self):
