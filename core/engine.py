@@ -246,7 +246,7 @@ class Engine:
   ok,sp,avg,lim=self.risk.spread_ok(tick,info)
   if not ok:return
 
-  reg,sig,meta=self.an.analyze(self.gw.ticks(symbol),info.point,self.gw.rates_m5(symbol,200))
+  reg,sig,meta=self.an.analyze(self.gw.ticks(symbol),info.point,self.gw.rates_m5(symbol,200),symbol=symbol)
   if not sig:
    return
   confidence_score=float(sig.confidence)*100.0
