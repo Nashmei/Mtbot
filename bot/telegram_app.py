@@ -3,39 +3,81 @@ from telegram.ext import Application,CommandHandler,CallbackQueryHandler,Message
 from telegram.error import BadRequest,RetryAfter
 from core.config import settings
 class TelegramUI:
- def __init__(self,engine,db): self.e=engine;self.db=db;self.login_state={};self.input_state={};self.message_ids=set()
+ def __init__(self,engine,db): self.e=engine;self.db=db;self.login_state={};self.input_state={};self.message_ids=set();self.menu_message_id=None;self.menu_chat_id=None;self.menu_expiry_task=None
  def allowed(self,u): return bool(u and u.id==settings.telegram_allowed_user_id)
- async def _edit(self,q,text,reply_markup=None):
+ def _cancel_menu_expiry(self):
+  if self.menu_expiry_task and not self.menu_expiry_task.done(): self.menu_expiry_task.cancel()
+  self.menu_expiry_task=None
+ def _arm_menu_expiry(self,bot,chat_id,message_id,delay=30):
+  import asyncio
+  self._cancel_menu_expiry()
+  async def expire():
+   try:
+    await asyncio.sleep(delay)
+    await bot.delete_message(chat_id=chat_id,message_id=message_id)
+    if self.menu_message_id==message_id:self.menu_message_id=None;self.menu_chat_id=None
+   except (asyncio.CancelledError,BadRequest): pass
+   except Exception: pass
+  self.menu_expiry_task=asyncio.create_task(expire())
+ async def _edit(self,q,text,reply_markup=None,arm=True):
   try:
    await q.edit_message_text(text,reply_markup=reply_markup)
-  except (BadRequest,RetryAfter):
-   return
+  except BadRequest as ex:
+   if 'message is not modified' not in str(ex).lower(): return
+  except RetryAfter as ex:
+   import asyncio
+   await asyncio.sleep(float(ex.retry_after)+.2)
+   try: await q.edit_message_text(text,reply_markup=reply_markup)
+   except Exception: return
+  self.menu_chat_id=q.message.chat_id;self.menu_message_id=q.message.message_id
+  if arm:self._arm_menu_expiry(q.get_bot(),self.menu_chat_id,self.menu_message_id)
+ async def _run_progress(self,q,label,work,reply_markup=None):
+  import asyncio
+  self._cancel_menu_expiry()
+  task=asyncio.create_task(asyncio.to_thread(work))
+  dots=1
+  while not task.done():
+   await self._edit(q,label+('.'*dots),reply_markup=reply_markup,arm=False)
+   dots=1 if dots>=4 else dots+1
+   try: await asyncio.wait_for(asyncio.shield(task),timeout=1.2)
+   except asyncio.TimeoutError: pass
+  return await task
+ async def _menu(self,bot,chat_id,text,reply_markup):
+  self._cancel_menu_expiry()
+  if self.menu_message_id and self.menu_chat_id==chat_id:
+   try:
+    await bot.edit_message_text(chat_id=chat_id,message_id=self.menu_message_id,text=text,reply_markup=reply_markup)
+    self._arm_menu_expiry(bot,chat_id,self.menu_message_id);return
+   except Exception: pass
+  m=await bot.send_message(chat_id=chat_id,text=text,reply_markup=reply_markup)
+  self.menu_chat_id=chat_id;self.menu_message_id=m.message_id;self._arm_menu_expiry(bot,chat_id,m.message_id)
  def kb(self):
-  return InlineKeyboardMarkup([
-   [InlineKeyboardButton('📊 الحالة',callback_data='status'),InlineKeyboardButton('🔎 تحليل الآن',callback_data='analyze')],
-   [InlineKeyboardButton('📈 إحصائيات حسابي',callback_data='accountstats')],
-   [InlineKeyboardButton('▶️ تشغيل',callback_data='start'),InlineKeyboardButton('⏹ إيقاف',callback_data='stop')],
-   [InlineKeyboardButton('💱 الأزواج',callback_data='symbols'),InlineKeyboardButton('⚖️ R:R',callback_data='rr')],
-   [InlineKeyboardButton('⚠️ المخاطرة',callback_data='risk'),InlineKeyboardButton('🛡 الحماية',callback_data='protection')],
-   [InlineKeyboardButton('🎯 الثقة',callback_data='confidence'),InlineKeyboardButton('⏱ مدة الصفقة',callback_data='maxduration')],
-   [InlineKeyboardButton('📂 حد المراكز',callback_data='maxpos'),InlineKeyboardButton('❌ حد الخسائر',callback_data='maxloss')],
-   [InlineKeyboardButton('🔐 حساب MT5',callback_data='mt5login')],
-   [InlineKeyboardButton('🔒 الحقيقي مقفل',callback_data='live')]
-  ])
+  return InlineKeyboardMarkup([[InlineKeyboardButton('📊 لوحة التحكم',callback_data='dashboard')],[InlineKeyboardButton('🤖 التداول',callback_data='trade_menu'),InlineKeyboardButton('🔎 التحليل',callback_data='analysis_menu')],[InlineKeyboardButton('⚙️ الإعدادات',callback_data='settings_menu'),InlineKeyboardButton('👤 الحساب',callback_data='account_menu')]])
+ def trade_kb(self): return InlineKeyboardMarkup([[InlineKeyboardButton('▶️ تشغيل المحرك',callback_data='start'),InlineKeyboardButton('⏹ إيقاف',callback_data='stop')],[InlineKeyboardButton('📊 الحالة',callback_data='status'),InlineKeyboardButton('↩️ الرئيسية',callback_data='dashboard')]])
+ def analysis_kb(self): return InlineKeyboardMarkup([[InlineKeyboardButton('🔎 تحليل الآن',callback_data='analyze')],[InlineKeyboardButton('💱 الأزواج',callback_data='symbols'),InlineKeyboardButton('🔥 الأنشط',callback_data='active')],[InlineKeyboardButton('↩️ الرئيسية',callback_data='dashboard')]])
+ def settings_kb(self): return InlineKeyboardMarkup([[InlineKeyboardButton('⚠️ المخاطرة',callback_data='risk'),InlineKeyboardButton('⚖️ R:R',callback_data='rr')],[InlineKeyboardButton('🎯 الثقة',callback_data='confidence'),InlineKeyboardButton('🛡 الحماية',callback_data='protection')],[InlineKeyboardButton('⏱ مدة الصفقة',callback_data='maxduration'),InlineKeyboardButton('📂 حد المراكز',callback_data='maxpos')],[InlineKeyboardButton('❌ حد الخسائر',callback_data='maxloss')],[InlineKeyboardButton('↩️ الرئيسية',callback_data='dashboard')]])
+ def account_kb(self): return InlineKeyboardMarkup([[InlineKeyboardButton('🔐 ربط MT5',callback_data='mt5login'),InlineKeyboardButton('📈 الإحصائيات',callback_data='accountstats')],[InlineKeyboardButton('🧪 فحص الجاهزية',callback_data='readiness')],[InlineKeyboardButton('↩️ الرئيسية',callback_data='dashboard')]])
  async def start(self,u,c):
   if not self.allowed(u.effective_user):return
   a=self.e.gw.account(); state=f'MT5: ✅ {a.login} / {a.server}' if a else 'MT5: ❌ غير مسجل الدخول\nاستخدم 🔐 حساب MT5'
-  await u.message.reply_text(state+'\n\n'+await self.e.status(),reply_markup=self.kb())
+  await self._menu(c.bot,u.effective_chat.id,state+'\n\n'+await self.e.status(),self.kb())
  async def cb(self,u,c):
   q=u.callback_query
   if not self.allowed(q.from_user):return
-  await q.answer(); x=q.data
+  try: await q.answer()\n  except BadRequest: pass\n  self._cancel_menu_expiry(); self.menu_chat_id=q.message.chat_id; self.menu_message_id=q.message.message_id\n  x=q.data\n  if x=='dashboard': return await self._edit(q,'🤖 MT5 BOT • لوحة التحكم\n━━━━━━━━━━━━━━\nاختر القسم:',self.kb())\n  if x=='trade_menu': return await self._edit(q,'🤖 التداول وإدارة المحرك',self.trade_kb())\n  if x=='analysis_menu': return await self._edit(q,'🔎 التحليل والأسواق',self.analysis_kb())\n  if x=='settings_menu': return await self._edit(q,'⚙️ إعدادات الاستراتيجية والمخاطر',self.settings_kb())\n  if x=='account_menu': return await self._edit(q,'👤 حساب MT5 والإحصائيات',self.account_kb())
   if x=='mt5login':
-   self.login_state[q.from_user.id]={'step':'login'}; msg='🔐 تسجيل دخول MT5 التجريبي\n\nأرسل رقم حساب MT5.\nاستخدم /cancel للإلغاء.'
+   self.login_state[q.from_user.id]={'step':'block'}; msg='🔐 تسجيل دخول MT5 التجريبي\n\nأرسل Server و Login و Password في رسالة واحدة.\nاستخدم /cancel للإلغاء.'
   elif x=='start':
    if not self.e.gw.account(): msg='❌ حساب MT5 غير متصل. استخدم 🔐 حساب MT5 أولاً.'
-   else: await self.e.start(); msg='🟢 تم تشغيل البوت على الحساب التجريبي.'
-  elif x=='stop': await self.e.stop(); msg='⏹ تم إيقاف البوت.'
+   else:
+    await self._edit(q,'⏳ جاري تشغيل المحرك.',self.trade_kb(),arm=False)
+    await self.e.start(); msg='🟢 تم تشغيل البوت على الحساب التجريبي.'
+  elif x=='stop':
+   await self._edit(q,'⏳ جاري إيقاف المحرك.',self.trade_kb(),arm=False)
+   await self.e.stop(); msg='⏹ تم إيقاف البوت.'
+  elif x=='readiness':
+   st=self.e.gw.algo_status()
+   msg=('🧪 فحص الجاهزية\n━━━━━━━━━━━━━━\n'+('✅ MT5 متصل\n' if st['connected'] else '❌ MT5 غير متصل\n')+('✅ الحساب يسمح بالتداول\n' if st['account_trade_allowed'] else '❌ الحساب يمنع التداول\n')+('✅ التداول الآلي مسموح للحساب\n' if st['trade_expert'] else '❌ التداول الآلي ممنوع للحساب\n')+('✅ Algo Trading مفعّل' if st['trade_allowed'] else '❌ Algo Trading غير مفعّل'))
   elif x=='status':
    a=self.e.gw.account(); head=f'MT5: ✅ {a.login} / {a.server}\n' if a else 'MT5: ❌ غير مسجل الدخول\n'; msg=head+await self.e.status()
   elif x=='accountstats':
@@ -56,6 +98,7 @@ class TelegramUI:
          f'🎯 R:R: 1:{self.e.rr:g}\n'
          f'❌ خسائر متتالية: {self.e.consecutive_losses}/{self.e.max_consecutive_losses}')
   elif x=='analyze':
+   await self._edit(q,'⏳ جاري تحميل بيانات السوق وتحليل الأزواج.',self.analysis_kb(),arm=False)
    if not self.e.gw.account(): msg='❌ سجّل الدخول إلى MT5 أولاً.'
    else:
     lines=['🔎 تحليل الأزواج المختارة']
@@ -131,7 +174,7 @@ class TelegramUI:
    import json
    await self.db.set('symbols',json.dumps(self.e.symbols))
    msg=f'✅ الأزواج المختارة: {", ".join(self.e.symbols) if self.e.symbols else "لا يوجد"}'
-   await self._edit(q,msg,reply_markup=self.kb())
+   await self._edit(q,msg,reply_markup=(self.account_kb() if x in ('mt5login','readiness','accountstats') else self.trade_kb() if x in ('start','stop','status') else self.analysis_kb() if x=='analyze' else self.settings_kb()))
    return
    
   elif x=='risk':
@@ -234,35 +277,37 @@ class TelegramUI:
 
   st=self.login_state.get(uid)
   if not st:return
-  if st['step']=='login':
-   if not value.isdigit(): return await u.message.reply_text('رقم الحساب يجب أن يكون أرقاماً فقط. حاول مجدداً أو استخدم /cancel.')
-   st['login']=int(value);st['step']='server';await u.message.reply_text('أرسل اسم خادم MT5 كما يظهر بالضبط، مثال: Broker-Demo.')
-  elif st['step']=='server':
-   if len(value)<2 or len(value)>100:return await u.message.reply_text('اسم الخادم غير صالح. حاول مجدداً أو استخدم /cancel.')
-   st['server']=value;st['step']='password';await u.message.reply_text('أرسل كلمة مرور MT5 الآن. سأحاول حذف رسالة كلمة المرور مباشرة بعد قراءتها، ولن يتم تسجيلها في السجل.')
-  elif st['step']=='password':
-   password=value
-   try: await u.message.delete()
-   except Exception: pass
-   login,server=st['login'],st['server']; self.login_state.pop(u.effective_user.id,None)
-   ok,err,a=self.e.gw.login(login,password,server)
+  if st.get('step')=='block':
+   import re,asyncio
+   fields={}
+   for line in value.splitlines():
+    m=re.match(r'^\s*(server|login|password)\s*:\s*(.*?)\s*$',line,re.I)
+    if m:fields[m.group(1).lower()]=m.group(2)
+   login=fields.get('login','').strip();server=fields.get('server','').strip();secret=fields.get('password','')
+   if not login.isdigit() or not server or not secret:return await u.message.reply_text('❌ البيانات ناقصة. أرسل Server و Login و Password في رسالة واحدة.')
+   self.login_state.pop(uid,None)
+   try:await u.message.delete()
+   except Exception:pass
+   wait=await c.bot.send_message(u.effective_chat.id,'⏳ جاري تشغيل MT5 وتسجيل الدخول.')
+   self.menu_chat_id=u.effective_chat.id;self.menu_message_id=wait.message_id
+   task=asyncio.create_task(asyncio.to_thread(self.e.gw.login,int(login),secret,server));dots=1
+   while not task.done():
+    try:await wait.edit_text('⏳ جاري تشغيل MT5 وتسجيل الدخول'+'.'*dots)
+    except Exception:pass
+    dots=1 if dots>=4 else dots+1
+    try:await asyncio.wait_for(asyncio.shield(task),timeout=1.2)
+    except asyncio.TimeoutError:pass
+   ok,err,a=await task
    if ok:
-    # حفظ بيانات الحساب محلياً بصلاحيات المالك فقط
     from pathlib import Path
-    import json, os
-    cred_file=Path.home()/'.mt5bot_credentials.json'
-    cred_file.write_text(json.dumps({
-     'login':int(login),
-     'server':server,
-     'password':password
-    }))
-    os.chmod(cred_file,0o600)
-    await self.db.log('MT5_LOGIN_SUCCESS',login=login,server=server)
-    password=None
-    await c.bot.send_message(u.effective_chat.id,f'✅ تم الاتصال بـ MT5\nرقم الحساب: {a.login}\nالخادم: {a.server}\nالوضع: حساب تجريبي محمي',reply_markup=self.kb())
+    import json,os
+    cred_file=Path.home()/'.mt5bot_credentials.json';cred_file.write_text(json.dumps({'login':int(login),'server':server,'password':secret}));os.chmod(cred_file,0o600)
+    await self.db.log('MT5_LOGIN_SUCCESS',login=int(login),server=server);secret=None
+    await wait.edit_text(f'👤 حساب MT5\n━━━━━━━━━━━━━━\n✅ تم الاتصال بنجاح\n🆔 الحساب: {a.login}\n🌐 الخادم: {a.server}\n🔒 الوضع: تجريبي محمي',reply_markup=self.account_kb())
    else:
-    await self.db.log('MT5_LOGIN_FAILED',login=login,server=server,error=str(err))
-    await c.bot.send_message(u.effective_chat.id,f'❌ فشل تسجيل الدخول إلى MT5\nالخطأ: {err}\nلم يتم تسجيل كلمة المرور. اضغط 🔐 حساب MT5 للمحاولة مجدداً.',reply_markup=self.kb())
+    secret=None;await self.db.log('MT5_LOGIN_FAILED',login=int(login),server=server,error=str(err))
+    await wait.edit_text(f'👤 حساب MT5\n━━━━━━━━━━━━━━\n❌ فشل تسجيل الدخول\n📡 الخطأ: {err}\n🔐 لم يتم حفظ بيانات الدخول.',reply_markup=self.account_kb())
+   self._arm_menu_expiry(c.bot,wait.chat_id,wait.message_id)
  async def ask_value(self,u,key,prompt):
   if not self.allowed(u.effective_user): return
   self.input_state[u.effective_user.id]=key
