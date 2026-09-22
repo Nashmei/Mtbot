@@ -98,6 +98,32 @@ class Analyzer:
   micro_z=(live-local_mean)/local_std
   range_ok=(not have) or adx<25
 
+  # Flexible per-symbol market regime router. This does not require one
+  # strategy for all symbols: every symbol is classified independently each scan.
+  # It only blocks clearly unsuitable setups; ambiguous conditions stay permissive
+  # so opportunity count is not unnecessarily reduced.
+  trend_strength=abs(context_trend)/max(atrp,1.)
+  directional=((m15_bias>0 and context_trend>0) or (m15_bias<0 and context_trend<0))
+  clear_trend=directional and (adx>=22 or trend_strength>=.16)
+  clear_range=(have and adx<18 and trend_strength<.10 and tick_range<max(10.,atrp*.85))
+  expansion=(tick_range>=max(7.,atrp*.65) and abs(tick_momentum)>=max(1.5,atrp*.08))
+  market_mode='trend' if clear_trend else ('range' if clear_range else ('expansion' if expansion else 'mixed'))
+
+  def strategy_allowed(name,side=None):
+   # Reversal/reversion are unsuitable in a clearly directional trend.
+   if name in ('scalp_m5_reversal','scalp_reversion') and clear_trend:
+    return False
+   # EMA crosses are useful frequently, but avoid clear range/chop where
+   # repeated 9/21 crosses are most likely to whipsaw.
+   if name=='ema_cross_scalp' and clear_range:
+    return False
+   # Trend continuation needs at least non-range conditions.
+   if name=='scalp_trend' and clear_range:
+    return False
+   # Breakout/retest and gold expansion remain available in mixed/expansion
+   # markets; their own entry rules still decide the actual signal.
+   return True
+
   sig=None; reg=Regime.RANGE; decision='waiting_live_momentum'
 
   # Frequent EMA crossover scalp. Use CLOSED candles only so a forming candle
@@ -184,7 +210,7 @@ class Analyzer:
    decision='scalp_breakout_retest'
 
   # Frequent EMA 9/21 crossover setup. Breakout/retest keeps first priority.
-  if sig is None and ema_cross_side is not None:
+  if sig is None and ema_cross_side is not None and strategy_allowed('ema_cross_scalp',ema_cross_side):
    side=ema_cross_side
    reg=Regime.TREND
    score=72+min(10,ema_cross_gap/max(atrp*.05,1.)*4)+min(8,abs(tick_momentum_fast)/max(atrp,1)*12)
@@ -194,7 +220,7 @@ class Analyzer:
 
   # Second priority: trend continuation, but only with M15 bias and an M5
   # pullback/retest instead of chasing an already extended impulse.
-  if sig is None and (bull or bear) and have:
+  if sig is None and (bull or bear) and have and strategy_allowed('scalp_trend'):
    side=Side.BUY if bull else Side.SELL
    strong=micro_gap>=max(1.25,atrp*.07) and abs(tick_momentum)>=max(1.25,atrp*.07)
    acceleration=((side==Side.BUY and tick_momentum_fast>=max(1.0,atrp*.035)) or
@@ -234,7 +260,7 @@ class Analyzer:
 
   # Fourth priority: M5 reversal only in a ranging/non-trending context.
   strong_trend=(have and adx>=25) or abs(context_trend)>max(2.0,atrp*.18)
-  if sig is None and m5_reversal_side is not None and range_ok and not strong_trend:
+  if sig is None and m5_reversal_side is not None and range_ok and not strong_trend and strategy_allowed('scalp_m5_reversal',m5_reversal_side):
    side=m5_reversal_side
    reg=Regime.RANGE
    score=76
@@ -243,7 +269,7 @@ class Analyzer:
    decision='scalp_m5_reversal'
 
   # Mean reversion remains last priority and needs a clearer extreme/reversal.
-  if sig is None and not (bull or bear) and range_ok and abs(micro_z)>=1.80 and abs(tick_momentum_fast)>=1.25:
+  if sig is None and not (bull or bear) and range_ok and abs(micro_z)>=1.80 and abs(tick_momentum_fast)>=1.25 and strategy_allowed('scalp_reversion'):
    side=Side.SELL if micro_z>0 and tick_momentum_fast<0 else (Side.BUY if micro_z<0 and tick_momentum_fast>0 else None)
    if side:
     reg=Regime.RANGE
@@ -265,7 +291,7 @@ class Analyzer:
    elif tick_range>max(8.,atrp*.8):
     reg=Regime.VOLATILE; decision='volatile_no_direction'
   return reg,sig,{
-   'decision':decision,'price':round(live,8),'spread_points':round(spread,1),
+   'decision':decision,'market_mode':market_mode,'price':round(live,8),'spread_points':round(spread,1),
    'spread_ratio':round(spread_ratio,2),'tick_momentum_fast':round(float(tick_momentum_fast),2),
    'tick_momentum':round(float(tick_momentum),2),'micro_trend':round(float(micro_trend),2),
    'atr_points':round(float(atrp),2),'adx':round(float(adx),1),
