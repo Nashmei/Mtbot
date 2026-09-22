@@ -6,7 +6,50 @@ class MT5Gateway:
     MAX_RETRIES = 3
     RETRY_DELAY = 1.0  # seconds
 
+    def _enable_algo_trading(self):
+        """Enable MT5 Expert/API trading flags for the single shared terminal."""
+        from pathlib import Path
+        import configparser
+
+        terminal = Path(settings.mt5_terminal_path) if settings.mt5_terminal_path else None
+        if not terminal:
+            return
+        terminal_dir = terminal.parent
+        candidates = [
+            terminal_dir / 'Config' / 'common.ini',
+            terminal_dir / 'config' / 'common.ini',
+        ]
+        ini = next((p for p in candidates if p.exists()), candidates[0])
+        ini.parent.mkdir(parents=True, exist_ok=True)
+
+        parser = configparser.ConfigParser(interpolation=None, strict=False)
+        parser.optionxform = str
+        encoding = 'utf-16'
+        if ini.exists():
+            raw = ini.read_bytes()
+            if raw.startswith((b'\xff\xfe', b'\xfe\xff')):
+                encoding = 'utf-16'
+            elif raw.startswith(b'\xef\xbb\xbf'):
+                encoding = 'utf-8-sig'
+            else:
+                encoding = 'utf-8'
+            try:
+                parser.read_string(raw.decode(encoding))
+            except Exception:
+                parser = configparser.ConfigParser(interpolation=None, strict=False)
+                parser.optionxform = str
+        if not parser.has_section('Experts'):
+            parser.add_section('Experts')
+        parser.set('Experts', 'AllowLiveTrading', '1')
+        parser.set('Experts', 'Enabled', '1')
+        parser.set('Experts', 'Account', '0')
+        parser.set('Experts', 'Profile', '0')
+        parser.set('Experts', 'Api', '0')
+        with open(ini, 'w', encoding=encoding, newline='') as out:
+            parser.write(out, space_around_delimiters=False)
+
     def initialize_terminal(self):
+        self._enable_algo_trading()
         for attempt in range(self.MAX_RETRIES):
             result = mt5.initialize(settings.mt5_terminal_path) if settings.mt5_terminal_path else mt5.initialize()
             if result:
@@ -29,6 +72,7 @@ class MT5Gateway:
         return None
 
     def login(self, login, password, server):
+        self._enable_algo_trading()
         for attempt in range(self.MAX_RETRIES):
             mt5.shutdown()
             kw = {'login': int(login), 'password': password, 'server': server}
