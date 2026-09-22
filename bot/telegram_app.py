@@ -62,7 +62,7 @@ class TelegramUI:
     for symbol in self.e.symbols:
      i=self.e.gw.info(symbol)
      if not i: continue
-     reg,sig,meta=self.e.an.analyze(self.e.gw.ticks(symbol),i.point,self.e.gw.rates_m5(symbol,200),symbol=symbol)
+     reg,sig,meta=self.e.an.analyze(self.e.gw.ticks(symbol),i.point,self.e.gw.rates_m5(symbol,200),symbol=symbol,rates_m15=self.e.gw.rates_m15(symbol,200))
      if sig:
       direction='شراء 🟢' if sig.side.value=='BUY' else 'بيع 🔴'
       lines.append(f'\n💱 {symbol}\n📌 الإشارة: {direction}\n🧠 الاستراتيجية: {sig.strategy}\n🎯 قوة الإشارة: {sig.confidence*100:.0f}%\n📊 السوق: {reg.value}')
