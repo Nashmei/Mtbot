@@ -5,7 +5,7 @@ import numpy as np
 from core.analyzer import Analyzer
 from core.models import Side
 
-SYMBOLS=['EURUSD','XAUUSD','NZDUSD','GBPUSD','AUDUSD','USDJPY']
+SYMBOLS=['EURUSD','XAUUSD','USDJPY']
 RR=1.5
 RISK_PCT=2.0
 PROTECTION_PCT=50.0
@@ -49,18 +49,39 @@ def main():
    d=max(float(sig.sl_points),10.0)*info.point+spread
    sl=entry-d if sig.side==Side.BUY else entry+d
    tp=entry+abs(entry-sl)*RR if sig.side==Side.BUY else entry-abs(entry-sl)*RR
-   i1=np.searchsorted(t1,ts,side='right'); j1=np.searchsorted(t1,ts+MAX_MINUTES*60,side='right')
-   future=m1[i1:j1]
-   exitp=float(future[-1]['close']) if len(future) else entry
-   reason='TIME'
-   for b in future:
-    hi=float(b['high']); lo=float(b['low'])
+   # Tick-level exit simulation: original SL/TP, protection trigger,
+   # 5% of original entry-to-TP trailing gap, and 60s no-new-best exit.
+   ex0=np.searchsorted(tt,ts,side='right'); ex1=np.searchsorted(tt,ts+MAX_MINUTES*60,side='right')
+   future_ticks=ticks[ex0:ex1]
+   exitp=entry; reason='TIME'; activated=False; best=None; last_best_time=None
+   trigger=entry+(tp-entry)*(PROTECTION_PCT/100.0)
+   trail_gap=abs(tp-entry)*0.05
+   for x in future_ticks:
+    xt=int(x['time'])
+    px=float(x['bid'] if sig.side==Side.BUY else x['ask'])
     if sig.side==Side.BUY:
-     if lo<=sl: exitp=sl; reason='SL'; break
-     if hi>=tp: exitp=tp; reason='TP'; break
+     if px<=sl: exitp=sl; reason='SL' if not activated else 'PROTECT_SL'; break
+     if px>=tp: exitp=tp; reason='TP'; break
+     if not activated and px>=trigger:
+      activated=True; best=px; last_best_time=xt; sl=max(sl,trigger)
+     elif activated:
+      if px>best:
+       best=px; last_best_time=xt; sl=max(sl,trigger,best-trail_gap)
+      elif xt-last_best_time>=60:
+       exitp=px; reason='PROTECT_60S'; break
     else:
-     if hi>=sl: exitp=sl; reason='SL'; break
-     if lo<=tp: exitp=tp; reason='TP'; break
+     if px>=sl: exitp=sl; reason='SL' if not activated else 'PROTECT_SL'; break
+     if px<=tp: exitp=tp; reason='TP'; break
+     if not activated and px<=trigger:
+      activated=True; best=px; last_best_time=xt; sl=min(sl,trigger)
+     elif activated:
+      if px<best:
+       best=px; last_best_time=xt; sl=min(sl,trigger,best+trail_gap)
+      elif xt-last_best_time>=60:
+       exitp=px; reason='PROTECT_60S'; break
+   else:
+    if len(future_ticks):
+     x=future_ticks[-1]; exitp=float(x['bid'] if sig.side==Side.BUY else x['ask'])
    r=((exitp-entry)/(entry-sl) if sig.side==Side.BUY else (entry-exitp)/(sl-entry))
    rows.append((symbol,sig.strategy,sig.side.value,r,reason,sig.confidence*100))
    last_exit=ts+MAX_MINUTES*60
@@ -83,6 +104,6 @@ def main():
  for st in sorted(set(x[1] for x in rows)):
   z=[x for x in rows if x[1]==st]
   print(f'  {st}: {len(z)} | {sum(x[3] for x in z):+.2f}R')
- print('NOTE: conservative historical approximation; current live protection/trailing and portfolio concurrency are not fully simulated.')
+ print('NOTE: protection/trailing/60s inactivity are simulated from ticks; portfolio concurrency is still not fully simulated.')
 if __name__=='__main__':
  main()
