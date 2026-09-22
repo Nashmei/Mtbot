@@ -59,8 +59,9 @@ async def main():
    if trade_update and trade_ticket is not None:
     state=trade_messages.get(int(trade_ticket))
     if not state:return
-    # Live price updates are intentionally throttled to avoid Telegram flood control.
-    if now-state.get('last_edit',0.0)<5.0:return
+    # Final close result must always replace the live price immediately.
+    is_final=('🏁 النتيجة:' in text)
+    if not is_final and now-state.get('last_edit',0.0)<5.0:return
     if state.get('caption')==text:return
     await app.bot.edit_message_caption(chat_id=chat_id,message_id=state['message_id'],caption=text)
     state['caption']=text
