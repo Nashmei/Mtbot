@@ -62,7 +62,7 @@ class TelegramUI:
     for symbol in self.e.symbols:
      i=self.e.gw.info(symbol)
      if not i: continue
-     reg,sig,meta=self.e.an.analyze(self.e.gw.ticks(symbol),i.point,self.e.gw.rates_m5(symbol,200))
+     reg,sig,meta=self.e.an.analyze(self.e.gw.ticks(symbol),i.point,self.e.gw.rates_m5(symbol,200),symbol=symbol)
      if sig:
       direction='شراء 🟢' if sig.side.value=='BUY' else 'بيع 🔴'
       lines.append(f'\n💱 {symbol}\n📌 الإشارة: {direction}\n🧠 الاستراتيجية: {sig.strategy}\n🎯 قوة الإشارة: {sig.confidence*100:.0f}%\n📊 السوق: {reg.value}')
@@ -92,15 +92,13 @@ class TelegramUI:
    return
   elif x=='active':
    import time
-   candidates=('XAUUSD','EURUSD','GBPUSD','USDJPY','USDCHF','USDCAD','AUDUSD','NZDUSD')
-   names=[z.name for z in self.e.gw.available_symbols()]
+   # Scan the complete symbol universe exposed by the connected MT5 server.
+   # Ranking is activity only: recent price range divided by current spread.
+   names=list(dict.fromkeys(z.name for z in self.e.gw.available_symbols()))
    ranked=[]
-   for key in candidates:
-    exact=[n for n in names if n.upper()==key]
-    matches=exact or [n for n in names if key in n.upper()]
-    if not matches: continue
-    n=matches[0]; info=self.e.gw.info(n); t=self.e.gw.tick(n)
-    ticks=self.e.gw.ticks(n,300)
+   for n in names:
+    info=self.e.gw.info(n); t=self.e.gw.tick(n)
+    ticks=self.e.gw.ticks(n,180)
     if not info or not t or not info.point or ticks is None or len(ticks)<2: continue
     bids=[float(z['bid']) for z in ticks if float(z['bid'])>0]
     if len(bids)<2: continue
@@ -112,11 +110,11 @@ class TelegramUI:
     ranked.append((score,n,move,spread))
    ranked.sort(reverse=True)
    rows=[]
-   for score,n,move,spread in ranked[:6]:
+   for score,n,move,spread in ranked[:10]:
     icon='🥇' if 'XAU' in n.upper() else '🔥'
     rows.append([InlineKeyboardButton(f'{icon} {n} • move {move:.0f} • spread {spread:.1f}',callback_data=f'sym:{n}')])
    rows.append([InlineKeyboardButton('↩️ الرموز',callback_data='symbols')])
-   text='🔥 الأنشط الآن\nالترتيب حسب حركة السعر الأخيرة ÷ السبريد.\nهذا مقياس للنشاط فقط وليس توقعاً للربحية.'
+   text=f'🔥 الأنشط الآن — كامل سوق MT5\nتم فحص {len(names)} رمزاً، وعرض أعلى 10 حسب حركة السعر الأخيرة ÷ السبريد.\nهذا مقياس للنشاط فقط وليس توقعاً للربحية.'
    if not ranked: text='⚠️ لا توجد بيانات لحظية كافية حالياً.'
    await self._edit(q,text,reply_markup=InlineKeyboardMarkup(rows))
    return
