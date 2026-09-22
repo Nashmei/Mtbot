@@ -141,9 +141,14 @@ class Analyzer:
    ema_cross_tf='M1' if cross_rates is rates_m1 else 'M5'
    # M15 blocks obvious counter-trend crosses, but H1 is not required here
    # so this setup can add opportunities instead of becoming too restrictive.
-   if cross_up and m15_bias>=0 and tick_momentum_fast>0:
+   # Confirm the cross is still supported by current price action. This
+   # avoids entering after the crossover has already gone stale/reversed.
+   recent_move=(live-float(mid[-10]))/point
+   buy_live_ok=tick_momentum_fast>0 and recent_move>0 and live>=micro_fast
+   sell_live_ok=tick_momentum_fast<0 and recent_move<0 and live<=micro_fast
+   if cross_up and m15_bias>=0 and buy_live_ok:
     ema_cross_side=Side.BUY
-   elif cross_dn and m15_bias<=0 and tick_momentum_fast<0:
+   elif cross_dn and m15_bias<=0 and sell_live_ok:
     ema_cross_side=Side.SELL
 
   # Closed-candle M5 reversal scalp helpers. The just-closed candle must form
@@ -209,8 +214,7 @@ class Analyzer:
    sig=Signal(side,'scalp_breakout',min(.92,score/100.),slp,'M5 breakout + direct retest + M15/H1 trend confirmation')
    decision='scalp_breakout_retest'
 
-  # Frequent EMA 9/21 crossover setup. Breakout/retest keeps first priority.
-  if sig is None and ema_cross_side is not None and strategy_allowed('ema_cross_scalp',ema_cross_side):
+  # Frequent EMA 9/21 crossover setup. XAUUSD is reserved for its dedicated gold_scalp logic.\n  is_gold=str(symbol or '').upper().startswith('XAUUSD')\n  if sig is None and not is_gold and ema_cross_side is not None and strategy_allowed('ema_cross_scalp',ema_cross_side):
    side=ema_cross_side
    reg=Regime.TREND
    score=72+min(10,ema_cross_gap/max(atrp*.05,1.)*4)+min(8,abs(tick_momentum_fast)/max(atrp,1)*12)
@@ -241,7 +245,6 @@ class Analyzer:
     reg=Regime.TREND; decision='trend_wait_pullback'
 
   # Third priority: dedicated gold expansion setup.
-  is_gold=str(symbol or '').upper().startswith('XAUUSD')
   if sig is None and is_gold:
    gold_up=micro_trend>0 and tick_momentum>0 and tick_momentum_fast>0 and context_up
    gold_dn=micro_trend<0 and tick_momentum<0 and tick_momentum_fast<0 and context_dn
