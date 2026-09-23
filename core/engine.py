@@ -55,6 +55,9 @@ class Engine:
   self.last_cycle_seconds=0.0
   self.last_cycle_at=0.0
   self.last_cycle_log_at=0.0
+  self.strategy_performance={}
+  self.strategy_performance_window=50
+  self.strategy_performance_refreshed_at=0.0
 
   # الإعدادات المحفوظة تُحمّل لاحقاً داخل سياق async
 
@@ -73,6 +76,20 @@ class Engine:
    self.consecutive_losses=max(0,int(await self.db.get('consecutive_losses',0)))
   except (TypeError,ValueError):
    pass
+
+  await self._refresh_strategy_performance(force=True)
+
+ async def _refresh_strategy_performance(self,force=False):
+  now=time.monotonic()
+  if not force and now-self.strategy_performance_refreshed_at<60.0:
+   return
+  try:
+   self.strategy_performance=await self.db.strategy_performance(self.strategy_performance_window)
+   self.strategy_performance_refreshed_at=now
+  except Exception as ex:
+   self.strategy_performance_refreshed_at=now
+   await self.db.log('STRATEGY_PERFORMANCE_ERROR',error=repr(ex))
+
 
  async def status(self):
   a=self.gw.account()
@@ -319,6 +336,8 @@ class Engine:
    info=self.gw.info(t.symbol); tick=self.gw.tick(t.symbol)
    if info and tick: await self.manage(t,tick,info)
 
+  await self._refresh_strategy_performance()
+
   # لا دخول جديد عند بلوغ الحدود
   if not await self._daily_entry_allowed(account):
    return
@@ -390,12 +409,28 @@ class Engine:
     return
    m5=self.gw.rates_m5(symbol,200)
    m1=self.gw.rates_m1(symbol,200)
-   reg,sig,meta=self.an.analyze(ticks,info.point,m5,symbol=symbol,rates_m15=self.gw.rates_m15(symbol,200),rates_h1=self.gw.rates_h1(symbol,200),rates_m1=m1)
+   reg,sig,meta=self.an.analyze(
+    ticks,info.point,m5,symbol=symbol,
+    rates_m15=self.gw.rates_m15(symbol,200),
+    rates_h1=self.gw.rates_h1(symbol,200),
+    rates_m1=m1,
+    strategy_performance=self.strategy_performance,
+   )
    for diagnostic in meta.get('opportunity_diagnostics',[]) or []:
     await self._log_reject(
      'OPPORTUNITY_DIAGNOSTIC',symbol,
      reason=diagnostic.get('strategy',''),
      **diagnostic,
+    )
+   selection=meta.get('strategy_selection',[]) or []
+   if selection:
+    winner=next((row for row in selection if row.get('selected')),None)
+    await self._log_reject(
+     'STRATEGY_SELECTION',symbol,
+     reason=(winner or {}).get('strategy','none'),
+     winner=(winner or {}).get('strategy'),
+     winner_score=(winner or {}).get('final_score'),
+     candidates=selection,
     )
    for candidate in meta.get('opportunity_candidates',[]) or []:
     await self._log_reject(
@@ -1014,7 +1049,11 @@ class Engine:
      self.consecutive_losses=0
     await self.db.set("consecutive_losses",self.consecutive_losses)
 
-    await self.db.log(event,t.symbol,exit_price=exit_price,pnl=pnl,reason=reason)
+    await self.db.log(
+     event,t.symbol,ticket=t.ticket,strategy=t.strategy,
+     exit_price=exit_price,pnl=pnl,reason=reason
+    )
+    await self._refresh_strategy_performance(force=True)
     caption=await self._trade_caption(t,pnl=pnl,closed=True)
     await self.notify(caption,trade_ticket=t.ticket,trade_update=True,trade_result=pnl,trade_result_reason=result_reason)
    else:
