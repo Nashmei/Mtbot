@@ -415,6 +415,7 @@ class Engine:
     rates_h1=self.gw.rates_h1(symbol,200),
     rates_m1=m1,
     strategy_performance=self.strategy_performance,
+    min_confidence=self.min_confidence,
    )
    for diagnostic in meta.get('opportunity_diagnostics',[]) or []:
     await self._log_reject(
