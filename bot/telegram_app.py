@@ -58,12 +58,12 @@ class TelegramUI:
  def settings_kb(self): return InlineKeyboardMarkup([[InlineKeyboardButton('⚠️ المخاطرة',callback_data='risk'),InlineKeyboardButton('⚖️ R:R',callback_data='rr')],[InlineKeyboardButton('🎯 الثقة',callback_data='confidence'),InlineKeyboardButton('🛡 الحماية',callback_data='protection')],[InlineKeyboardButton('⏱ مدة الصفقة',callback_data='maxduration'),InlineKeyboardButton('📂 حد المراكز',callback_data='maxpos')],[InlineKeyboardButton('❌ حد الخسائر',callback_data='maxloss')],[InlineKeyboardButton('↩️ الرئيسية',callback_data='dashboard')]])
  def account_kb(self): return InlineKeyboardMarkup([[InlineKeyboardButton('🔐 ربط MT5',callback_data='mt5login'),InlineKeyboardButton('📈 الإحصائيات',callback_data='accountstats')],[InlineKeyboardButton('🧪 فحص الجاهزية',callback_data='readiness')],[InlineKeyboardButton('↩️ الرئيسية',callback_data='dashboard')]])
  async def start(self,u,c):
-  if not self.allowed(u.effective_user):return
+  if not self.allowed(u.effective_user) or u.effective_chat.id!=settings.telegram_allowed_user_id:return
   a=self.e.gw.account(); state=f'MT5: ✅ {a.login} / {a.server}' if a else 'MT5: ❌ غير مسجل الدخول\nاستخدم 🔐 حساب MT5'
   await self._menu(c.bot,u.effective_chat.id,state+'\n\n'+await self.e.status(),self.kb())
  async def cb(self,u,c):
   q=u.callback_query
-  if not self.allowed(q.from_user):return
+  if not self.allowed(q.from_user) or u.effective_chat.id!=settings.telegram_allowed_user_id:return
   try: await q.answer()
   except BadRequest: pass
   self._cancel_menu_expiry()
@@ -76,12 +76,15 @@ class TelegramUI:
   if x=='settings_menu': return await self._edit(q,'⚙️ إعدادات الاستراتيجية والمخاطر',self.settings_kb())
   if x=='account_menu': return await self._edit(q,'👤 حساب MT5 والإحصائيات',self.account_kb())
   if x=='mt5login':
+   if self.e.running:
+    return await self._edit(q,'⏹ أوقف المحرك قبل تغيير حساب MT5.',self.account_kb())
    self.login_state[q.from_user.id]={'step':'block'}; msg='🔐 تسجيل دخول MT5 التجريبي\n\nأرسل Server و Login و Password في رسالة واحدة.\nاستخدم /cancel للإلغاء.'
   elif x=='start':
    if not self.e.gw.account(): msg='❌ حساب MT5 غير متصل. استخدم 🔐 حساب MT5 أولاً.'
    else:
     await self._edit(q,'⏳ جاري تشغيل المحرك.',self.trade_kb(),arm=False)
-    await self.e.start(); msg='🟢 تم تشغيل البوت على الحساب التجريبي.'
+    started=await self.e.start()
+    msg='🟢 تم تشغيل البوت على الحساب التجريبي.' if started else '⚠️ لم يبدأ المحرك. راجع رسالة السبب وفحص الجاهزية.'
   elif x=='stop':
    await self._edit(q,'⏳ جاري إيقاف المحرك.',self.trade_kb(),arm=False)
    await self.e.stop(); msg='⏹ تم إيقاف البوت.'
@@ -115,7 +118,16 @@ class TelegramUI:
     for symbol in self.e.symbols:
      i=self.e.gw.info(symbol)
      if not i: continue
-     reg,sig,meta=self.e.an.analyze(self.e.gw.ticks(symbol),i.point,self.e.gw.rates_m5(symbol,200),symbol=symbol,rates_m15=self.e.gw.rates_m15(symbol,200))
+     import time
+     ticks=self.e.gw.ticks(symbol)
+     if ticks is None or len(ticks)<80:
+      lines.append(f'\n💱 {symbol}\n⚠️ بيانات ticks غير كافية.')
+      continue
+     tick_ts=float(ticks['time_msc'][-1])/1000.0 if 'time_msc' in ticks.dtype.names else float(ticks['time'][-1])
+     if abs(time.time()-tick_ts)>settings.max_tick_age_seconds:
+      lines.append(f'\n💱 {symbol}\n⚠️ آخر سعر قديم؛ لا توجد إشارة صالحة الآن.')
+      continue
+     reg,sig,meta=self.e.an.analyze(ticks,i.point,self.e.gw.rates_m5(symbol,200),symbol=symbol,rates_m15=self.e.gw.rates_m15(symbol,200),rates_h1=self.e.gw.rates_h1(symbol,200),rates_m1=self.e.gw.rates_m1(symbol,200))
      if sig:
       direction='شراء 🟢' if sig.side.value=='BUY' else 'بيع 🔴'
       lines.append(f'\n💱 {symbol}\n📌 الإشارة: {direction}\n🧠 الاستراتيجية: {sig.strategy}\n🎯 قوة الإشارة: {sig.confidence*100:.0f}%\n📊 السوق: {reg.value}')
@@ -123,6 +135,22 @@ class TelegramUI:
       reason=str(meta.get('decision','waiting'))
       labels={'waiting_live_momentum':'انتظار زخم لحظي','waiting_momentum':'انتظار تأكيد الزخم','volatile_no_direction':'حركة قوية بلا اتجاه','direction_not_confirmed':'الاتجاه غير مؤكد'}
       lines.append(f'\n💱 {symbol}\n⚪ لا توجد فرصة حالياً\n📊 السوق: {reg.value}\n🔎 السبب: {labels.get(reason,reason)}')
+      checks=meta.get('gold_checks') if reason=='gold_wait_confirmation' else meta.get('trend_checks')
+      if checks:
+       check_labels={'gap':'Micro gap','momentum':'الزخم','acceleration':'التسارع','pullback':'Pullback','htf':'M15/H1','direction':'الاتجاه اللحظي','expansion_range':'مدى التوسع','range_floor':'الحد الأدنى للمدى'}
+       detail=['   '+('✅' if ok else '❌')+' '+check_labels.get(name,name) for name,ok in checks.items()]
+       lines[-1]+='\n🧩 شروط الدخول:\n'+'\n'.join(detail)
+       values=meta.get('gold_values') if reason=='gold_wait_confirmation' else meta.get('trend_values')
+       if values:
+        bias_name=lambda v: 'BUY' if v>0 else ('SELL' if v<0 else 'NEUTRAL')
+        if reason=='gold_wait_confirmation':
+         lines[-1]+=(f"\n📐 القيم: Gap {values['micro_gap']}/{values['gap_min']} | Momentum {values['momentum']} (|{values['momentum_abs']}|/{values['momentum_min']}) | Accel {values['acceleration']} (|{values['acceleration_abs']}|/{values['acceleration_min']})\n"
+                     f"   Range {values['tick_range']}/{values['expansion_range_min']} | Floor {values['expansion_range_floor']} | Score {values['confirmation_score']}/{values['confirmation_required']}\n"
+                     f"   Score {values['confirmation_score']}/{values['confirmation_required']} | Side {values['side']} | M15 {bias_name(values['m15_bias'])} | H1 {bias_name(values['h1_bias'])}")
+        else:
+         lines[-1]+=(f"\n📐 القيم: Gap {values['micro_gap']}/{values['momentum_min']} | Momentum {values['momentum']} (|{values['momentum_abs']}|/{values['momentum_min']}) | Accel {values['acceleration']} (|{values['acceleration_abs']}|/{values['acceleration_min']})\n"
+                     f"   Pullback distance {values['pullback_distance_points']}pt | tolerance {values['pullback_tolerance_points']}pt | Live {values['live']} | EMA20 {values['ema20_m5']}\n"
+                     f"   Side {values['side']} | M15 {bias_name(values['m15_bias'])} | H1 {bias_name(values['h1_bias'])}")
     msg='\n'.join(lines)
   elif x=='symbols':
    symbols=self.e.gw.available_symbols()
@@ -212,20 +240,12 @@ class TelegramUI:
   else: msg='⚠️ هذا الزر غير مفعّل بعد.'
   await self._edit(q,msg,reply_markup=self.kb())
  async def cancel(self,u,c):
-  if not self.allowed(u.effective_user): return
-  from pathlib import Path
-  import MetaTrader5 as mt5
+  if not self.allowed(u.effective_user) or u.effective_chat.id!=settings.telegram_allowed_user_id:return
   self.login_state.pop(u.effective_user.id,None)
   self.input_state.pop(u.effective_user.id,None)
-  f=Path.home()/'.mt5bot_credentials.json'
-  try:
-   if f.exists(): f.unlink()
-  except Exception:
-   pass
-  mt5.shutdown()
-  await u.message.reply_text('🗑️ تم حذف بيانات حساب MT5 المحفوظة وتسجيل الخروج.',reply_markup=self.kb())
+  await u.message.reply_text('✅ أُلغيت العملية الحالية. بقي حساب MT5 محفوظاً ومتصلًا.',reply_markup=self.kb())
  async def text(self,u,c):
-  if not self.allowed(u.effective_user) or not u.message:return
+  if not self.allowed(u.effective_user) or not u.message or u.effective_chat.id!=settings.telegram_allowed_user_id:return
   uid=u.effective_user.id
   value=(u.message.text or '').strip()
   self.message_ids.add((u.effective_chat.id,u.message.message_id))
@@ -233,25 +253,26 @@ class TelegramUI:
   key=self.input_state.pop(uid,None)
   if key:
    try:
+    import math
     if key=='risk':
      v=float(value)
-     if not 0.25<=v<=50: raise ValueError()
+     if not math.isfinite(v) or not 0.25<=v<=50: raise ValueError()
      self.e.risk_pct=v; await self.db.set('risk_pct',v); msg=f'✅ المخاطرة: {v:g}%'
     elif key=='confidence':
      v=float(value)
-     if not 50<=v<=95: raise ValueError()
+     if not math.isfinite(v) or not 50<=v<=95: raise ValueError()
      self.e.min_confidence=v; await self.db.set('min_confidence',v); msg=f'✅ الثقة: {v:g}%'
     elif key=='protection':
      v=float(value)
-     if not 5<=v<=90: raise ValueError()
+     if not math.isfinite(v) or not 5<=v<=90: raise ValueError()
      self.e.protection_pct=v; await self.db.set('protection_pct',v); msg=f'✅ الحماية: {v:g}%'
     elif key=='maxduration':
      v=float(value)
-     if not 3<=v<=240: raise ValueError()
+     if not math.isfinite(v) or not 3<=v<=240: raise ValueError()
      self.e.max_trade_minutes=v; await self.db.set('max_trade_minutes',v); msg=f'✅ حد مدة الصفقة: {v:g} دقيقة'
     elif key=='rr':
      v=float(value)
-     if not .5<=v<=10: raise ValueError()
+     if not math.isfinite(v) or not .5<=v<=10: raise ValueError()
      self.e.rr=v; await self.db.set('rr',v); msg=f'✅ R:R = 1:{v:g}'
     elif key=='maxpos':
      v=int(value)
@@ -319,7 +340,7 @@ class TelegramUI:
     await wait.edit_text(f'👤 حساب MT5\n━━━━━━━━━━━━━━\n❌ فشل تسجيل الدخول\n📡 الخطأ: {err}\n🔐 لم يتم حفظ بيانات الدخول.',reply_markup=self.account_kb())
    self._arm_menu_expiry(c.bot,wait.chat_id,wait.message_id)
  async def ask_value(self,u,key,prompt):
-  if not self.allowed(u.effective_user): return
+  if not self.allowed(u.effective_user) or u.effective_chat.id!=settings.telegram_allowed_user_id:return
   self.input_state[u.effective_user.id]=key
   m=await u.message.reply_text(prompt)
   self.message_ids.add((u.effective_chat.id,m.message_id))
@@ -350,7 +371,7 @@ class TelegramUI:
   await self.ask_value(u,'symbols','📊 أرسل الرموز مفصولة بمسافة\nمثال:\nEURUSD GBPUSD XAUUSD')
 
  async def clean(self,u,c):
-  if not self.allowed(u.effective_user): return
+  if not self.allowed(u.effective_user) or u.effective_chat.id!=settings.telegram_allowed_user_id:return
   chat=u.effective_chat.id
   self.message_ids.add((chat,u.message.message_id))
   deleted=0

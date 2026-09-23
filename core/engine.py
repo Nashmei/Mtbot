@@ -1,4 +1,4 @@
-import asyncio,time
+import asyncio,time,traceback
 import MetaTrader5 as mt5
 from .config import settings
 from .models import TradeState,Side
@@ -27,6 +27,7 @@ class Engine:
   self.max_consecutive_losses=settings.max_consecutive_losses
   self.consecutive_losses=0
   self.loss_limit_notified=False
+  self.daily_loss_notified=False
 
   # كل ticket له TradeState مستقل
   self.trades={}
@@ -45,6 +46,10 @@ class Engine:
   self.reject_log_interval=60.0
   self.trade_alert_meta={}
   self.execution_notice_once=set()
+  self.scan_count=0
+  self.last_cycle_seconds=0.0
+  self.last_cycle_at=0.0
+  self.last_cycle_log_at=0.0
 
   # الإعدادات المحفوظة تُحمّل لاحقاً داخل سياق async
 
@@ -73,6 +78,7 @@ class Engine:
 
   return (
    f'{state} | 🔒 تجريبي\n'
+   f'🔄 دورات المحرك: {self.scan_count} | آخر مدة: {self.last_cycle_seconds:.2f}ث\n'
    f'💱 الأزواج: {symbols}\n'
    f'📂 المراكز: {len(self.trades)} / {self.max_positions}\n'
    f'⚠️ المخاطرة: {self.risk_pct:g}% لكل صفقة\n'
@@ -84,18 +90,40 @@ class Engine:
   )
 
  async def start(self):
-  old=[p for p in (self.gw.positions() or ()) if getattr(p,'magic',0)==4009 and p.ticket not in self.trades]
+  import math
+  if not (math.isfinite(self.risk_pct) and 0<self.risk_pct<=50
+          and math.isfinite(self.rr) and .5<=self.rr<=10
+          and 1<=self.max_positions<=10
+          and math.isfinite(settings.daily_loss_limit_pct)
+          and 0<=settings.daily_loss_limit_pct<=100):
+   await self.notify('⚠️ إعدادات المخاطرة أو العائد أو حد المراكز غير صالحة.')
+   return False
+  account=self.gw.account()
+  if not account or account.trade_mode!=mt5.ACCOUNT_TRADE_MODE_DEMO:
+   await self.notify('🔒 يلزم اتصال بحساب MT5 تجريبي قبل التشغيل.')
+   return False
+  if not await self._daily_entry_allowed(account):
+   return False
+  permissions=self.gw.algo_status()
+  if not all(permissions.get(key) for key in ('connected','trade_allowed','account_trade_allowed','trade_expert')):
+   await self.notify('⚠️ اتصال MT5 أو صلاحية Algo Trading غير جاهزة. افحص الجاهزية أولاً.')
+   return False
+  positions=self.gw.positions()
+  if positions is None:
+   await self.notify('⚠️ تعذر قراءة مراكز MT5؛ لن يبدأ المحرك.')
+   return False
+  old=[p for p in positions if getattr(p,'magic',0)==4009 and p.ticket not in self.trades]
   if old:
    await self.notify('⚠️ توجد صفقة قديمة للبوت غير متتبعة. أغلقها يدويًا قبل التشغيل.')
-   return
+   return False
 
   if self.running:
    await self.notify('ℹ️ البوت يعمل بالفعل.')
-   return
+   return True
 
   if not self.symbols:
    await self.notify('⚠️ اختر زوجاً واحداً على الأقل قبل التشغيل.')
-   return
+   return False
 
   self.running=True
   self.last_analysis_by_symbol={}
@@ -117,7 +145,8 @@ class Engine:
    f'🛡 الحماية: {self.protection_pct:g}%'
   )
 
-  asyncio.create_task(self.loop())
+  self.loop_task=asyncio.create_task(self.loop())
+  return True
 
  async def stop(self):
   # منع أي دخول جديد فوراً
@@ -146,6 +175,15 @@ class Engine:
     mt5.TRADE_RETCODE_DONE,
     mt5.TRADE_RETCODE_DONE_PARTIAL
    ):
+    remaining=self.gw.position_by_ticket(t.ticket)
+    if remaining:
+     failed+=1
+     await self.db.log('STOP_EXIT_PARTIAL',t.symbol,ticket=t.ticket,remaining_volume=remaining.volume)
+     await self.notify(
+      f'⚠️ إغلاق جزئي للمركز {t.ticket} ({t.symbol}). '
+      f'المتبقي {remaining.volume:g} لوت؛ افحصه في MT5.'
+     )
+     continue
     closed+=1
     await asyncio.sleep(.3)
 
@@ -210,13 +248,62 @@ class Engine:
 
  async def loop(self):
   while self.running:
-   try: await self.step()
-   except Exception as e: await self.db.log('ENGINE_ERROR',self.symbol,error=str(e))
+   started=time.monotonic()
+   try:
+    await self.step()
+    self.scan_count+=1
+    self.last_cycle_seconds=time.monotonic()-started
+    self.last_cycle_at=time.time()
+    if self.last_cycle_at-self.last_cycle_log_at>=60:
+     self.last_cycle_log_at=self.last_cycle_at
+     await self.db.log('ENGINE_CYCLE',duration_seconds=round(self.last_cycle_seconds,3),scan_count=self.scan_count)
+   except Exception as e:
+    self.running=False
+    try: await self.db.log('ENGINE_ERROR',self.symbol,error=repr(e),traceback=traceback.format_exc())
+    finally: await self.notify('🚨 توقف المحرك بسبب خطأ. افحص سجل ENGINE_ERROR ومراكز MT5 قبل إعادة التشغيل.')
+    return
    await asyncio.sleep(settings.poll_interval_ms/1000)
+
+ async def _daily_entry_allowed(self,account):
+  """Persist a local-day equity baseline across bot restarts."""
+  from datetime import date
+  import math
+  equity=float(getattr(account,'equity',0) or 0)
+  if not math.isfinite(equity) or equity<=0:
+   return False
+  if settings.daily_loss_limit_pct<=0:
+   return True
+  today=date.today().isoformat()
+  saved_day=await self.db.get('daily_equity_date')
+  baseline=float(await self.db.get('daily_equity_baseline',0) or 0)
+  if saved_day!=today or not math.isfinite(baseline) or baseline<=0:
+   baseline=equity
+   await self.db.set('daily_equity_baseline',baseline)
+   await self.db.set('daily_equity_date',today)
+   self.daily_loss_notified=False
+  allowed=equity>baseline*(1-settings.daily_loss_limit_pct/100.0)
+  if not allowed and not self.daily_loss_notified:
+   self.daily_loss_notified=True
+   await self.db.log('DAILY_EQUITY_LIMIT',equity=equity,baseline=baseline,limit_pct=settings.daily_loss_limit_pct)
+   await self.notify('🛑 توقف الدخول: حد انخفاض Equity اليومي. تستمر إدارة المراكز المفتوحة.')
+  return allowed
+
  async def step(self):
   account=self.gw.account()
   if not account or account.trade_mode!=mt5.ACCOUNT_TRADE_MODE_DEMO:
    self.running=False; await self.notify('🔒 الحساب التجريبي فقط.'); return
+
+  positions=self.gw.positions()
+  if positions is None:
+   self.running=False
+   await self.notify('⚠️ تعذر التحقق من مراكز MT5؛ أُوقف الدخول حتى استعادة الاتصال.')
+   return
+  unknown=[p for p in positions if getattr(p,'magic',0)==4009 and p.ticket not in self.trades]
+  if unknown:
+   self.running=False
+   await self.db.log('UNMANAGED_POSITION',tickets=[p.ticket for p in unknown])
+   await self.notify('🚨 يوجد مركز للبوت غير متتبع. أُوقف المحرك؛ افحص المراكز في MT5.')
+   return
 
   # إدارة كل الصفقات المفتوحة أولاً
   for t in list(self.trades.values()):
@@ -224,6 +311,8 @@ class Engine:
    if info and tick: await self.manage(t,tick,info)
 
   # لا دخول جديد عند بلوغ الحدود
+  if not await self._daily_entry_allowed(account):
+   return
   if len(self.trades)>=self.max_positions:return
   if self.max_consecutive_losses > 0 and self.consecutive_losses>=self.max_consecutive_losses:
    if not self.loss_limit_notified:
@@ -263,15 +352,36 @@ class Engine:
    usd_group={'EURUSD','GBPUSD','AUDUSD','NZDUSD'}
    info=self.gw.info(symbol); tick=self.gw.tick(symbol)
    if not info or not tick or not info.point or tick.bid<=0 or tick.ask<=tick.bid:
-    await self._log_reject('SCAN_REJECT',symbol,reason='INVALID_MARKET_DATA')
+    await self._log_reject(
+     'SCAN_REJECT',symbol,reason='INVALID_MARKET_DATA',
+     info=bool(info),tick=bool(tick),
+     point=float(getattr(info,'point',0) or 0) if info else 0,
+     bid=float(getattr(tick,'bid',0) or 0) if tick else 0,
+     ask=float(getattr(tick,'ask',0) or 0) if tick else 0,
+    )
+    return
+
+   # Under Wine/MT5, symbol_info_tick() can expose a terminal-local timestamp
+   # (for example UTC+3) even though copy_ticks_range() returns Unix UTC.
+   # Use the history tick stream as the authoritative freshness clock and keep
+   # symbol_info_tick() only for the live bid/ask used by spread/execution.
+   ticks=self.gw.ticks(symbol)
+   if ticks is None or len(ticks)<80:
+    await self._log_reject('SCAN_REJECT',symbol,reason='INSUFFICIENT_TICKS')
+    return
+   latest=float(ticks['time_msc'][-1])/1000.0 if 'time_msc' in ticks.dtype.names else float(ticks['time'][-1])
+   tick_age=time.time()-latest
+   if abs(tick_age)>settings.max_tick_age_seconds:
+    await self._log_reject('SCAN_REJECT',symbol,reason='STALE_TICKS',age_seconds=tick_age)
     return
 
    ok,sp,avg,lim=self.risk.spread_ok(tick,info)
    if not ok:
     await self._log_reject('SPREAD_REJECT',symbol,spread=sp,average=avg,limit=lim)
     return
-
-   reg,sig,meta=self.an.analyze(self.gw.ticks(symbol),info.point,self.gw.rates_m5(symbol,200),symbol=symbol,rates_m15=self.gw.rates_m15(symbol,200),rates_h1=self.gw.rates_h1(symbol,200),rates_m1=self.gw.rates_m1(symbol,200))
+   m5=self.gw.rates_m5(symbol,200)
+   m1=self.gw.rates_m1(symbol,200)
+   reg,sig,meta=self.an.analyze(ticks,info.point,m5,symbol=symbol,rates_m15=self.gw.rates_m15(symbol,200),rates_h1=self.gw.rates_h1(symbol,200),rates_m1=m1)
    if not sig:
     await self._log_reject('NO_SIGNAL',symbol,regime=reg.value)
     return
@@ -285,7 +395,9 @@ class Engine:
     return
 
    # بعد الإغلاق: مهلة قصيرة، ثم يجب أن تتجدد الإشارة قبل تكرار نفس الاستراتيجية/الاتجاه.
-   signal_key=(sig.strategy,sig.side.value)
+   is_gold=symbol.upper().startswith('XAUUSD')
+   signal_bar=int(m1['time'][-1]) if m1 is not None and len(m1) and sig.strategy=='ema_cross_scalp' else (int(m5['time'][-1]) if m5 is not None and len(m5) else int(ticks['time'][-1]//60*60))
+   signal_key=(sig.strategy,sig.side.value) if is_gold else (sig.strategy,sig.side.value,signal_bar)
    last_close=self.last_close_by_symbol.get(symbol,0)
    if last_close and time.time()-last_close<self.reentry_cooldown_seconds:
     await self._log_reject('REENTRY_REJECT',symbol,reason='COOLDOWN',strategy=sig.strategy,side=sig.side.value)
@@ -297,6 +409,34 @@ class Engine:
    last=self.last_entry_by_symbol.get(symbol,0)
    if time.time()-last<3:
     await self._log_reject('REENTRY_REJECT',symbol,reason='ENTRY_THROTTLE',strategy=sig.strategy,side=sig.side.value)
+    return
+
+   # Analysis and history calls may take time. Size and price the order from
+   # a fresh quote, not from the quote captured before analysis.
+   tick=self.gw.tick(symbol)
+   if not tick or tick.bid<=0 or tick.ask<=tick.bid:
+    await self._log_reject(
+     'SCAN_REJECT',symbol,reason='INVALID_ENTRY_QUOTE',
+     bid=float(getattr(tick,'bid',0) or 0) if tick else 0,
+     ask=float(getattr(tick,'ask',0) or 0) if tick else 0,
+    )
+    return
+   # Re-check freshness from copy_ticks_range(), whose timestamps are Unix UTC
+   # on this Wine/MT5 setup. Do not compare the terminal-local live quote time.
+   entry_ticks=self.gw.ticks(symbol,80)
+   if entry_ticks is None or len(entry_ticks)<80:
+    await self._log_reject('SCAN_REJECT',symbol,reason='INSUFFICIENT_ENTRY_TICKS')
+    return
+   entry_latest=(float(entry_ticks['time_msc'][-1])/1000.0
+                 if 'time_msc' in entry_ticks.dtype.names
+                 else float(entry_ticks['time'][-1]))
+   entry_age=time.time()-entry_latest
+   if abs(entry_age)>settings.max_tick_age_seconds:
+    await self._log_reject('SCAN_REJECT',symbol,reason='STALE_ENTRY_QUOTE',age_seconds=entry_age)
+    return
+   spread_ok,_,_,_=self.risk.spread_ok(tick,info)
+   if not spread_ok:
+    await self._log_reject('SPREAD_REJECT',symbol,reason='ENTRY_SPREAD')
     return
 
    # مسافة SL: الاستراتيجية + الحد الأدنى الذي يفرضه الوسيط
@@ -404,23 +544,80 @@ class Engine:
 
    actual_risk_pct=(actual_risk/float(account.equity)*100.0) if account.equity else 0.0
 
-   before={p.ticket for p in (self.gw.positions(symbol) or ())}
+   existing=self.gw.positions(symbol)
+   if existing is None:
+    await self._log_reject('ORDER_REJECT',symbol,reason='POSITIONS_UNAVAILABLE')
+    return
+   before={p.ticket for p in existing}
+   filling=self.gw.filling_for(info)
+   if filling is None:
+    await self._log_reject('ORDER_REJECT',symbol,reason='NO_SUPPORTED_FILLING_MODE')
+    return
    req={'action':mt5.TRADE_ACTION_DEAL,'symbol':symbol,'volume':vol,'type':typ,
         'price':price,'sl':sl,'tp':tp,'deviation':settings.max_slippage_points,
         'magic':4009,'comment':f'TGSCALP:{sig.strategy}',
-        'type_time':mt5.ORDER_TIME_GTC,'type_filling':mt5.ORDER_FILLING_FOK}
+        'type_time':mt5.ORDER_TIME_GTC,'type_filling':filling}
 
    chk=self.gw.order_check(req)
    if not chk:
-    await self.notify(f'❌ لم تنفذ {symbol}\norder_check لم يرجع نتيجة\nMT5: {mt5.last_error()}')
+    notice_key=('order_check_none',symbol,signal_key)
+    if notice_key not in self.execution_notice_once:
+     self.execution_notice_once.add(notice_key)
+     await self.notify(f'❌ لم تنفذ {symbol}\norder_check لم يرجع نتيجة\nMT5: {mt5.last_error()}')
+    await self._log_reject('ORDER_CHECK_REJECT',symbol,reason='NO_RESULT',volume=vol)
     return
+
+   # MT5 may require more margin than order_calc_margin() estimated. For
+   # TRADE_RETCODE_NO_MONEY, walk volume down by the broker step until the
+   # order check accepts it. This can only reduce risk; it never increases it.
+   no_money=getattr(mt5,'TRADE_RETCODE_NO_MONEY',10019)
+   if chk.retcode==no_money:
+    requested_vol=vol
+    while chk and chk.retcode==no_money and vol-vstep>=vmin-1e-9:
+     vol=round(vol-vstep,8)
+     req['volume']=vol
+     chk=self.gw.order_check(req)
+    actual_risk=loss_1lot*vol
+    actual_risk_pct=(actual_risk/float(account.equity)*100.0) if account.equity else 0.0
+    if not chk or chk.retcode!=0:
+     code=getattr(chk,'retcode',no_money) if chk else no_money
+     comment=getattr(chk,'comment','No money') if chk else 'No money'
+     await self._log_reject(
+      'ORDER_CHECK_REJECT',symbol,reason='NO_MONEY',retcode=code,
+      requested_volume=requested_vol,final_volume=vol,
+      risk_pct=actual_risk_pct,
+     )
+     notice_key=('order_check_no_money',symbol,signal_key)
+     if notice_key not in self.execution_notice_once:
+      self.execution_notice_once.add(notice_key)
+      await self.notify(
+       f'❌ رفض فحص الصفقة — {symbol}\n'
+       f'الكود: {code}\n'
+       f'السبب: {comment}\n'
+       f'اللوت بعد خفض المارجن: {vol:g} | المخاطرة: {actual_risk_pct:.2f}%'
+      )
+     return
+    if vol < requested_vol:
+     await self._log_reject(
+      'MARGIN_VOLUME_REDUCED',symbol,requested_volume=requested_vol,
+      accepted_volume=vol,risk_pct=actual_risk_pct,
+     )
+
    if chk.retcode!=0:
-    await self.notify(
-     f'❌ رفض فحص الصفقة — {symbol}\n'
-     f'الكود: {chk.retcode}\n'
-     f'السبب: {getattr(chk,"comment","غير معروف")}\n'
-     f'اللوت: {vol:g} | المخاطرة: {actual_risk_pct:.2f}%'
+    await self._log_reject(
+     'ORDER_CHECK_REJECT',symbol,reason='BROKER_REJECT',
+     retcode=chk.retcode,comment=getattr(chk,'comment','غير معروف'),
+     volume=vol,risk_pct=actual_risk_pct,
     )
+    notice_key=('order_check_reject',symbol,signal_key,chk.retcode)
+    if notice_key not in self.execution_notice_once:
+     self.execution_notice_once.add(notice_key)
+     await self.notify(
+      f'❌ رفض فحص الصفقة — {symbol}\n'
+      f'الكود: {chk.retcode}\n'
+      f'السبب: {getattr(chk,"comment","غير معروف")}\n'
+      f'اللوت: {vol:g} | المخاطرة: {actual_risk_pct:.2f}%'
+     )
     return
 
    res=self.gw.send(req)
@@ -443,11 +640,12 @@ class Engine:
      break
 
    if not pos:
+    self.running=False
     await self.db.log('POSITION_LINK_FAILED',symbol,result=str(res))
     try:
      await self.notify(
       f'🚨 نُفذت صفقة {symbol} لكن تعذر ربطها آلياً. '
-      f'لن يتم فتح صفقة جديدة على الرمز حتى الفحص.'
+      f'أُوقف المحرك بالكامل؛ افحص المركز في MT5 قبل إعادة التشغيل.'
      )
     except Exception:
      pass
@@ -469,7 +667,7 @@ class Engine:
    t=TradeState(
     pos.ticket,symbol,sig.side,fill,actual_sl,actual_tp,initial_r,time.time(),
     strategy=sig.strategy,regime=reg.value,confidence=sig.confidence,
-    reason=sig.reason,volume=float(pos.volume or vol),
+    reason=sig.reason,volume=float(pos.volume or vol),signal_bar=signal_bar,
     protection_pct=self.protection_pct,trailing_gap_pct=self.trailing_gap_pct
    )
 
@@ -728,7 +926,10 @@ class Engine:
     await self.notify(caption,trade_ticket=t.ticket,trade_update=True)
 
    self.last_close_by_symbol[t.symbol]=time.time()
-   self.blocked_signal_by_symbol[t.symbol]=(t.strategy,t.side.value)
+   self.blocked_signal_by_symbol[t.symbol]=(
+    (t.strategy,t.side.value) if t.symbol.upper().startswith('XAUUSD')
+    else (t.strategy,t.side.value,t.signal_bar)
+   )
    self.trades.pop(t.ticket,None)
    self.trade_alert_meta.pop(t.ticket,None)
    return

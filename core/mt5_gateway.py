@@ -123,7 +123,13 @@ class MT5Gateway:
 
     def ticks(self, s, n=300):
         from datetime import datetime, timezone, timedelta
-        return mt5.copy_ticks_from(s, datetime.now(timezone.utc) - timedelta(minutes=30), n, mt5.COPY_TICKS_ALL)
+        now = datetime.now(timezone.utc)
+        # copy_ticks_from returns the FIRST n ticks after its start time,
+        # which can be almost 30 minutes old on an active instrument.
+        rows = mt5.copy_ticks_range(s, now - timedelta(minutes=1), now, mt5.COPY_TICKS_ALL)
+        if rows is None or len(rows) < 80:
+            rows = mt5.copy_ticks_range(s, now - timedelta(minutes=5), now, mt5.COPY_TICKS_ALL)
+        return rows[-n:] if rows is not None else None
 
     def rates(self, s, timeframe, count=200):
         # شموع مغلقة فقط
@@ -171,6 +177,18 @@ class MT5Gateway:
     def order_check(self, r):
         return mt5.order_check(r)
 
+    def filling_for(self, info):
+        """Choose a filling policy permitted by this symbol's execution mode."""
+        mode = getattr(info, 'trade_exemode', None)
+        flags = int(getattr(info, 'filling_mode', 0) or 0)
+        if mode in (mt5.SYMBOL_TRADE_EXECUTION_REQUEST, mt5.SYMBOL_TRADE_EXECUTION_INSTANT) or flags & 1:
+            return mt5.ORDER_FILLING_FOK
+        if flags & 2:
+            return mt5.ORDER_FILLING_IOC
+        if mode != mt5.SYMBOL_TRADE_EXECUTION_MARKET:
+            return mt5.ORDER_FILLING_RETURN
+        return None
+
     def send(self, r):
         return mt5.order_send(r)
 
@@ -179,6 +197,10 @@ class MT5Gateway:
 
     def close(self, p):
         t = self.tick(p.symbol)
+        info = self.info(p.symbol)
+        filling = self.filling_for(info) if info else None
+        if not t or filling is None:
+            return None
         side = mt5.ORDER_TYPE_SELL if p.type == mt5.POSITION_TYPE_BUY else mt5.ORDER_TYPE_BUY
         price = t.bid if side == mt5.ORDER_TYPE_SELL else t.ask
         return mt5.order_send({
@@ -192,5 +214,5 @@ class MT5Gateway:
             'magic': 4009,
             'comment': 'TGSCALP_CLOSE',
             'type_time': mt5.ORDER_TIME_GTC,
-            'type_filling': mt5.ORDER_FILLING_FOK
+            'type_filling': filling
         })
