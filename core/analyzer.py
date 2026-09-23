@@ -4,6 +4,7 @@ from .strategies import (
  SCALP_TREND, GOLD_SCALP,
  scalp_breakout, ema_cross_scalp, scalp_trend, gold_scalp,
  m5_reversal_candidate, scalp_m5_reversal, scalp_reversion,
+ scalp_sweep_reversal, scalp_squeeze_expansion,
 )
 
 # MT5Gateway.rates() starts at position 1, so -1 is the latest fully closed M5 bar.
@@ -165,6 +166,20 @@ class Analyzer:
    reversion_candidate=scalp_reversion(ctx)
    if reversion_candidate is not None:
     sig=reversion_candidate; reg=Regime.RANGE; decision='scalp_reversion'
+
+  # Priority 6: failed-breakout / liquidity-sweep reversal.
+  # New opportunity strategies run only after all existing strategies so
+  # existing signal selection remains unchanged.
+  if sig is None:
+   sweep_candidate=scalp_sweep_reversal(ctx)
+   if sweep_candidate is not None:
+    sig=sweep_candidate; reg=Regime.BREAKOUT; decision='scalp_sweep_reversal'
+
+  # Priority 7: volatility compression -> expansion.
+  if sig is None:
+   squeeze_candidate=scalp_squeeze_expansion(ctx)
+   if squeeze_candidate is not None:
+    sig=squeeze_candidate; reg=Regime.VOLATILE; decision='scalp_squeeze_expansion'
 
   if sig is None:
    if clear_trend:blockers.append('clear_trend')
