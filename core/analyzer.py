@@ -84,8 +84,8 @@ class Analyzer:
   # Closed M5 is context only. Entry direction is driven by live MT5 ticks.
   # ATR-adaptive thresholds keep quiet markets tradable without accepting a
   # directionless tick stream. HTF protection is applied separately below.
-  momentum_min=max(.75,atrp*.04)
-  acceleration_min=max(.50,atrp*.02)
+  momentum_min=max(.50,atrp*.025)
+  acceleration_min=max(.25,atrp*.0125)
   live_up=micro_trend>0 and tick_momentum>0 and tick_momentum_fast>=-acceleration_min
   live_dn=micro_trend<0 and tick_momentum<0 and tick_momentum_fast<=acceleration_min
   context_up=(not have) or context_trend>=-atrp*.20
@@ -243,12 +243,12 @@ class Analyzer:
   # pullback/retest instead of chasing an already extended impulse.
   if sig is None and (bull or bear) and have and strategy_allowed('scalp_trend'):
    side=Side.BUY if bull else Side.SELL
-   strong=micro_gap>=max(.75,atrp*.04) and abs(tick_momentum)>=momentum_min
+   strong=micro_gap>=max(.50,atrp*.025) and abs(tick_momentum)>=momentum_min
    acceleration=((side==Side.BUY and tick_momentum_fast>=acceleration_min) or
                  (side==Side.SELL and tick_momentum_fast<=-acceleration_min))
    c5=np.asarray(rates['close'],float); h5=np.asarray(rates['high'],float); l5=np.asarray(rates['low'],float)
    ema20_5=self._ema(c5[-30:],20)
-   pull_tol=max(atrp*.22*point,4*point)
+   pull_tol=max(atrp*.30*point,4*point)
    pullback=((side==Side.BUY and l5[-1]<=ema20_5+pull_tol and live>ema20_5) or
              (side==Side.SELL and h5[-1]>=ema20_5-pull_tol and live<ema20_5))
    htf_ok=htf_allows(side)
@@ -265,9 +265,9 @@ class Analyzer:
   if sig is None and is_gold:
    gold_up=micro_trend>0 and tick_momentum>0 and tick_momentum_fast>0 and context_up
    gold_dn=micro_trend<0 and tick_momentum<0 and tick_momentum_fast<0 and context_dn
-   gold_gap=micro_gap>=max(1.0,atrp*.05)
-   gold_momentum=abs(tick_momentum)>=max(1.0,atrp*.05)
-   gold_fast=abs(tick_momentum_fast)>=max(.75,atrp*.025)
+   gold_gap=micro_gap>=max(.75,atrp*.035)
+   gold_momentum=abs(tick_momentum)>=max(.75,atrp*.035)
+   gold_fast=abs(tick_momentum_fast)>=max(.50,atrp*.0175)
    gold_side=Side.BUY if gold_up else (Side.SELL if gold_dn else None)
    gold_expand=(gold_up or gold_dn) and gold_gap and gold_momentum and gold_fast and tick_range>=max(5.0,atrp*.35) and gold_side is not None and htf_allows(gold_side)
    if gold_expand:
