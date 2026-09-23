@@ -251,7 +251,8 @@ class Analyzer:
   # pullback/retest instead of chasing an already extended impulse.
   if sig is None and (bull or bear) and have and strategy_allowed('scalp_trend'):
    side=Side.BUY if bull else Side.SELL
-   strong=micro_gap>=momentum_min and abs(tick_momentum)>=momentum_min
+   gap_ok=micro_gap>=momentum_min
+   momentum_ok=abs(tick_momentum)>=momentum_min
    acceleration=((side==Side.BUY and tick_momentum_fast>=acceleration_min) or
                  (side==Side.SELL and tick_momentum_fast<=-acceleration_min))
    c5=np.asarray(rates['close'],float); h5=np.asarray(rates['high'],float); l5=np.asarray(rates['low'],float)
@@ -260,10 +261,14 @@ class Analyzer:
    pullback=((side==Side.BUY and l5[-1]<=ema20_5+pull_tol and live>ema20_5) or
              (side==Side.SELL and h5[-1]>=ema20_5-pull_tol and live<ema20_5))
    htf_ok=htf_allows(side)
-   trend_checks={'strong':bool(strong),'acceleration':bool(acceleration),'pullback':bool(pullback),'htf':bool(htf_ok)}
+   confirmations={'gap':bool(gap_ok),'momentum':bool(momentum_ok),'acceleration':bool(acceleration),'pullback':bool(pullback)}
+   confirmation_score=sum(confirmations.values())
+   trend_checks={**confirmations,'htf':bool(htf_ok)}
    pullback_distance=((live-ema20_5)/point if side==Side.BUY else (ema20_5-live)/point)
-   trend_values={'side':side.value,'micro_gap':round(float(micro_gap),2),'momentum':round(float(tick_momentum),2),'momentum_abs':round(abs(float(tick_momentum)),2),'momentum_min':round(float(momentum_min),2),'acceleration':round(float(tick_momentum_fast),2),'acceleration_abs':round(abs(float(tick_momentum_fast)),2),'acceleration_min':round(float(acceleration_min),2),'ema20_m5':round(float(ema20_5),8),'live':round(float(live),8),'pullback_distance_points':round(float(pullback_distance),2),'pullback_tolerance_points':round(float(pull_tol/point),2),'m15_bias':m15_bias,'h1_bias':h1_bias}
-   if strong and acceleration and pullback and htf_ok:
+   trend_values={'side':side.value,'confirmation_score':confirmation_score,'confirmation_required':3,'micro_gap':round(float(micro_gap),2),'momentum':round(float(tick_momentum),2),'momentum_abs':round(abs(float(tick_momentum)),2),'momentum_min':round(float(momentum_min),2),'acceleration':round(float(tick_momentum_fast),2),'acceleration_abs':round(abs(float(tick_momentum_fast)),2),'acceleration_min':round(float(acceleration_min),2),'ema20_m5':round(float(ema20_5),8),'live':round(float(live),8),'pullback_distance_points':round(float(pullback_distance),2),'pullback_tolerance_points':round(float(pull_tol/point),2),'m15_bias':m15_bias,'h1_bias':h1_bias}
+   # Direction + HTF are hard guards. The four short-term confirmations are
+   # evidence: require any 3/4 instead of making every correlated measure fatal.
+   if htf_ok and confirmation_score>=3:
     reg=Regime.TREND
     score=70+min(12,abs(micro_trend)/max(atrp,1)*20)+min(10,abs(tick_momentum)/max(atrp,1)*15)
     slp=max(10.,min(1.8*atrp,max(.70*atrp,tick_range*.33)))
@@ -280,11 +285,18 @@ class Analyzer:
    gold_momentum=abs(tick_momentum)>=momentum_min
    gold_fast=abs(tick_momentum_fast)>=acceleration_min
    gold_side=Side.BUY if gold_up else (Side.SELL if gold_dn else None)
-   gold_range=tick_range>=max(5.0,atrp*.35)
+   gold_range_min=max(5.0,atrp*.35)
+   gold_range=tick_range>=gold_range_min
+   gold_range_floor=tick_range>=gold_range_min*.60
    gold_htf=gold_side is not None and htf_allows(gold_side)
-   gold_checks={'direction':bool(gold_up or gold_dn),'gap':bool(gold_gap),'momentum':bool(gold_momentum),'acceleration':bool(gold_fast),'expansion_range':bool(gold_range),'htf':bool(gold_htf)}
-   gold_values={'side':gold_side.value if gold_side is not None else 'NONE','micro_gap':round(float(micro_gap),2),'gap_min':round(float(momentum_min),2),'momentum':round(float(tick_momentum),2),'momentum_abs':round(abs(float(tick_momentum)),2),'momentum_min':round(float(momentum_min),2),'acceleration':round(float(tick_momentum_fast),2),'acceleration_abs':round(abs(float(tick_momentum_fast)),2),'acceleration_min':round(float(acceleration_min),2),'tick_range':round(float(tick_range),2),'expansion_range_min':round(float(max(5.0,atrp*.35)),2),'micro_trend':round(float(micro_trend),2),'m15_bias':m15_bias,'h1_bias':h1_bias}
-   gold_expand=(gold_up or gold_dn) and gold_gap and gold_momentum and gold_fast and gold_range and gold_side is not None and gold_htf
+   gold_confirmations={'gap':bool(gold_gap),'momentum':bool(gold_momentum),'acceleration':bool(gold_fast),'expansion_range':bool(gold_range)}
+   gold_confirmation_score=sum(gold_confirmations.values())
+   gold_checks={'direction':bool(gold_up or gold_dn),**gold_confirmations,'htf':bool(gold_htf),'range_floor':bool(gold_range_floor)}
+   gold_values={'side':gold_side.value if gold_side is not None else 'NONE','confirmation_score':gold_confirmation_score,'confirmation_required':3,'micro_gap':round(float(micro_gap),2),'gap_min':round(float(momentum_min),2),'momentum':round(float(tick_momentum),2),'momentum_abs':round(abs(float(tick_momentum)),2),'momentum_min':round(float(momentum_min),2),'acceleration':round(float(tick_momentum_fast),2),'acceleration_abs':round(abs(float(tick_momentum_fast)),2),'acceleration_min':round(float(acceleration_min),2),'tick_range':round(float(tick_range),2),'expansion_range_min':round(float(gold_range_min),2),'expansion_range_floor':round(float(gold_range_min*.60),2),'micro_trend':round(float(micro_trend),2),'m15_bias':m15_bias,'h1_bias':h1_bias}
+   # Gold keeps direction + HTF as hard guards. Require 3/4 confirmations and
+   # a minimum 60% expansion floor so three correlated momentum checks cannot
+   # justify chasing a market with materially insufficient range.
+   gold_expand=(gold_up or gold_dn) and gold_side is not None and gold_htf and gold_range_floor and gold_confirmation_score>=3
    if gold_expand:
     side=Side.BUY if gold_up else Side.SELL
     reg=Regime.TREND
