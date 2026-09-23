@@ -46,6 +46,10 @@ class Engine:
   self.reject_log_interval=60.0
   self.trade_alert_meta={}
   self.execution_notice_once=set()
+  self.scan_count=0
+  self.last_cycle_seconds=0.0
+  self.last_cycle_at=0.0
+  self.last_cycle_log_at=0.0
 
   # الإعدادات المحفوظة تُحمّل لاحقاً داخل سياق async
 
@@ -74,6 +78,7 @@ class Engine:
 
   return (
    f'{state} | 🔒 تجريبي\n'
+   f'🔄 دورات المحرك: {self.scan_count} | آخر مدة: {self.last_cycle_seconds:.2f}ث\n'
    f'💱 الأزواج: {symbols}\n'
    f'📂 المراكز: {len(self.trades)} / {self.max_positions}\n'
    f'⚠️ المخاطرة: {self.risk_pct:g}% لكل صفقة\n'
@@ -243,7 +248,15 @@ class Engine:
 
  async def loop(self):
   while self.running:
-   try: await self.step()
+   started=time.monotonic()
+   try:
+    await self.step()
+    self.scan_count+=1
+    self.last_cycle_seconds=time.monotonic()-started
+    self.last_cycle_at=time.time()
+    if self.last_cycle_at-self.last_cycle_log_at>=60:
+     self.last_cycle_log_at=self.last_cycle_at
+     await self.db.log('ENGINE_CYCLE',duration_seconds=round(self.last_cycle_seconds,3),scan_count=self.scan_count)
    except Exception as e:
     self.running=False
     try: await self.db.log('ENGINE_ERROR',self.symbol,error=repr(e),traceback=traceback.format_exc())
