@@ -468,14 +468,20 @@ class Engine:
    usd_group={'EURUSD','GBPUSD','AUDUSD','NZDUSD'}
    info=self.gw.info(symbol); tick=self.gw.tick(symbol)
    if not info or not tick or not info.point or tick.bid<=0 or tick.ask<=tick.bid:
-    await self._log_reject(
-     'SCAN_REJECT',symbol,reason='INVALID_MARKET_DATA',
-     info=bool(info),tick=bool(tick),
-     point=float(getattr(info,'point',0) or 0) if info else 0,
-     bid=float(getattr(tick,'bid',0) or 0) if tick else 0,
-     ask=float(getattr(tick,'ask',0) or 0) if tick else 0,
-    )
-    return
+    # A transient Wine/MT5 quote can briefly expose bid==ask. Retry once,
+    # but never weaken the strict quote validity rule.
+    await asyncio.sleep(.2)
+    info=self.gw.info(symbol); tick=self.gw.tick(symbol)
+    if not info or not tick or not info.point or tick.bid<=0 or tick.ask<=tick.bid:
+     await self._log_reject(
+      'SCAN_REJECT',symbol,reason='INVALID_MARKET_DATA',
+      info=bool(info),tick=bool(tick),
+      point=float(getattr(info,'point',0) or 0) if info else 0,
+      bid=float(getattr(tick,'bid',0) or 0) if tick else 0,
+      ask=float(getattr(tick,'ask',0) or 0) if tick else 0,
+      last_error=repr(mt5.last_error()),
+     )
+     return
 
    # Under Wine/MT5, symbol_info_tick() can expose a terminal-local timestamp
    # (for example UTC+3) even though copy_ticks_range() returns Unix UTC.
@@ -540,9 +546,21 @@ class Engine:
    if confidence_score < self.min_confidence:
     await self._log_reject('CONFIDENCE_REJECT',symbol,strategy=sig.strategy,confidence=confidence_score,min_confidence=self.min_confidence)
     return
-   if symbol in usd_group and any(t.symbol in usd_group and t.side==sig.side for t in self.trades.values()):
-    await self._log_reject('CORRELATION_REJECT',symbol,side=sig.side.value,strategy=sig.strategy)
-    return
+   if symbol in usd_group:
+    conflicts=[
+     t for t in self.trades.values()
+     if t.symbol in usd_group and t.side==sig.side
+    ]
+    if conflicts:
+     await self._log_reject(
+      'CORRELATION_REJECT',symbol,side=sig.side.value,strategy=sig.strategy,
+      conflicting_positions=[
+       {'ticket':t.ticket,'symbol':t.symbol,'side':t.side.value,'strategy':t.strategy}
+       for t in conflicts
+      ],
+      rule='same_direction_usd_group',
+     )
+     return
 
    # بعد الإغلاق: مهلة قصيرة، ثم يجب أن تتجدد الإشارة قبل تكرار نفس الاستراتيجية/الاتجاه.
    signal_bar=int(m1['time'][-1]) if m1 is not None and len(m1) and sig.strategy=='ema_cross_scalp' else (int(m5['time'][-1]) if m5 is not None and len(m5) else int(ticks['time'][-1]//60*60))
@@ -672,6 +690,39 @@ class Engine:
     margin_vol=vmin+max(0,msteps)*vstep
     vol=min(vol,margin_vol,vmax)
 
+    # Aggregate account margin safety: after the new order, projected
+    # Margin Level must remain >= 200%. Reduce volume first; reject only
+    # when even the broker minimum lot cannot satisfy the floor.
+    min_margin_level_pct=200.0
+    current_margin=float(getattr(account,'margin',0) or 0)
+    equity=float(getattr(account,'equity',0) or 0)
+    max_total_margin=(equity*100.0/min_margin_level_pct) if equity>0 else 0.0
+    remaining_margin=max_total_margin-current_margin
+    level_capacity=remaining_margin/float(margin_1lot)
+    if level_capacity < vmin:
+     projected_min_margin=current_margin+float(margin_1lot)*vmin
+     projected_min_level=(equity/projected_min_margin*100.0) if projected_min_margin>0 else 0.0
+     await self._log_reject(
+      'MARGIN_LEVEL_REJECT',symbol,reason='BELOW_200_PERCENT',
+      min_margin_level_pct=min_margin_level_pct,
+      projected_margin_level_pct=projected_min_level,
+      current_margin=current_margin,equity=equity,min_lot=vmin,
+     )
+     return
+    lsteps=math.floor((level_capacity-vmin)/vstep+1e-9)
+    level_vol=vmin+max(0,lsteps)*vstep
+    if level_vol < vol:
+     original_vol=vol
+     vol=max(vmin,min(vol,level_vol))
+     projected_margin=current_margin+float(margin_1lot)*vol
+     projected_level=(equity/projected_margin*100.0) if projected_margin>0 else 0.0
+     await self._log_reject(
+      'MARGIN_LEVEL_VOLUME_REDUCED',symbol,
+      requested_volume=original_vol,accepted_volume=vol,
+      min_margin_level_pct=min_margin_level_pct,
+      projected_margin_level_pct=projected_level,
+     )
+
    # تثبيت الحجم على خطوة الوسيط وإعادة التحقق النهائي
    steps=math.floor((vol-vmin)/vstep+1e-9)
    vol=vmin+max(0,steps)*vstep
@@ -713,7 +764,12 @@ class Engine:
     if notice_key not in self.execution_notice_once:
      self.execution_notice_once.add(notice_key)
      await self.notify(f'❌ لم تنفذ {symbol}\norder_check لم يرجع نتيجة\nMT5: {mt5.last_error()}')
-    await self._log_reject('ORDER_CHECK_REJECT',symbol,reason='NO_RESULT',volume=vol)
+    await self._log_reject(
+     'ORDER_CHECK_REJECT',symbol,reason='NO_RESULT',volume=vol,
+     last_error=repr(mt5.last_error()),
+     order_type=int(typ),price=float(price),sl=float(sl),tp=float(tp),
+     filling=int(filling),deviation=int(settings.max_slippage_points),
+    )
     return
 
    # MT5 may require more margin than order_calc_margin() estimated. For
@@ -780,9 +836,10 @@ class Engine:
     )
     return
 
-   # MT5 قد يتأخر في إظهار المركز بعد نجاح التنفيذ
+   # MT5 قد يتأخر في إظهار المركز بعد نجاح التنفيذ. Verify directly for
+   # up to 15 seconds before declaring the successfully-sent trade unmanaged.
    pos=None
-   for _ in range(50):
+   for _ in range(150):
     await asyncio.sleep(.1)
     pos=self.gw.find_new_bot_position(symbol,before)
     if pos:
@@ -790,7 +847,12 @@ class Engine:
 
    if not pos:
     self.running=False
-    await self.db.log('POSITION_LINK_FAILED',symbol,result=str(res))
+    await self.db.log(
+     'POSITION_LINK_FAILED',symbol,result=str(res),
+     order=getattr(res,'order',None),deal=getattr(res,'deal',None),
+     retcode=getattr(res,'retcode',None),last_error=repr(mt5.last_error()),
+     before_tickets=sorted(before),
+    )
     try:
      await self.notify(
       f'🚨 نُفذت صفقة {symbol} لكن تعذر ربطها آلياً. '
@@ -1187,7 +1249,17 @@ class Engine:
     )
 
    else:
-    await self.db.log('PROTECTION_FAILED',t.symbol,result=str(res))
+    await self.db.log(
+     'PROTECTION_FAILED',t.symbol,ticket=t.ticket,result=str(res),
+     retcode=getattr(res,'retcode',None),
+     comment=getattr(res,'comment',None),
+     last_error=repr(mt5.last_error()),
+     requested_sl=level45,current_sl=t.sl,tp=t.tp,
+     bid=float(tick.bid),ask=float(tick.ask),
+     stops_level=int(getattr(info,'trade_stops_level',0) or 0),
+     freeze_level=int(getattr(info,'trade_freeze_level',0) or 0),
+     valid_distance=bool(valid),
+    )
 
   # بعد التفعيل: أفضل سعر جديد يحرك SL للأمام. لا يوجد إغلاق بسبب خمول زمني.
   if t.protection_45_active:
