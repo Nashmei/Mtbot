@@ -249,7 +249,8 @@ class Analyzer:
 
   # Second priority: trend continuation, but only with M15 bias and an M5
   # pullback/retest instead of chasing an already extended impulse.
-  if sig is None and (bull or bear) and have and strategy_allowed('scalp_trend'):
+  # XAUUSD is handled by its dedicated gold expansion setup below.
+  if sig is None and not is_gold and (bull or bear) and have and strategy_allowed('scalp_trend'):
    side=Side.BUY if bull else Side.SELL
    gap_ok=micro_gap>=momentum_min
    momentum_ok=abs(tick_momentum)>=momentum_min
