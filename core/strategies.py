@@ -262,3 +262,106 @@ def scalp_reversion(ctx):
     atrp=ctx['atrp']
     slp=max(10.,min(MEAN_REVERSION['sl_atr_max']*atrp,max(MEAN_REVERSION['sl_atr_min']*atrp,ctx['tick_range']*MEAN_REVERSION['sl_range_factor'])))
     return Signal(side,MEAN_REVERSION['name'],min(MEAN_REVERSION['score_cap'],score/100.),slp,'strong short-term extreme + confirmed live reversal')
+
+
+# ============================================================
+# استراتيجية: SWEEP REVERSAL
+# ============================================================
+SCALP_SWEEP_REVERSAL = {
+    'name': 'scalp_sweep_reversal',
+    'lookback': 20,
+    'wick_body_ratio': 1.5,
+    'score_base': 76,
+    'score_cap': .90,
+    'sl_atr_min': .65,
+    'sl_atr_max': 1.7,
+    'sl_range_factor': .30,
+}
+
+def scalp_sweep_reversal(ctx):
+    rates=ctx['rates']
+    if not ctx['have'] or rates is None or len(rates)<SCALP_SWEEP_REVERSAL['lookback']+2:
+        return None
+    point=ctx['point']; atrp=ctx['atrp']
+    o=np.asarray(rates['open'],float); h=np.asarray(rates['high'],float)
+    l=np.asarray(rates['low'],float); c=np.asarray(rates['close'],float)
+    i=-1; n=SCALP_SWEEP_REVERSAL['lookback']
+    prior_hi=float(np.max(h[-(n+1):-1])); prior_lo=float(np.min(l[-(n+1):-1]))
+    body=abs(float(c[i]-o[i]))
+    body_ref=max(body,point)
+    upper=float(h[i]-max(o[i],c[i])); lower=float(min(o[i],c[i])-l[i])
+
+    swept_low=l[i]<prior_lo and c[i]>prior_lo
+    swept_high=h[i]>prior_hi and c[i]<prior_hi
+    buy_reject=swept_low and lower>=body_ref*SCALP_SWEEP_REVERSAL['wick_body_ratio']
+    sell_reject=swept_high and upper>=body_ref*SCALP_SWEEP_REVERSAL['wick_body_ratio']
+
+    side=None
+    if buy_reject and ctx['tick_momentum_fast']>0 and ctx['h1_bias'] in (0,1):
+        side=Side.BUY
+    elif sell_reject and ctx['tick_momentum_fast']<0 and ctx['h1_bias'] in (0,-1):
+        side=Side.SELL
+    if side is None or not ctx['strategy_allowed'](SCALP_SWEEP_REVERSAL['name'],side):
+        return None
+
+    wick=lower if side==Side.BUY else upper
+    wick_ratio=wick/body_ref
+    score=SCALP_SWEEP_REVERSAL['score_base']+min(8,(wick_ratio-SCALP_SWEEP_REVERSAL['wick_body_ratio'])*4)+min(6,abs(ctx['tick_momentum_fast'])/max(atrp,1)*10)
+    slp=max(10.,min(SCALP_SWEEP_REVERSAL['sl_atr_max']*atrp,max(SCALP_SWEEP_REVERSAL['sl_atr_min']*atrp,ctx['tick_range']*SCALP_SWEEP_REVERSAL['sl_range_factor'])))
+    return Signal(side,SCALP_SWEEP_REVERSAL['name'],min(SCALP_SWEEP_REVERSAL['score_cap'],score/100.),slp,'M5 failed breakout + wick rejection + live reversal confirmation')
+
+
+# ============================================================
+# استراتيجية: SQUEEZE EXPANSION
+# ============================================================
+SCALP_SQUEEZE_EXPANSION = {
+    'name': 'scalp_squeeze_expansion',
+    'short_atr': 14,
+    'long_atr': 50,
+    'squeeze_ratio': .65,
+    'expansion_body_atr': 1.20,
+    'score_base': 76,
+    'score_cap': .90,
+    'sl_atr_min': .65,
+    'sl_atr_max': 1.7,
+    'sl_range_factor': .30,
+}
+
+def scalp_squeeze_expansion(ctx):
+    rates=ctx['rates']
+    need=SCALP_SQUEEZE_EXPANSION['long_atr']+2
+    if not ctx['have'] or rates is None or len(rates)<need:
+        return None
+    point=ctx['point']; atrp=ctx['atrp']
+    o=np.asarray(rates['open'],float); h=np.asarray(rates['high'],float)
+    l=np.asarray(rates['low'],float); c=np.asarray(rates['close'],float)
+
+    prev=c[:-1]
+    tr=np.maximum(h[1:]-l[1:],np.maximum(np.abs(h[1:]-prev),np.abs(l[1:]-prev)))
+    prior_tr=tr[:-1]
+    short_n=SCALP_SQUEEZE_EXPANSION['short_atr']; long_n=SCALP_SQUEEZE_EXPANSION['long_atr']
+    if len(prior_tr)<long_n:
+        return None
+    atr_short=float(np.mean(prior_tr[-short_n:]))
+    atr_long=float(np.mean(prior_tr[-long_n:]))
+    if atr_long<=0 or atr_short/atr_long>=SCALP_SQUEEZE_EXPANSION['squeeze_ratio']:
+        return None
+
+    body=float(c[-1]-o[-1])
+    body_abs=abs(body)
+    if body_abs<atr_short*SCALP_SQUEEZE_EXPANSION['expansion_body_atr']:
+        return None
+
+    side=None
+    if body>0 and ctx['tick_momentum']>0 and ctx['micro_trend']>0 and ctx['context_up'] and ctx['h1_bias'] in (0,1):
+        side=Side.BUY
+    elif body<0 and ctx['tick_momentum']<0 and ctx['micro_trend']<0 and ctx['context_dn'] and ctx['h1_bias'] in (0,-1):
+        side=Side.SELL
+    if side is None or not ctx['strategy_allowed'](SCALP_SQUEEZE_EXPANSION['name'],side):
+        return None
+
+    compression=max(0.,1.-atr_short/atr_long)
+    expansion=body_abs/max(atr_short,point)
+    score=SCALP_SQUEEZE_EXPANSION['score_base']+min(7,compression*12)+min(7,max(0.,expansion-SCALP_SQUEEZE_EXPANSION['expansion_body_atr'])*5)
+    slp=max(10.,min(SCALP_SQUEEZE_EXPANSION['sl_atr_max']*atrp,max(SCALP_SQUEEZE_EXPANSION['sl_atr_min']*atrp,ctx['tick_range']*SCALP_SQUEEZE_EXPANSION['sl_range_factor'])))
+    return Signal(side,SCALP_SQUEEZE_EXPANSION['name'],min(SCALP_SQUEEZE_EXPANSION['score_cap'],score/100.),slp,'M5 volatility squeeze + closed-bar expansion + live momentum confirmation')
