@@ -352,26 +352,32 @@ class Engine:
    usd_group={'EURUSD','GBPUSD','AUDUSD','NZDUSD'}
    info=self.gw.info(symbol); tick=self.gw.tick(symbol)
    if not info or not tick or not info.point or tick.bid<=0 or tick.ask<=tick.bid:
-    await self._log_reject('SCAN_REJECT',symbol,reason='INVALID_MARKET_DATA')
-    return
-   quote_time=(float(getattr(tick,'time_msc',0) or 0)/1000.0
-               or float(getattr(tick,'time',0) or 0))
-   if not quote_time or abs(time.time()-quote_time)>settings.max_tick_age_seconds:
-    await self._log_reject('SCAN_REJECT',symbol,reason='STALE_QUOTE')
-    return
-
-   ok,sp,avg,lim=self.risk.spread_ok(tick,info)
-   if not ok:
-    await self._log_reject('SPREAD_REJECT',symbol,spread=sp,average=avg,limit=lim)
+    await self._log_reject(
+     'SCAN_REJECT',symbol,reason='INVALID_MARKET_DATA',
+     info=bool(info),tick=bool(tick),
+     point=float(getattr(info,'point',0) or 0) if info else 0,
+     bid=float(getattr(tick,'bid',0) or 0) if tick else 0,
+     ask=float(getattr(tick,'ask',0) or 0) if tick else 0,
+    )
     return
 
+   # Under Wine/MT5, symbol_info_tick() can expose a terminal-local timestamp
+   # (for example UTC+3) even though copy_ticks_range() returns Unix UTC.
+   # Use the history tick stream as the authoritative freshness clock and keep
+   # symbol_info_tick() only for the live bid/ask used by spread/execution.
    ticks=self.gw.ticks(symbol)
    if ticks is None or len(ticks)<80:
     await self._log_reject('SCAN_REJECT',symbol,reason='INSUFFICIENT_TICKS')
     return
    latest=float(ticks['time_msc'][-1])/1000.0 if 'time_msc' in ticks.dtype.names else float(ticks['time'][-1])
-   if abs(time.time()-latest)>settings.max_tick_age_seconds:
-    await self._log_reject('SCAN_REJECT',symbol,reason='STALE_TICKS',age_seconds=time.time()-latest)
+   tick_age=time.time()-latest
+   if abs(tick_age)>settings.max_tick_age_seconds:
+    await self._log_reject('SCAN_REJECT',symbol,reason='STALE_TICKS',age_seconds=tick_age)
+    return
+
+   ok,sp,avg,lim=self.risk.spread_ok(tick,info)
+   if not ok:
+    await self._log_reject('SPREAD_REJECT',symbol,spread=sp,average=avg,limit=lim)
     return
    m5=self.gw.rates_m5(symbol,200)
    m1=self.gw.rates_m1(symbol,200)
@@ -408,10 +414,25 @@ class Engine:
    # Analysis and history calls may take time. Size and price the order from
    # a fresh quote, not from the quote captured before analysis.
    tick=self.gw.tick(symbol)
-   tick_ts=(float(getattr(tick,'time_msc',0) or 0)/1000.0
-            or float(getattr(tick,'time',0) or 0)) if tick else 0
-   if not tick or tick.ask<=tick.bid or abs(time.time()-tick_ts)>settings.max_tick_age_seconds:
-    await self._log_reject('SCAN_REJECT',symbol,reason='STALE_ENTRY_QUOTE')
+   if not tick or tick.bid<=0 or tick.ask<=tick.bid:
+    await self._log_reject(
+     'SCAN_REJECT',symbol,reason='INVALID_ENTRY_QUOTE',
+     bid=float(getattr(tick,'bid',0) or 0) if tick else 0,
+     ask=float(getattr(tick,'ask',0) or 0) if tick else 0,
+    )
+    return
+   # Re-check freshness from copy_ticks_range(), whose timestamps are Unix UTC
+   # on this Wine/MT5 setup. Do not compare the terminal-local live quote time.
+   entry_ticks=self.gw.ticks(symbol,80)
+   if entry_ticks is None or len(entry_ticks)<80:
+    await self._log_reject('SCAN_REJECT',symbol,reason='INSUFFICIENT_ENTRY_TICKS')
+    return
+   entry_latest=(float(entry_ticks['time_msc'][-1])/1000.0
+                 if 'time_msc' in entry_ticks.dtype.names
+                 else float(entry_ticks['time'][-1]))
+   entry_age=time.time()-entry_latest
+   if abs(entry_age)>settings.max_tick_age_seconds:
+    await self._log_reject('SCAN_REJECT',symbol,reason='STALE_ENTRY_QUOTE',age_seconds=entry_age)
     return
    spread_ok,_,_,_=self.risk.spread_ok(tick,info)
    if not spread_ok:
