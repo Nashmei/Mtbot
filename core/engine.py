@@ -391,6 +391,17 @@ class Engine:
    m5=self.gw.rates_m5(symbol,200)
    m1=self.gw.rates_m1(symbol,200)
    reg,sig,meta=self.an.analyze(ticks,info.point,m5,symbol=symbol,rates_m15=self.gw.rates_m15(symbol,200),rates_h1=self.gw.rates_h1(symbol,200),rates_m1=m1)
+   for candidate in meta.get('opportunity_candidates',[]) or []:
+    await self._log_reject(
+     'OPPORTUNITY_CANDIDATE',symbol,
+     reason=candidate.get('strategy',''),
+     strategy=candidate.get('strategy'),
+     side=candidate.get('side'),
+     confidence=candidate.get('confidence'),
+     selected=bool(candidate.get('selected')),
+     preempted_by=candidate.get('preempted_by'),
+     final_signal=sig.strategy if sig is not None else None,
+    )
    if not sig:
     await self._log_reject('NO_SIGNAL',symbol,regime=reg.value)
     return
