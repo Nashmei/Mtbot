@@ -82,7 +82,30 @@ class Engine:
    account=self.gw.account()
    raw_login=getattr(account,'login',None) if account else None
    login=int(raw_login) if raw_login is not None else None
+  # Compatibility path for isolated/unit use without an MT5 account:
+  # load legacy global DB settings, but never use this path for a connected account.
   if login is None:
+   legacy={
+    'rr':('rr',float),'risk_pct':('risk_pct',float),
+    'min_confidence':('min_confidence',float),
+    'protection_pct':('protection_pct',float),
+    'trailing_gap_pct':('trailing_gap_pct',float),
+    'max_trade_minutes':('max_trade_minutes',float),
+    'max_positions':('max_positions',int),
+    'max_consecutive_losses':('max_consecutive_losses',int),
+    'daily_loss_limit_pct':('daily_loss_limit_pct',float),
+    'consecutive_losses':('consecutive_losses',int),
+   }
+   for key,(attr,cast) in legacy.items():
+    raw=await self.db.get(key)
+    if raw is None:
+     continue
+    try:
+     value=cast(raw)
+     if key=='consecutive_losses': value=max(0,value)
+     setattr(self,attr,value)
+    except (TypeError,ValueError):
+     pass
    await self._refresh_strategy_performance(force=True)
    return
 
