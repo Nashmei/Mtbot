@@ -166,6 +166,25 @@ class MarketSafetyTests(unittest.TestCase):
         self.assertIn("acceleration_min", meta)
         self.assertGreater(meta["momentum_min"], 0)
         self.assertGreater(meta["acceleration_min"], 0)
+        self.assertAlmostEqual(meta["momentum_min"], 1.2)
+        self.assertAlmostEqual(meta["acceleration_min"], 0.6)
+
+    def test_gold_uses_dedicated_opportunity_floors(self):
+        ticks = np.array(
+            [(2000 + i * .001 - .05, 2000 + i * .001 + .05) for i in range(300)],
+            dtype=[("bid", "f8"), ("ask", "f8")],
+        )
+        closes = np.linspace(2010, 2000, 200)
+        rates = np.array(
+            [(v, v + .2, v - .2, v) for v in closes],
+            dtype=[("open", "f8"), ("high", "f8"), ("low", "f8"), ("close", "f8")],
+        )
+        _, _, meta = Analyzer().analyze(
+            ticks, .01, rates, symbol="XAUUSD",
+            rates_m15=rates, rates_h1=rates, rates_m1=rates,
+        )
+        self.assertAlmostEqual(meta["momentum_min"], 8.0)
+        self.assertAlmostEqual(meta["acceleration_min"], 5.0)
 
 
     def test_unknown_broker_position_stops_engine(self):
