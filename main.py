@@ -30,7 +30,7 @@ async def main():
  trade_messages={}
  blocked_until={'until':0.0}
 
- async def notify(text,photo_path=None,caption=None,trade_ticket=None,trade_update=False,pin=False,trade_result=None):
+ async def notify(text,photo_path=None,caption=None,trade_ticket=None,trade_update=False,pin=False,trade_result=None,trade_result_reason=None):
   import time
   app=app_holder.get('app')
   if not app:return
@@ -66,9 +66,10 @@ async def main():
     if not state:return
     if trade_result is not None:
      pnl=float(trade_result)
-     result_text=(f'🟢 ربح $+{pnl:.2f}' if pnl>0 else
-                  f'🔴 خسارة $-{abs(pnl):.2f}' if pnl<0 else
-                  '📍 تعادل $0.00')
+     suffix=f' | {trade_result_reason}' if trade_result_reason else ''
+     result_text=(f'🟢 ربح $+{pnl:.2f}{suffix}' if pnl>0 else
+                  f'🔴 خسارة $-{abs(pnl):.2f}{suffix}' if pnl<0 else
+                  f'📍 تعادل $0.00{suffix}')
      result_msg=await app.bot.send_message(chat_id=chat_id,text=result_text,reply_to_message_id=state['message_id'])
      try:
       await app.bot.unpin_chat_message(chat_id=chat_id,message_id=state['message_id'])

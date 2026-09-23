@@ -55,6 +55,9 @@ class Engine:
   self.last_cycle_seconds=0.0
   self.last_cycle_at=0.0
   self.last_cycle_log_at=0.0
+  self.strategy_performance={}
+  self.strategy_performance_window=50
+  self.strategy_performance_refreshed_at=0.0
 
   # الإعدادات المحفوظة تُحمّل لاحقاً داخل سياق async
 
@@ -73,6 +76,20 @@ class Engine:
    self.consecutive_losses=max(0,int(await self.db.get('consecutive_losses',0)))
   except (TypeError,ValueError):
    pass
+
+  await self._refresh_strategy_performance(force=True)
+
+ async def _refresh_strategy_performance(self,force=False):
+  now=time.monotonic()
+  if not force and now-self.strategy_performance_refreshed_at<60.0:
+   return
+  try:
+   self.strategy_performance=await self.db.strategy_performance(self.strategy_performance_window)
+   self.strategy_performance_refreshed_at=now
+  except Exception as ex:
+   self.strategy_performance_refreshed_at=now
+   await self.db.log('STRATEGY_PERFORMANCE_ERROR',error=repr(ex))
+
 
  async def status(self):
   a=self.gw.account()
@@ -319,6 +336,8 @@ class Engine:
    info=self.gw.info(t.symbol); tick=self.gw.tick(t.symbol)
    if info and tick: await self.manage(t,tick,info)
 
+  await self._refresh_strategy_performance()
+
   # لا دخول جديد عند بلوغ الحدود
   if not await self._daily_entry_allowed(account):
    return
@@ -390,7 +409,41 @@ class Engine:
     return
    m5=self.gw.rates_m5(symbol,200)
    m1=self.gw.rates_m1(symbol,200)
-   reg,sig,meta=self.an.analyze(ticks,info.point,m5,symbol=symbol,rates_m15=self.gw.rates_m15(symbol,200),rates_h1=self.gw.rates_h1(symbol,200),rates_m1=m1)
+   reg,sig,meta=self.an.analyze(
+    ticks,info.point,m5,symbol=symbol,
+    rates_m15=self.gw.rates_m15(symbol,200),
+    rates_h1=self.gw.rates_h1(symbol,200),
+    rates_m1=m1,
+    strategy_performance=self.strategy_performance,
+    min_confidence=self.min_confidence,
+   )
+   for diagnostic in meta.get('opportunity_diagnostics',[]) or []:
+    await self._log_reject(
+     'OPPORTUNITY_DIAGNOSTIC',symbol,
+     reason=diagnostic.get('strategy',''),
+     **diagnostic,
+    )
+   selection=meta.get('strategy_selection',[]) or []
+   if selection:
+    winner=next((row for row in selection if row.get('selected')),None)
+    await self._log_reject(
+     'STRATEGY_SELECTION',symbol,
+     reason=(winner or {}).get('strategy','none'),
+     winner=(winner or {}).get('strategy'),
+     winner_score=(winner or {}).get('final_score'),
+     candidates=selection,
+    )
+   for candidate in meta.get('opportunity_candidates',[]) or []:
+    await self._log_reject(
+     'OPPORTUNITY_CANDIDATE',symbol,
+     reason=candidate.get('strategy',''),
+     strategy=candidate.get('strategy'),
+     side=candidate.get('side'),
+     confidence=candidate.get('confidence'),
+     selected=bool(candidate.get('selected')),
+     preempted_by=candidate.get('preempted_by'),
+     final_signal=sig.strategy if sig is not None else None,
+    )
    if not sig:
     await self._log_reject('NO_SIGNAL',symbol,regime=reg.value)
     return
@@ -679,13 +732,55 @@ class Engine:
    sl=actual_sl
    tp=actual_tp
    vol=float(pos.volume or vol)
+
+   # Recalculate risk and R:R from the broker-confirmed fill/SL/TP/volume.
+   # Pre-send values can drift slightly because the actual fill may differ.
+   post_fill_loss=mt5.order_calc_profit(typ,symbol,vol,fill,actual_sl)
+   post_fill_reward=mt5.order_calc_profit(typ,symbol,vol,fill,actual_tp)
+   if post_fill_loss is not None and abs(float(post_fill_loss))>0:
+    actual_risk=abs(float(post_fill_loss))
+   else:
+    # Defensive fallback: preserve the already-validated pre-send estimate.
+    actual_risk=float(actual_risk)
+   actual_risk_pct=(actual_risk/float(account.equity)*100.0) if account.equity else 0.0
+   actual_rr=(
+    abs(float(post_fill_reward))/actual_risk
+    if post_fill_reward is not None and actual_risk>0
+    else self.rr
+   )
+   if not math.isfinite(actual_rr) or actual_rr<=0:
+    actual_rr=self.rr
+
+   risk_drift_cash=actual_risk-risk_cash
+   risk_drift_pct=((actual_risk/risk_cash)-1.0)*100.0 if risk_cash>0 else 0.0
+   if abs(risk_drift_cash)>0.01:
+    await self.db.log(
+     'POST_FILL_RISK_DRIFT',symbol,
+     ticket=pos.ticket,planned_risk_cash=risk_cash,actual_risk_cash=actual_risk,
+     drift_cash=risk_drift_cash,drift_pct=risk_drift_pct,
+     planned_entry=price,actual_entry=fill,actual_sl=actual_sl,
+     volume=vol,actual_rr=actual_rr,
+    )
+
    self.trades[pos.ticket]=t
-   self.trade_alert_meta[pos.ticket]={'risk_cash':actual_risk,'risk_pct':actual_risk_pct}
+   self.trade_alert_meta[pos.ticket]={
+    'risk_cash':actual_risk,
+    'risk_pct':actual_risk_pct,
+    'rr_actual':actual_rr,
+    'planned_risk_cash':risk_cash,
+    'risk_drift_cash':risk_drift_cash,
+    'risk_drift_pct':risk_drift_pct,
+   }
    self.execution_notice_once.discard(('margin_min',symbol))
    # A successful trade resets this symbol to the normal spread baseline.
    self.risk.reset_spread_relaxation(symbol)
 
-   await self.db.log('OPEN',symbol,ticket=pos.ticket,entry=fill,sl=sl,tp=tp,volume=vol,side=sig.side.value,strategy=sig.strategy,regime=reg.value,confidence=float(sig.confidence),reason=sig.reason)
+   await self.db.log(
+    'OPEN',symbol,ticket=pos.ticket,entry=fill,sl=sl,tp=tp,volume=vol,
+    side=sig.side.value,strategy=sig.strategy,regime=reg.value,
+    confidence=float(sig.confidence),reason=sig.reason,
+    risk_cash=actual_risk,risk_pct=actual_risk_pct,rr_actual=actual_rr,
+   )
    asyncio.create_task(self._send_trade_chart(t,actual_risk,actual_risk_pct))
 
  async def _handle_invalid_initial_r(self,symbol,pos,fill,actual_sl):
@@ -727,6 +822,7 @@ class Engine:
   meta=self.trade_alert_meta.get(t.ticket,{})
   risk_cash=float(meta.get('risk_cash',0) or 0)
   risk_pct=float(meta.get('risk_pct',self.risk_pct) or self.risk_pct)
+  rr_actual=float(meta.get('rr_actual',self.rr) or self.rr)
 
   if closed:
    if pnl is None:
@@ -754,7 +850,7 @@ class Engine:
    f'🛑 الوقف: {t.sl:.{digits}f}\n'
    f'💰 الهدف: {t.tp:.{digits}f}\n'
    f'{live_line}\n'
-   f'🛡 الحماية: {t.protection_pct:g}% | ⚖️ R:R 1:{self.rr:g}'
+   f'🛡 الحماية: {t.protection_pct:g}% | ⚖️ R:R 1:{rr_actual:.2f}'
   )
 
  async def _send_trade_chart(self,t,actual_risk,actual_risk_pct):
@@ -882,9 +978,7 @@ class Engine:
   target_progress=max(0.0,(favorable/target_distance)*100) if target_distance>0 else 0.0
 
   if t.protection_45_active:
-   idle=max(0.0,time.time()-t.last_progress_at)
-   remaining=max(0,60-int(idle))
-   protection=f'مفعلة 🔐 | الخمول: {remaining}ث'
+   protection='مفعلة 🔐 | تتبع الربح مستمر'
   else:
    protection=f'انتظار {t.protection_pct:g}% | التقدم: {target_progress:.0f}%'
 
@@ -940,13 +1034,13 @@ class Engine:
 
     if reason==mt5.DEAL_REASON_TP:
      event='TP'
-     icon='🎯'
+     result_reason='TP 🎯'
     elif reason==mt5.DEAL_REASON_SL:
      event='SL'
-     icon='🛑'
+     result_reason='حماية ربح 🛡️' if pnl>0 and t.protection_45_active else 'SL 🛑'
     else:
      event='POSITION_CLOSED'
-     icon='🏁'
+     result_reason='حماية ربح 🛡️' if pnl>0 and t.protection_45_active else 'إغلاق 🏁'
 
     if pnl < 0:
      self.consecutive_losses+=1
@@ -954,9 +1048,13 @@ class Engine:
      self.consecutive_losses=0
     await self.db.set("consecutive_losses",self.consecutive_losses)
 
-    await self.db.log(event,t.symbol,exit_price=exit_price,pnl=pnl,reason=reason)
+    await self.db.log(
+     event,t.symbol,ticket=t.ticket,strategy=t.strategy,
+     exit_price=exit_price,pnl=pnl,reason=reason
+    )
+    await self._refresh_strategy_performance(force=True)
     caption=await self._trade_caption(t,pnl=pnl,closed=True)
-    await self.notify(caption,trade_ticket=t.ticket,trade_update=True,trade_result=pnl)
+    await self.notify(caption,trade_ticket=t.ticket,trade_update=True,trade_result=pnl,trade_result_reason=result_reason)
    else:
     await self.db.log('POSITION_CLOSED',t.symbol,reason='history_not_found')
     caption=await self._trade_caption(t,pnl=None,closed=True)
@@ -979,7 +1077,7 @@ class Engine:
   target_progress=(favorable/target_distance) if target_distance>0 else 0.0
   now=time.time()
 
-  # عند تحقيق 45%: انقل SL إلى مستوى 45% وابدأ عداد 60 ثانية.
+  # عند تحقيق 45%: انقل SL إلى مستوى الحماية وابدأ تتبع أفضل سعر فقط.
   trigger=t.protection_pct/100.0
   if target_progress>=trigger and not t.protection_45_active:
    level45=t.entry+(target_distance*trigger) if t.side==Side.BUY else t.entry-(target_distance*trigger)
@@ -996,13 +1094,14 @@ class Engine:
 
     await self.db.log(
      'PROTECTION_ACTIVATED',t.symbol,
-     sl=level45,price=price,target_progress=target_progress
+     ticket=t.ticket,sl=level45,price=price,
+     target_progress=target_progress,target_progress_pct=target_progress*100.0
     )
 
    else:
     await self.db.log('PROTECTION_FAILED',t.symbol,result=str(res))
 
-  # بعد التفعيل: أفضل سعر جديد يعيد عداد 60 ثانية ويحرك SL للأمام.
+  # بعد التفعيل: أفضل سعر جديد يحرك SL للأمام. لا يوجد إغلاق بسبب خمول زمني.
   if t.protection_45_active:
    progress=(
     (t.side==Side.BUY and price>t.best_favorable_price)
@@ -1044,29 +1143,16 @@ class Engine:
      if res and res.retcode==mt5.TRADE_RETCODE_DONE:
       oldsl=t.sl
       t.sl=cand
+      trailing_progress=(
+       ((t.best_favorable_price-t.entry)/target_distance)
+       if t.side==Side.BUY
+       else ((t.entry-t.best_favorable_price)/target_distance)
+      ) if target_distance>0 else 0.0
       await self.db.log(
        'TRAILING_PROTECTION',t.symbol,
-       old_sl=oldsl,new_sl=cand,best_price=t.best_favorable_price
+       ticket=t.ticket,old_sl=oldsl,new_sl=cand,
+       best_price=t.best_favorable_price,
+       target_progress=trailing_progress,
+       target_progress_pct=trailing_progress*100.0
       )
 
-  # بعد تفعيل 45% فقط: 60 ثانية بلا أفضل سعر جديد = إغلاق بالسوق.
-  if t.protection_45_active and (now-t.last_progress_at)>=60:
-   idle=now-t.last_progress_at
-   res=self.gw.close(pos)
-
-   if res and res.retcode in (
-    mt5.TRADE_RETCODE_DONE,
-    mt5.TRADE_RETCODE_DONE_PARTIAL
-   ):
-    await self.db.log(
-     'PROFIT_STALL_EXIT',t.symbol,
-     idle_seconds=idle,result=str(res)
-    )
-
-   else:
-    await self.db.log(
-     'PROFIT_STALL_EXIT_FAILED',t.symbol,
-     idle_seconds=idle,result=str(res)
-    )
-    # تبقى الصفقة تحت المراقبة ونحاول مجددًا بعد 60 ثانية.
-    t.last_progress_at=now

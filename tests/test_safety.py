@@ -256,6 +256,44 @@ class MarketSafetyTests(unittest.TestCase):
             self.assertIn("غير متتبع", messages[0])
         asyncio.run(check())
 
+    def test_profit_protection_has_no_one_minute_stall_exit(self):
+        position = types.SimpleNamespace(ticket=501, profit=25.0)
+        class Gateway:
+            def __init__(self):
+                self.close_calls = 0
+            def position_by_ticket(self, ticket):
+                return position
+            def close(self, pos):
+                self.close_calls += 1
+                return types.SimpleNamespace(retcode=fake_mt5.TRADE_RETCODE_DONE)
+            def info(self, symbol):
+                return types.SimpleNamespace(digits=5)
+        messages = []
+        async def notify(message, **kwargs):
+            messages.append(message)
+        async def check():
+            gw=Gateway()
+            engine=Engine(gw,FakeDB(),notify)
+            engine.max_trade_minutes=10
+            trade=types.SimpleNamespace(
+                ticket=501,symbol='EURUSD',side=types.SimpleNamespace(value='BUY'),
+                entry=1.10000,sl=1.10500,tp=1.12000,initial_r=.005,
+                opened_at=time.time()-120,strategy='scalp_trend',regime='TREND',
+                confidence=.80,reason='',volume=.1,protection_pct=45.0,
+                trailing_gap_pct=5.0,protection_45_active=True,trailing=True,
+                best_favorable_price=1.11000,last_progress_at=time.time()-300,
+                signal_bar=0,
+            )
+            # Use the real Side enum so manage() follows the BUY path.
+            from core.models import Side
+            trade.side=Side.BUY
+            tick=types.SimpleNamespace(bid=1.11000,ask=1.11010)
+            info=types.SimpleNamespace(point=.00001,digits=5,trade_stops_level=0,trade_freeze_level=0)
+            await engine.manage(trade,tick,info)
+            self.assertEqual(gw.close_calls,0)
+            self.assertFalse(any(event.startswith('PROFIT_STALL_EXIT') for event,_ in engine.db.events))
+        asyncio.run(check())
+
     def test_daily_equity_limit_survives_restart(self):
         db = FakeDB()
         alerts = []

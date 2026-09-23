@@ -1,9 +1,12 @@
 import numpy as np
 from .models import Regime, Side
+from .strategy_ranker import choose_best
 from .strategies import (
  SCALP_TREND, GOLD_SCALP,
  scalp_breakout, ema_cross_scalp, scalp_trend, gold_scalp,
  m5_reversal_candidate, scalp_m5_reversal, scalp_reversion,
+ scalp_sweep_reversal, scalp_squeeze_expansion,
+ diagnose_scalp_sweep_reversal, diagnose_scalp_squeeze_expansion,
 )
 
 # MT5Gateway.rates() starts at position 1, so -1 is the latest fully closed M5 bar.
@@ -40,7 +43,7 @@ class Analyzer:
    dx.append(100*abs(pp-mm)/max(pp+mm,1e-12))
   return (float(np.mean(dx[-n:])) if dx else 0.),p,m
 
- def analyze(self,ticks,point,rates=None,symbol=None,rates_m15=None,rates_h1=None,rates_m1=None):
+ def analyze(self,ticks,point,rates=None,symbol=None,rates_m15=None,rates_h1=None,rates_m1=None,strategy_performance=None,min_confidence=None):
   if ticks is None or len(ticks)<80 or point<=0:
    return Regime.NO_TRADE,None,{'decision':'insufficient_ticks'}
 
@@ -129,42 +132,91 @@ class Analyzer:
    'm5_sideways_overlap_indices':_M5_SIDEWAYS_OVERLAP_INDICES,
   }
 
-  # Build reversal diagnostics once; actual reversal remains fourth priority.
+  # Build every valid candidate from the same market snapshot.
   reversal_side,reversal_reason,m5_doji,m5_sideways=m5_reversal_candidate(ctx)
 
-  # Priority 1: breakout/retest.
-  sig,reg_override,decision_override,retest_level=scalp_breakout(ctx)
-  if reg_override is not None: reg=reg_override
-  if decision_override is not None: decision=decision_override
-
-  # Priority 2a: EMA cross (non-gold only).
+  breakout_candidate,breakout_reg,breakout_decision,retest_level=scalp_breakout(ctx)
   ema_candidate,ema_cross_tf,ema_cross_gap=ema_cross_scalp(ctx)
-  if sig is None and ema_candidate is not None:
-   sig=ema_candidate; reg=Regime.TREND; decision='ema_cross_scalp'
-
-  # Priority 2b: trend continuation (non-gold only).
   trend_candidate,trend_checks,trend_values=scalp_trend(ctx)
-  if sig is None and trend_candidate is not None:
-   sig=trend_candidate; reg=Regime.TREND; decision='scalp_trend'
-  elif sig is None and trend_checks is not None:
-   reg=Regime.TREND; decision='trend_wait_pullback'
-
-  # Priority 3: dedicated XAUUSD strategy.
   gold_candidate,gold_checks,gold_values=gold_scalp(ctx)
-  if sig is None and gold_candidate is not None:
-   sig=gold_candidate; reg=Regime.TREND; decision='gold_scalp'
+  reversal_candidate=scalp_m5_reversal(ctx,reversal_side,reversal_reason)
+  reversion_candidate=scalp_reversion(ctx)
+  sweep_candidate=scalp_sweep_reversal(ctx)
+  squeeze_candidate=scalp_squeeze_expansion(ctx)
 
-  # Priority 4: M5 reversal.
-  if sig is None:
-   reversal_candidate=scalp_m5_reversal(ctx,reversal_side,reversal_reason)
-   if reversal_candidate is not None:
-    sig=reversal_candidate; reg=Regime.RANGE; decision='scalp_m5_reversal'
+  opportunity_diagnostics=[
+   diagnose_scalp_sweep_reversal(ctx),
+   diagnose_scalp_squeeze_expansion(ctx),
+  ]
 
-  # Priority 5: mean reversion.
+  candidates=[]
+  def add_candidate(signal,candidate_regime,candidate_decision,legacy_priority):
+   if signal is not None:
+    candidates.append({
+     'signal':signal,
+     'regime':candidate_regime,
+     'decision':candidate_decision,
+     'legacy_priority':legacy_priority,
+    })
+
+  add_candidate(breakout_candidate,Regime.BREAKOUT,'scalp_breakout_retest',1)
+  add_candidate(ema_candidate,Regime.TREND,'ema_cross_scalp',2)
+  add_candidate(trend_candidate,Regime.TREND,'scalp_trend',3)
+  add_candidate(gold_candidate,Regime.TREND,'gold_scalp',4)
+  add_candidate(reversal_candidate,Regime.RANGE,'scalp_m5_reversal',5)
+  add_candidate(reversion_candidate,Regime.RANGE,'scalp_reversion',6)
+  add_candidate(sweep_candidate,Regime.BREAKOUT,'scalp_sweep_reversal',7)
+  add_candidate(squeeze_candidate,Regime.VOLATILE,'scalp_squeeze_expansion',8)
+
+  selection_rows=[]
+  if strategy_performance is None:
+   # Preserve legacy behavior for direct/tests callers that do not provide
+   # performance data. The live engine passes a rolling performance table.
+   winner=min(candidates,key=lambda x:x['legacy_priority']) if candidates else None
+   if winner is not None:
+    sig=winner['signal']; reg=winner['regime']; decision=winner['decision']
+  else:
+   winner,ranked=choose_best(candidates,strategy_performance,min_confidence=min_confidence)
+   selection_rows=[
+    {
+     'strategy':row['strategy'],
+     'side':row['side'],
+     'confidence':row['confidence'],
+     'performance_score':row['performance_score'],
+     'performance_trades':row['performance_trades'],
+     'performance_points':row['performance_points'],
+     'performance_avg_points':row['performance_avg_points'],
+     'performance_reliability':row['performance_reliability'],
+     'confidence_weight':row['confidence_weight'],
+     'performance_weight':row['performance_weight'],
+     'final_score':row['final_score'],
+     'legacy_priority':row['legacy_priority'],
+     'eligible':bool(row.get('eligible',True)),
+     'selected':bool(winner is not None and row['strategy']==winner['strategy'] and row['side']==winner['side']),
+    }
+    for row in ranked
+   ]
+   if winner is not None:
+    sig=winner['signal']; reg=winner['regime']; decision=winner['decision']
+
+  # Preserve the useful no-signal diagnostic labels from the old priority flow.
   if sig is None:
-   reversion_candidate=scalp_reversion(ctx)
-   if reversion_candidate is not None:
-    sig=reversion_candidate; reg=Regime.RANGE; decision='scalp_reversion'
+   if breakout_reg is not None: reg=breakout_reg
+   if breakout_decision is not None: decision=breakout_decision
+   if trend_checks is not None:
+    reg=Regime.TREND; decision='trend_wait_pullback'
+
+  selected_strategy=sig.strategy if sig is not None else None
+  opportunity_candidates=[]
+  for candidate in (sweep_candidate,squeeze_candidate):
+   if candidate is not None:
+    opportunity_candidates.append({
+     'strategy':candidate.strategy,
+     'side':candidate.side.value,
+     'confidence':round(float(candidate.confidence),4),
+     'selected':candidate.strategy==selected_strategy,
+     'preempted_by':None if candidate.strategy==selected_strategy else selected_strategy,
+    })
 
   if sig is None:
    if clear_trend:blockers.append('clear_trend')
@@ -193,5 +245,5 @@ class Analyzer:
    'tick_momentum':round(float(tick_momentum),2),'micro_trend':round(float(micro_trend),2),
    'atr_points':round(float(atrp),2),'adx':round(float(adx),1),
    'di_plus':round(float(dp),1),'di_minus':round(float(dm),1),
-   'context_trend':round(float(context_trend),2),'m15_bias':m15_bias,'h1_bias':h1_bias,'retest_level':retest_level,'ema_cross_tf':ema_cross_tf,'ema_cross_gap':round(float(ema_cross_gap),2),'micro_z':round(float(micro_z),2),'momentum_min':round(float(momentum_min),2),'acceleration_min':round(float(acceleration_min),2),'live':True
+   'context_trend':round(float(context_trend),2),'m15_bias':m15_bias,'h1_bias':h1_bias,'retest_level':retest_level,'ema_cross_tf':ema_cross_tf,'ema_cross_gap':round(float(ema_cross_gap),2),'micro_z':round(float(micro_z),2),'momentum_min':round(float(momentum_min),2),'acceleration_min':round(float(acceleration_min),2),'opportunity_candidates':opportunity_candidates,'opportunity_diagnostics':opportunity_diagnostics,'strategy_selection':selection_rows,'live':True
   }

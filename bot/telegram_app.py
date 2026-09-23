@@ -179,7 +179,7 @@ class TelegramUI:
      if abs(time.time()-tick_ts)>settings.max_tick_age_seconds:
       lines.append(f'\n💱 {symbol}\n⚠️ آخر سعر قديم؛ لا توجد إشارة صالحة الآن.')
       continue
-     reg,sig,meta=self.e.an.analyze(ticks,i.point,self.e.gw.rates_m5(symbol,200),symbol=symbol,rates_m15=self.e.gw.rates_m15(symbol,200),rates_h1=self.e.gw.rates_h1(symbol,200),rates_m1=self.e.gw.rates_m1(symbol,200))
+     reg,sig,meta=self.e.an.analyze(ticks,i.point,self.e.gw.rates_m5(symbol,200),symbol=symbol,rates_m15=self.e.gw.rates_m15(symbol,200),rates_h1=self.e.gw.rates_h1(symbol,200),rates_m1=self.e.gw.rates_m1(symbol,200),strategy_performance=self.e.strategy_performance,min_confidence=self.e.min_confidence)
      if sig:
       direction='شراء 🟢' if sig.side.value=='BUY' else 'بيع 🔴'
       lines.append(f'\n💱 {symbol}\n📌 الإشارة: {direction}\n🧠 الاستراتيجية: {sig.strategy}\n🎯 قوة الإشارة: {sig.confidence*100:.0f}%\n📊 السوق: {reg.value}')

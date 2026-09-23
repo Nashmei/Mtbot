@@ -1,0 +1,183 @@
+"""Tests for rolling strategy-performance ranking."""
+import asyncio
+import json
+import os
+import sqlite3
+import tempfile
+import unittest
+
+from core.models import Signal, Side
+from core.strategy_ranker import (
+    adaptive_weights,
+    choose_best,
+    effective_performance_score,
+    normalize_average_points,
+    score_signal,
+)
+from storage.db import DB
+
+
+class StrategyRankerTests(unittest.TestCase):
+    def test_adaptive_weight_tiers(self):
+        self.assertEqual(adaptive_weights(0),(0.80,0.20))
+        self.assertEqual(adaptive_weights(9),(0.80,0.20))
+        self.assertEqual(adaptive_weights(10),(0.60,0.40))
+        self.assertEqual(adaptive_weights(29),(0.60,0.40))
+        self.assertEqual(adaptive_weights(30),(0.40,0.60))
+        self.assertEqual(adaptive_weights(50),(0.40,0.60))
+
+    def test_score_exposes_active_weights(self):
+        sig=Signal(Side.BUY,'scalp_trend',.80,10,'')
+        under10=score_signal(sig,{'trades':7,'points':1,'avg_points':1/7})
+        mid=score_signal(sig,{'trades':15,'points':3,'avg_points':.2})
+        mature=score_signal(sig,{'trades':30,'points':6,'avg_points':.2})
+        self.assertEqual((under10['confidence_weight'],under10['performance_weight']),(0.80,0.20))
+        self.assertEqual((mid['confidence_weight'],mid['performance_weight']),(0.60,0.40))
+        self.assertEqual((mature['confidence_weight'],mature['performance_weight']),(0.40,0.60))
+
+    def test_performance_scale_is_neutral_at_zero(self):
+        self.assertEqual(normalize_average_points(-1), 0.0)
+        self.assertEqual(normalize_average_points(0), 50.0)
+        self.assertEqual(normalize_average_points(3), 100.0)
+
+    def test_small_samples_are_shrunk_toward_neutral(self):
+        weak=effective_performance_score({'trades':3,'points':9,'avg_points':3})
+        full=effective_performance_score({'trades':30,'points':90,'avg_points':3})
+        self.assertGreater(weak['score'],50.0)
+        self.assertLess(weak['score'],full['score'])
+        self.assertEqual(full['score'],100.0)
+
+    def test_recent_performance_can_change_the_winner(self):
+        higher_conf=Signal(Side.BUY,'higher_conf',.82,10,'')
+        stronger_recent=Signal(Side.BUY,'stronger_recent',.78,10,'')
+        candidates=[
+            {'signal':higher_conf,'regime':None,'decision':'a','legacy_priority':1},
+            {'signal':stronger_recent,'regime':None,'decision':'b','legacy_priority':2},
+        ]
+        perf={
+            'higher_conf':{'trades':30,'points':-30,'avg_points':-1},
+            'stronger_recent':{'trades':30,'points':90,'avg_points':3},
+        }
+        winner,ranked=choose_best(candidates,perf)
+        self.assertEqual(winner['strategy'],'stronger_recent')
+        self.assertGreater(ranked[0]['final_score'],ranked[1]['final_score'])
+
+    def test_below_confidence_candidate_cannot_block_eligible_signal(self):
+        below=Signal(Side.BUY,'below',.74,10,'')
+        eligible=Signal(Side.BUY,'eligible',.76,10,'')
+        candidates=[
+            {'signal':below,'regime':None,'decision':'a','legacy_priority':1},
+            {'signal':eligible,'regime':None,'decision':'b','legacy_priority':2},
+        ]
+        perf={
+            'below':{'trades':30,'points':90,'avg_points':3},
+            'eligible':{'trades':30,'points':0,'avg_points':0},
+        }
+        winner,ranked=choose_best(candidates,perf,min_confidence=75)
+        self.assertEqual(winner['strategy'],'eligible')
+        self.assertFalse(next(r for r in ranked if r['strategy']=='below')['eligible'])
+
+    def test_new_strategy_is_neutral_not_penalized(self):
+        sig=Signal(Side.SELL,'new_strategy',.76,10,'')
+        winner,ranked=choose_best(
+            [{'signal':sig,'regime':None,'decision':'x','legacy_priority':7}],
+            {},
+        )
+        self.assertEqual(winner['strategy'],'new_strategy')
+        self.assertEqual(ranked[0]['performance_score'],50.0)
+        self.assertEqual(ranked[0]['performance_trades'],0)
+
+
+class StrategyPerformanceDBTests(unittest.TestCase):
+    def test_latest_50_closed_trades_per_strategy_are_used(self):
+        fd,path=tempfile.mkstemp(suffix='.db')
+        os.close(fd)
+        try:
+            db=DB(path)
+            asyncio.run(db.init())
+            con=sqlite3.connect(path)
+            ts=1000.0
+            # Old 10 winners should fall outside the latest-50 window.
+            for i in range(60):
+                open_details=json.dumps({'strategy':'scalp_trend','side':'BUY'})
+                con.execute(
+                    'INSERT INTO audit(ts,event,symbol,details) VALUES(?,?,?,?)',
+                    (ts,'OPEN','EURUSD',open_details),
+                )
+                points_win=i<10
+                close_event='TP' if points_win else 'SL'
+                close_details=json.dumps({'pnl':100.0 if points_win else -100.0})
+                con.execute(
+                    'INSERT INTO audit(ts,event,symbol,details) VALUES(?,?,?,?)',
+                    (ts+0.5,close_event,'EURUSD',close_details),
+                )
+                ts+=1.0
+            con.commit()
+            con.close()
+
+            stats=asyncio.run(db.strategy_performance(50))
+            row=stats['scalp_trend']
+            self.assertEqual(row['trades'],50)
+            self.assertEqual(row['points'],-50.0)
+            self.assertEqual(row['avg_points'],-1.0)
+        finally:
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+
+
+    def test_reset_cutoff_starts_performance_from_zero_without_deleting_audit(self):
+        fd,path=tempfile.mkstemp(suffix='.db')
+        os.close(fd)
+        try:
+            db=DB(path)
+            asyncio.run(db.init())
+            con=sqlite3.connect(path)
+
+            con.execute(
+                'INSERT INTO audit(ts,event,symbol,details) VALUES(?,?,?,?)',
+                (1000.0,'OPEN','EURUSD',json.dumps({'strategy':'scalp_trend'})),
+            )
+            con.execute(
+                'INSERT INTO audit(ts,event,symbol,details) VALUES(?,?,?,?)',
+                (1000.5,'TP','EURUSD',json.dumps({'pnl':100.0})),
+            )
+            con.commit()
+            con.close()
+
+            before=asyncio.run(db.strategy_performance(50))
+            self.assertEqual(before['scalp_trend']['points'],3.0)
+
+            asyncio.run(db.reset_strategy_performance(at_ts=2000.0))
+            after=asyncio.run(db.strategy_performance(50))
+            self.assertEqual(after,{})
+
+            con=sqlite3.connect(path)
+            old_rows=con.execute(
+                "SELECT COUNT(*) FROM audit WHERE event IN ('OPEN','TP')"
+            ).fetchone()[0]
+            con.execute(
+                'INSERT INTO audit(ts,event,symbol,details) VALUES(?,?,?,?)',
+                (2001.0,'OPEN','EURUSD',json.dumps({'strategy':'scalp_trend'})),
+            )
+            con.execute(
+                'INSERT INTO audit(ts,event,symbol,details) VALUES(?,?,?,?)',
+                (2001.5,'SL','EURUSD',json.dumps({'pnl':-50.0})),
+            )
+            con.commit()
+            con.close()
+
+            self.assertEqual(old_rows,2)
+            fresh=asyncio.run(db.strategy_performance(50))
+            self.assertEqual(fresh['scalp_trend']['trades'],1)
+            self.assertEqual(fresh['scalp_trend']['points'],-1.0)
+        finally:
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+
+
+if __name__ == '__main__':
+    unittest.main()
