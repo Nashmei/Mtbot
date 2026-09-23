@@ -62,15 +62,15 @@ EMA_CROSS_SCALP = {
 }
 
 def ema_cross_scalp(ctx):
-    if ctx['is_gold']:
-        return None, None, 0.0
     rates_m1=ctx['rates_m1']; rates=ctx['rates']
     cross_rates=rates_m1 if rates_m1 is not None and len(rates_m1)>=30 else rates
-    if cross_rates is None or len(cross_rates)<31:
+    required=30 if ctx['is_gold'] else 31
+    if cross_rates is None or len(cross_rates)<required:
         return None, None, 0.0
     cc=np.asarray(cross_rates['close'],float); ema=ctx['ema']
     ema9_now=ema(cc[-24:],9); ema21_now=ema(cc[-30:],21)
-    ema9_prev=ema(cc[-25:-1],9); ema21_prev=ema(cc[-31:-1],21)
+    ema9_prev=ema(cc[-25:-1],9)
+    ema21_prev=ema(cc[-30:-1] if ctx['is_gold'] else cc[-31:-1],21)
     cross_up=ema9_prev<=ema21_prev and ema9_now>ema21_now
     cross_dn=ema9_prev>=ema21_prev and ema9_now<ema21_now
     gap=abs(ema9_now-ema21_now)/ctx['point']
@@ -83,7 +83,7 @@ def ema_cross_scalp(ctx):
         side=Side.BUY
     elif cross_dn and ctx['m15_bias']<=0 and sell_live_ok:
         side=Side.SELL
-    if side is None or not ctx['strategy_allowed'](EMA_CROSS_SCALP['name'],side):
+    if ctx['is_gold'] or side is None or not ctx['strategy_allowed'](EMA_CROSS_SCALP['name'],side):
         return None, tf, gap
     atrp=ctx['atrp']
     score=EMA_CROSS_SCALP['score_base']+min(10,gap/max(atrp*.05,1.)*4)+min(8,abs(ctx['tick_momentum_fast'])/max(atrp,1)*12)
