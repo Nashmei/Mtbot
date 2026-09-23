@@ -82,8 +82,12 @@ class Analyzer:
    return m15_bias==want and h1_bias in (0,want)
 
   # Closed M5 is context only. Entry direction is driven by live MT5 ticks.
-  live_up=micro_trend>0 and tick_momentum>0 and tick_momentum_fast>=-max(1.,atrp*.08)
-  live_dn=micro_trend<0 and tick_momentum<0 and tick_momentum_fast<=max(1.,atrp*.08)
+  # ATR-adaptive thresholds keep quiet markets tradable without accepting a
+  # directionless tick stream. HTF protection is applied separately below.
+  momentum_min=max(.75,atrp*.04)
+  acceleration_min=max(.50,atrp*.02)
+  live_up=micro_trend>0 and tick_momentum>0 and tick_momentum_fast>=-acceleration_min
+  live_dn=micro_trend<0 and tick_momentum<0 and tick_momentum_fast<=acceleration_min
   context_up=(not have) or context_trend>=-atrp*.20
   context_dn=(not have) or context_trend<=atrp*.20
   # Scalping entry stays live-first: M5 is context only; ADX/DI never blocks an entry.
@@ -239,9 +243,9 @@ class Analyzer:
   # pullback/retest instead of chasing an already extended impulse.
   if sig is None and (bull or bear) and have and strategy_allowed('scalp_trend'):
    side=Side.BUY if bull else Side.SELL
-   strong=micro_gap>=max(1.25,atrp*.07) and abs(tick_momentum)>=max(1.25,atrp*.07)
-   acceleration=((side==Side.BUY and tick_momentum_fast>=max(1.0,atrp*.035)) or
-                 (side==Side.SELL and tick_momentum_fast<=-max(1.0,atrp*.035)))
+   strong=micro_gap>=max(.75,atrp*.04) and abs(tick_momentum)>=momentum_min
+   acceleration=((side==Side.BUY and tick_momentum_fast>=acceleration_min) or
+                 (side==Side.SELL and tick_momentum_fast<=-acceleration_min))
    c5=np.asarray(rates['close'],float); h5=np.asarray(rates['high'],float); l5=np.asarray(rates['low'],float)
    ema20_5=self._ema(c5[-30:],20)
    pull_tol=max(atrp*.22*point,4*point)
@@ -261,9 +265,9 @@ class Analyzer:
   if sig is None and is_gold:
    gold_up=micro_trend>0 and tick_momentum>0 and tick_momentum_fast>0 and context_up
    gold_dn=micro_trend<0 and tick_momentum<0 and tick_momentum_fast<0 and context_dn
-   gold_gap=micro_gap>=max(1.5,atrp*.07)
-   gold_momentum=abs(tick_momentum)>=max(1.5,atrp*.07)
-   gold_fast=abs(tick_momentum_fast)>=max(1.0,atrp*.035)
+   gold_gap=micro_gap>=max(1.0,atrp*.05)
+   gold_momentum=abs(tick_momentum)>=max(1.0,atrp*.05)
+   gold_fast=abs(tick_momentum_fast)>=max(.75,atrp*.025)
    gold_side=Side.BUY if gold_up else (Side.SELL if gold_dn else None)
    gold_expand=(gold_up or gold_dn) and gold_gap and gold_momentum and gold_fast and tick_range>=max(5.0,atrp*.35) and gold_side is not None and htf_allows(gold_side)
    if gold_expand:
@@ -301,9 +305,9 @@ class Analyzer:
     blockers.append('clear_trend')
    if not (live_up or live_dn):
     blockers.append('live_direction_missing')
-   if abs(tick_momentum)<max(1.25,atrp*.07):
+   if abs(tick_momentum)<momentum_min:
     blockers.append('momentum_below_trend_threshold')
-   if abs(tick_momentum_fast)<max(1.0,atrp*.035):
+   if abs(tick_momentum_fast)<acceleration_min:
     blockers.append('acceleration_below_trend_threshold')
    if m15_bias and h1_bias and m15_bias!=h1_bias:
     blockers.append('m15_h1_conflict')
@@ -311,12 +315,17 @@ class Analyzer:
     want=1 if tick_momentum>0 else (-1 if tick_momentum<0 else 0)
     if want and want!=m15_bias:
      blockers.append('gold_live_vs_htf_conflict')
-   if m5_doji:
+   # A doji alone must not erase an otherwise valid trend regime. It still
+   # suppresses the dedicated reversal pattern above and remains diagnostic.
+   if m5_doji and market_mode!='trend':
     reg=Regime.NO_TRADE; decision='m5_doji_no_trade'
-   elif m5_sideways:
+   elif m5_sideways and market_mode!='trend':
     reg=Regime.NO_TRADE; decision='m5_sideways_no_trade'
    elif is_gold:
-    reg=Regime.VOLATILE if tick_range>max(8.,atrp*.8) else (Regime.TREND if abs(micro_trend)>max(1.5,atrp*.10) else Regime.RANGE)
+    # Report the router regime consistently; waiting for gold confirmation
+    # must not relabel a clear HTF trend as RANGE.
+    reg=(Regime.TREND if market_mode=='trend' else
+         Regime.VOLATILE if market_mode=='expansion' else Regime.RANGE)
     decision='gold_wait_confirmation'
    elif abs(micro_trend)>max(1.5,atrp*.10):
     reg=Regime.TREND; decision='waiting_momentum'
@@ -328,5 +337,5 @@ class Analyzer:
    'tick_momentum':round(float(tick_momentum),2),'micro_trend':round(float(micro_trend),2),
    'atr_points':round(float(atrp),2),'adx':round(float(adx),1),
    'di_plus':round(float(dp),1),'di_minus':round(float(dm),1),
-   'context_trend':round(float(context_trend),2),'m15_bias':m15_bias,'h1_bias':h1_bias,'retest_level':retest_level,'ema_cross_tf':ema_cross_tf,'ema_cross_gap':round(float(ema_cross_gap),2),'micro_z':round(float(micro_z),2),'live':True
+   'context_trend':round(float(context_trend),2),'m15_bias':m15_bias,'h1_bias':h1_bias,'retest_level':retest_level,'ema_cross_tf':ema_cross_tf,'ema_cross_gap':round(float(ema_cross_gap),2),'micro_z':round(float(micro_z),2),'momentum_min':round(float(momentum_min),2),'acceleration_min':round(float(acceleration_min),2),'live':True
   }
