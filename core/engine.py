@@ -1077,7 +1077,7 @@ class Engine:
   target_progress=(favorable/target_distance) if target_distance>0 else 0.0
   now=time.time()
 
-  # عند تحقيق 45%: انقل SL إلى مستوى 45% وابدأ عداد 60 ثانية.
+  # عند تحقيق 45%: انقل SL إلى مستوى الحماية وابدأ تتبع أفضل سعر فقط.
   trigger=t.protection_pct/100.0
   if target_progress>=trigger and not t.protection_45_active:
    level45=t.entry+(target_distance*trigger) if t.side==Side.BUY else t.entry-(target_distance*trigger)
