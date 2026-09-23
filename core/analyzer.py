@@ -187,6 +187,8 @@ class Analyzer:
      'performance_points':row['performance_points'],
      'performance_avg_points':row['performance_avg_points'],
      'performance_reliability':row['performance_reliability'],
+     'confidence_weight':row['confidence_weight'],
+     'performance_weight':row['performance_weight'],
      'final_score':row['final_score'],
      'legacy_priority':row['legacy_priority'],
      'eligible':bool(row.get('eligible',True)),
