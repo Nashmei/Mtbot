@@ -66,7 +66,9 @@ async def main():
     if not state:return
     if trade_result is not None:
      pnl=float(trade_result)
-     result_text=f'🟢 ربح $+{pnl:.2f}' if pnl>=0 else f'🔴 خسارة $-{abs(pnl):.2f}'
+     result_text=(f'🟢 ربح $+{pnl:.2f}' if pnl>0 else
+                  f'🔴 خسارة $-{abs(pnl):.2f}' if pnl<0 else
+                  '📍 تعادل $0.00')
      result_msg=await app.bot.send_message(chat_id=chat_id,text=result_text,reply_to_message_id=state['message_id'])
      try:
       await app.bot.unpin_chat_message(chat_id=chat_id,message_id=state['message_id'])
