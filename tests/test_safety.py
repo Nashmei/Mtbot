@@ -83,6 +83,29 @@ class MarketSafetyTests(unittest.TestCase):
             fake_config.settings.max_tick_age_seconds,
         )
 
+    def test_no_money_volume_walk_never_increases_risk(self):
+        vmin, vstep, requested = 0.01, 0.01, 10.19
+        accepted = 8.37
+        vol = requested
+        checked = []
+        while vol - vstep >= vmin - 1e-9:
+            vol = round(vol - vstep, 8)
+            checked.append(vol)
+            if vol <= accepted:
+                break
+        self.assertLess(vol, requested)
+        self.assertGreaterEqual(vol, vmin)
+        self.assertLessEqual(vol, accepted)
+        self.assertTrue(all(b < a for a, b in zip([requested] + checked, checked)))
+
+    def test_no_money_notice_key_is_signal_scoped(self):
+        signal_key = ("scalp_trend", "SELL", 12345)
+        first = ("order_check_no_money", "NZDUSD", signal_key)
+        repeat = ("order_check_no_money", "NZDUSD", signal_key)
+        new_signal = ("order_check_no_money", "NZDUSD", ("scalp_trend", "SELL", 12346))
+        self.assertEqual(first, repeat)
+        self.assertNotEqual(first, new_signal)
+
     def test_fill_policy_rejects_unsupported_market_mode(self):
         gateway = MT5Gateway()
         info = types.SimpleNamespace(trade_exemode=2, filling_mode=0)
