@@ -6,11 +6,10 @@ from core.analyzer import Analyzer
 from core.models import Side
 
 SYMBOLS=['EURUSD','XAUUSD','USDJPY']
-RR=1.5
-RISK_PCT=2.0
-PROTECTION_PCT=50.0
-MAX_MINUTES=15
-MAX_POSITIONS=5
+RR=3.0
+RISK_PCT=0.25
+PROTECTION_PCT=45.0
+MAX_MINUTES=10
 MIN_CONFIDENCE=75.0
 
 def main():
@@ -28,10 +27,11 @@ def main():
   m1=mt5.copy_rates_range(symbol,mt5.TIMEFRAME_M1,start,end)
   m5=mt5.copy_rates_range(symbol,mt5.TIMEFRAME_M5,start,end)
   m15=mt5.copy_rates_range(symbol,mt5.TIMEFRAME_M15,start,end)
+  h1=mt5.copy_rates_range(symbol,mt5.TIMEFRAME_H1,start,end)
   ticks=mt5.copy_ticks_range(symbol,start,end,mt5.COPY_TICKS_ALL)
-  if m1 is None or m5 is None or m15 is None or ticks is None: continue
+  if m1 is None or m5 is None or m15 is None or h1 is None or ticks is None: continue
   # Pre-index time arrays so each minute slices data in O(log n), not full-array scans.
-  tt=ticks['time']; t5=m5['time']; t15=m15['time']; t1=m1['time']
+  tt=ticks['time']; t5=m5['time']; t15=m15['time']; t1=m1['time']; th1=h1['time']
   print(f'[{symbol}] loaded: {len(m1)} M1 bars, {len(ticks)} ticks', flush=True)
   last_exit=0
   for bar in m1[60:]:
@@ -39,10 +39,12 @@ def main():
    if ts<last_exit: continue
    lo=np.searchsorted(tt,ts-1800,side='left'); hi=np.searchsorted(tt,ts,side='right')
    i5=np.searchsorted(t5,ts,side='left'); i15=np.searchsorted(t15,ts,side='left')
+   i1=np.searchsorted(t1,ts,side='left'); ih1=np.searchsorted(th1,ts,side='left')
    tk=ticks[lo:hi]
    r5=m5[max(0,i5-200):i5]; r15=m15[max(0,i15-200):i15]
-   if len(tk)<80 or len(r5)<60: continue
-   reg,sig,meta=an.analyze(tk,info.point,r5,symbol=symbol,rates_m15=r15)
+   r1=m1[max(0,i1-200):i1]; rh1=h1[max(0,ih1-200):ih1]
+   if len(tk)<80 or len(r5)<60 or ts-int(tk['time'][-1])>15: continue
+   reg,sig,meta=an.analyze(tk[-300:],info.point,r5,symbol=symbol,rates_m15=r15,rates_h1=rh1,rates_m1=r1)
    if not sig or sig.confidence*100<MIN_CONFIDENCE: continue
    entry=float(tk['ask'][-1] if sig.side==Side.BUY else tk['bid'][-1])
    spread=float(tk['ask'][-1]-tk['bid'][-1])
@@ -90,7 +92,7 @@ def main():
    last_exit=ts+MAX_MINUTES*60
   print(f'[{symbol}] done | total qualifying trades so far: {len(rows)}', flush=True)
  mt5.shutdown()
- print(f'BACKTEST {a.days} days | risk={RISK_PCT}% | RR=1:{RR} | protection={PROTECTION_PCT}% | max={MAX_MINUTES}m | positions={MAX_POSITIONS} | confidence={MIN_CONFIDENCE}%')
+ print(f'SIGNAL REPLAY {a.days} days | risk={RISK_PCT}% | RR=1:{RR} | protection={PROTECTION_PCT}% | max={MAX_MINUTES}m | confidence={MIN_CONFIDENCE}%')
  if not rows:
   print('No qualifying trades.'); return
  rs=np.array([x[3] for x in rows],float); wins=int((rs>0).sum()); losses=int((rs<0).sum())
@@ -111,6 +113,6 @@ def main():
  for st in sorted(set(x[1] for x in rows)):
   z=[x for x in rows if x[1]==st]
   print(f'  {st}: {len(z)} | {sum(x[3] for x in z):+.2f}R')
- print('NOTE: protection/trailing/60s inactivity are simulated from ticks; portfolio concurrency is still not fully simulated.')
+ print('LIMITATION: signal replay only. No broker fills, margin, fees, slippage, rollover, portfolio concurrency, or real stop/freeze restrictions; equity index is not a live performance estimate.')
 if __name__=='__main__':
  main()
