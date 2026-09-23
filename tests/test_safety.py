@@ -129,6 +129,45 @@ class MarketSafetyTests(unittest.TestCase):
         )
         self.assertEqual(signal.strategy, "scalp_breakout")
 
+
+    def test_gold_wait_keeps_trend_regime(self):
+        ticks = np.array(
+            [(2000 + i * .001 - .05, 2000 + i * .001 + .05) for i in range(300)],
+            dtype=[("bid", "f8"), ("ask", "f8")],
+        )
+        closes = np.linspace(2010, 2000, 200)
+        rates = np.array(
+            [(v, v + .2, v - .2, v) for v in closes],
+            dtype=[("open", "f8"), ("high", "f8"), ("low", "f8"), ("close", "f8")],
+        )
+        regime, signal, meta = Analyzer().analyze(
+            ticks, .01, rates, symbol="XAUUSD",
+            rates_m15=rates, rates_h1=rates, rates_m1=rates,
+        )
+        self.assertIsNone(signal)
+        self.assertEqual(meta["market_mode"], "trend")
+        self.assertEqual(regime.value, "TREND")
+
+    def test_adaptive_thresholds_are_exposed(self):
+        ticks = np.array(
+            [(1.1000 + i * .000001, 1.1001 + i * .000001) for i in range(300)],
+            dtype=[("bid", "f8"), ("ask", "f8")],
+        )
+        closes = np.linspace(1.101, 1.100, 200)
+        rates = np.array(
+            [(v, v + .0002, v - .0002, v) for v in closes],
+            dtype=[("open", "f8"), ("high", "f8"), ("low", "f8"), ("close", "f8")],
+        )
+        _, _, meta = Analyzer().analyze(
+            ticks, .00001, rates, symbol="EURUSD",
+            rates_m15=rates, rates_h1=rates, rates_m1=rates,
+        )
+        self.assertIn("momentum_min", meta)
+        self.assertIn("acceleration_min", meta)
+        self.assertGreater(meta["momentum_min"], 0)
+        self.assertGreater(meta["acceleration_min"], 0)
+
+
     def test_unknown_broker_position_stops_engine(self):
         class Gateway:
             def account(self):
