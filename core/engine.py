@@ -560,15 +560,64 @@ class Engine:
 
    chk=self.gw.order_check(req)
    if not chk:
-    await self.notify(f'❌ لم تنفذ {symbol}\norder_check لم يرجع نتيجة\nMT5: {mt5.last_error()}')
+    notice_key=('order_check_none',symbol,signal_key)
+    if notice_key not in self.execution_notice_once:
+     self.execution_notice_once.add(notice_key)
+     await self.notify(f'❌ لم تنفذ {symbol}\norder_check لم يرجع نتيجة\nMT5: {mt5.last_error()}')
+    await self._log_reject('ORDER_CHECK_REJECT',symbol,reason='NO_RESULT',volume=vol)
     return
+
+   # MT5 may require more margin than order_calc_margin() estimated. For
+   # TRADE_RETCODE_NO_MONEY, walk volume down by the broker step until the
+   # order check accepts it. This can only reduce risk; it never increases it.
+   no_money=getattr(mt5,'TRADE_RETCODE_NO_MONEY',10019)
+   if chk.retcode==no_money:
+    requested_vol=vol
+    while chk and chk.retcode==no_money and vol-vstep>=vmin-1e-9:
+     vol=round(vol-vstep,8)
+     req['volume']=vol
+     chk=self.gw.order_check(req)
+    actual_risk=loss_1lot*vol
+    actual_risk_pct=(actual_risk/float(account.equity)*100.0) if account.equity else 0.0
+    if not chk or chk.retcode!=0:
+     code=getattr(chk,'retcode',no_money) if chk else no_money
+     comment=getattr(chk,'comment','No money') if chk else 'No money'
+     await self._log_reject(
+      'ORDER_CHECK_REJECT',symbol,reason='NO_MONEY',retcode=code,
+      requested_volume=requested_vol,final_volume=vol,
+      risk_pct=actual_risk_pct,
+     )
+     notice_key=('order_check_no_money',symbol,signal_key)
+     if notice_key not in self.execution_notice_once:
+      self.execution_notice_once.add(notice_key)
+      await self.notify(
+       f'❌ رفض فحص الصفقة — {symbol}\n'
+       f'الكود: {code}\n'
+       f'السبب: {comment}\n'
+       f'اللوت بعد خفض المارجن: {vol:g} | المخاطرة: {actual_risk_pct:.2f}%'
+      )
+     return
+    if vol < requested_vol:
+     await self._log_reject(
+      'MARGIN_VOLUME_REDUCED',symbol,requested_volume=requested_vol,
+      accepted_volume=vol,risk_pct=actual_risk_pct,
+     )
+
    if chk.retcode!=0:
-    await self.notify(
-     f'❌ رفض فحص الصفقة — {symbol}\n'
-     f'الكود: {chk.retcode}\n'
-     f'السبب: {getattr(chk,"comment","غير معروف")}\n'
-     f'اللوت: {vol:g} | المخاطرة: {actual_risk_pct:.2f}%'
+    await self._log_reject(
+     'ORDER_CHECK_REJECT',symbol,reason='BROKER_REJECT',
+     retcode=chk.retcode,comment=getattr(chk,'comment','غير معروف'),
+     volume=vol,risk_pct=actual_risk_pct,
     )
+    notice_key=('order_check_reject',symbol,signal_key,chk.retcode)
+    if notice_key not in self.execution_notice_once:
+     self.execution_notice_once.add(notice_key)
+     await self.notify(
+      f'❌ رفض فحص الصفقة — {symbol}\n'
+      f'الكود: {chk.retcode}\n'
+      f'السبب: {getattr(chk,"comment","غير معروف")}\n'
+      f'اللوت: {vol:g} | المخاطرة: {actual_risk_pct:.2f}%'
+     )
     return
 
    res=self.gw.send(req)
