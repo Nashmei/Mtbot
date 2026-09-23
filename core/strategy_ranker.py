@@ -65,7 +65,7 @@ def score_signal(signal, performance_stats=None):
     }
 
 
-def choose_best(candidates, performance_by_strategy=None):
+def choose_best(candidates, performance_by_strategy=None, min_confidence=None):
     """Return (winner, ranked_rows).
 
     candidates: iterable of dicts containing at least signal, regime, decision,
@@ -76,7 +76,8 @@ def choose_best(candidates, performance_by_strategy=None):
     for item in candidates:
         sig=item['signal']
         score=score_signal(sig,performance_by_strategy.get(sig.strategy))
-        ranked.append({**item,**score})
+        eligible=(min_confidence is None or score['confidence']>=float(min_confidence))
+        ranked.append({**item,**score,'eligible':eligible})
     ranked.sort(
         key=lambda row:(
             row['final_score'],
@@ -85,4 +86,6 @@ def choose_best(candidates, performance_by_strategy=None):
         ),
         reverse=True,
     )
-    return (ranked[0] if ranked else None), ranked
+    eligible_rows=[row for row in ranked if row['eligible']]
+    winner=eligible_rows[0] if eligible_rows else (ranked[0] if ranked else None)
+    return winner, ranked
