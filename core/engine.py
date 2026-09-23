@@ -940,13 +940,13 @@ class Engine:
 
     if reason==mt5.DEAL_REASON_TP:
      event='TP'
-     icon='🎯'
+     result_reason='TP 🎯'
     elif reason==mt5.DEAL_REASON_SL:
      event='SL'
-     icon='🛑'
+     result_reason='حماية ربح 🛡️' if pnl>0 and t.protection_45_active else 'SL 🛑'
     else:
      event='POSITION_CLOSED'
-     icon='🏁'
+     result_reason='حماية ربح 🛡️' if pnl>0 and t.protection_45_active else 'إغلاق 🏁'
 
     if pnl < 0:
      self.consecutive_losses+=1
@@ -956,7 +956,7 @@ class Engine:
 
     await self.db.log(event,t.symbol,exit_price=exit_price,pnl=pnl,reason=reason)
     caption=await self._trade_caption(t,pnl=pnl,closed=True)
-    await self.notify(caption,trade_ticket=t.ticket,trade_update=True,trade_result=pnl)
+    await self.notify(caption,trade_ticket=t.ticket,trade_update=True,trade_result=pnl,trade_result_reason=result_reason)
    else:
     await self.db.log('POSITION_CLOSED',t.symbol,reason='history_not_found')
     caption=await self._trade_caption(t,pnl=None,closed=True)
