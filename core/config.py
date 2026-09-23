@@ -9,6 +9,7 @@ class Settings(BaseSettings):
     rr:float=3.; min_hold_seconds:int=5; max_hold_seconds:int=120
     min_sl_points:float=10.; max_test_lot:float=.10
     spread_sample_size:int=60; max_spread_multiplier:float=1.8; max_spread_points:float=0.; max_slippage_points:int=10; poll_interval_ms:int=150
+    max_tick_age_seconds:float=15.
     db_path:str=str(BASE_DIR/'storage'/'bot.db')
     model_config=SettingsConfigDict(env_file=str(BASE_DIR/'.env'), case_sensitive=False, extra='ignore')
 settings=Settings()
