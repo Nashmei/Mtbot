@@ -137,7 +137,7 @@ class TelegramUI:
       lines.append(f'\n💱 {symbol}\n⚪ لا توجد فرصة حالياً\n📊 السوق: {reg.value}\n🔎 السبب: {labels.get(reason,reason)}')
       checks=meta.get('gold_checks') if reason=='gold_wait_confirmation' else meta.get('trend_checks')
       if checks:
-       check_labels={'strong':'قوة الزخم','acceleration':'التسارع','pullback':'Pullback','htf':'M15/H1','direction':'الاتجاه اللحظي','gap':'Micro gap','momentum':'الزخم','expansion_range':'مدى التوسع'}
+       check_labels={'gap':'Micro gap','momentum':'الزخم','acceleration':'التسارع','pullback':'Pullback','htf':'M15/H1','direction':'الاتجاه اللحظي','expansion_range':'مدى التوسع','range_floor':'الحد الأدنى للمدى'}
        detail=['   '+('✅' if ok else '❌')+' '+check_labels.get(name,name) for name,ok in checks.items()]
        lines[-1]+='\n🧩 شروط الدخول:\n'+'\n'.join(detail)
        values=meta.get('gold_values') if reason=='gold_wait_confirmation' else meta.get('trend_values')
@@ -145,7 +145,8 @@ class TelegramUI:
         bias_name=lambda v: 'BUY' if v>0 else ('SELL' if v<0 else 'NEUTRAL')
         if reason=='gold_wait_confirmation':
          lines[-1]+=(f"\n📐 القيم: Gap {values['micro_gap']}/{values['gap_min']} | Momentum {values['momentum']} (|{values['momentum_abs']}|/{values['momentum_min']}) | Accel {values['acceleration']} (|{values['acceleration_abs']}|/{values['acceleration_min']})\n"
-                     f"   Range {values['tick_range']}/{values['expansion_range_min']} | Side {values['side']} | M15 {bias_name(values['m15_bias'])} | H1 {bias_name(values['h1_bias'])}")
+                     f"   Range {values['tick_range']}/{values['expansion_range_min']} | Floor {values['expansion_range_floor']} | Score {values['confirmation_score']}/{values['confirmation_required']}\n"
+                     f"   Score {values['confirmation_score']}/{values['confirmation_required']} | Side {values['side']} | M15 {bias_name(values['m15_bias'])} | H1 {bias_name(values['h1_bias'])}")
         else:
          lines[-1]+=(f"\n📐 القيم: Gap {values['micro_gap']}/{values['momentum_min']} | Momentum {values['momentum']} (|{values['momentum_abs']}|/{values['momentum_min']}) | Accel {values['acceleration']} (|{values['acceleration_abs']}|/{values['acceleration_min']})\n"
                      f"   Pullback distance {values['pullback_distance_points']}pt | tolerance {values['pullback_tolerance_points']}pt | Live {values['live']} | EMA20 {values['ema20_m5']}\n"
