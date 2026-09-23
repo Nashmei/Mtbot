@@ -214,7 +214,9 @@ class Analyzer:
    sig=Signal(side,'scalp_breakout',min(.92,score/100.),slp,'M5 breakout + direct retest + M15/H1 trend confirmation')
    decision='scalp_breakout_retest'
 
-  # Frequent EMA 9/21 crossover setup. XAUUSD is reserved for its dedicated gold_scalp logic.\n  is_gold=str(symbol or '').upper().startswith('XAUUSD')\n  if sig is None and not is_gold and ema_cross_side is not None and strategy_allowed('ema_cross_scalp',ema_cross_side):
+  # Frequent EMA 9/21 crossover setup. XAUUSD is reserved for its dedicated gold_scalp logic.
+  is_gold=str(symbol or '').upper().startswith('XAUUSD')
+  if sig is None and not is_gold and ema_cross_side is not None and strategy_allowed('ema_cross_scalp',ema_cross_side):
    side=ema_cross_side
    reg=Regime.TREND
    score=72+min(10,ema_cross_gap/max(atrp*.05,1.)*4)+min(8,abs(tick_momentum_fast)/max(atrp,1)*12)
