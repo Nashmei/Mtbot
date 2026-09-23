@@ -13,7 +13,7 @@
 - الإعدادات التشغيلية تحفظ في SQLite وتستعاد عند إعادة تشغيل البوت.
 - البيئة المستخدمة فعلياً على الخادم: Ubuntu + Wine + Windows Python + MT5.
 - آخر بيئة تم اختبارها: Wine Staging 11.18، Windows Python 3.11.9، حزمة MetaTrader5 5.0.6180.
-- **ملاحظة تشغيلية مهمة (2026-09-23):** بعد تحديث Terminal تلقائياً من build 6204 إلى build 6207 ظهر `(-10005, 'IPC timeout')` بين حزمة Python وMT5 تحت Wine. لذلك يجب عدم اعتبار MT5 جاهزاً لمجرد أن عملية `terminal64.exe` تعمل؛ يلزم نجاح `mt5.initialize()` فعلياً قبل تشغيل التداول. أثناء آخر تشخيص كان `mt5.service` و`mtbot.service` متوقفين.
+- **ملاحظة تشغيلية مهمة (2026-09-23):** بعد تحديث Terminal تلقائياً من build 6204 إلى build 6207 ظهر `(-10005, 'IPC timeout')` بين حزمة Python وMT5 تحت Wine. لذلك يجب عدم اعتبار MT5 جاهزاً لمجرد أن عملية `terminal64.exe` تعمل؛ يلزم نجاح `mt5.initialize()` فعلياً قبل تشغيل التداول. مشكلة IPC هذه حُلّت لاحقاً بحسب إفادة صاحب السيرفر؛ لا تُعامل هذا الوصف التاريخي على أنه حالة التشغيل الحالية.
 
 ## المعمارية
 
@@ -196,23 +196,19 @@ cd "$HOME/.wine/drive_c/mt5bot"
 APP_MODE=DEMO WINEDEBUG=-all PYTHONUNBUFFERED=1 /opt/wine-staging/bin/wine "C:\users\ubuntu\AppData\Local\Programs\Python\Python311\python.exe" -u main.py
 ```
 
-لا تشغل نسخة يدوية من MT5 بالتزامن مع `mt5.service`؛ وجود أكثر من Terminal على نفس الـprefix تسبب سابقاً في تشخيصات IPC ملتبسة.
+لا تشغّل Terminal إضافياً يدوياً إذا كان MT5 يعمل بالفعل داخل Wine prefix نفسه. كذلك لا تشغّل البوت يدوياً بالتزامن مع `mtbot.service` حتى لا تتكرر جلسة Telegram polling.
 
-## systemd
+## تشغيل البوت عبر systemd
 
-الخادم يستخدم وحدتين:
+على هذا السيرفر توجد خدمة واحدة للبوت: `mtbot.service`. لا توجد خدمة باسم `mt5.service`. يمكن تشغيل البوت يدوياً بدلاً من الخدمة، لكن لا تشغّل الطريقتين معاً. يعمل MT5 داخل Wine على جلسة VNC/XFCE ذات `DISPLAY=:1`، ويمكن لـ `mt5.initialize()` تشغيل Terminal عند الحاجة؛ تأكد من عدم وجود نسختين من `terminal64.exe` على Wine prefix نفسه.
 
-- `mt5.service` لتشغيل MT5 عبر Wine.
-- `mtbot.service` لتشغيل البوت.
-
-افحصهما بـ:
+لفحص خدمة البوت دون عرض المتغيرات السرية:
 
 ```bash
-systemctl show mt5.service -p ActiveState -p SubState -p MainPID
-systemctl show mtbot.service -p ActiveState -p SubState -p MainPID
+systemctl show mtbot.service -p ActiveState -p SubState -p MainPID -p NRestarts
 ```
 
-**الحالة التشخيصية الأخيرة:** تم تعطيل/إيقاف MT5 والبوت بعد استمرار IPC timeout على build 6207. لا تعِد تشغيل التداول تلقائياً قبل نجاح اختبار API.
+قبل تشغيل المحرك من Telegram، تحقق أن الاتصال بـMT5 نجح وأن الحساب التجريبي متصل. حل صاحب السيرفر مشكلة IPC التي ظهرت بعد تحديث Terminal؛ هذا المستند لا يفترض أن العطل لا يزال قائماً.
 
 اختبار API مستقل:
 
@@ -258,9 +254,9 @@ Api=0
 - إعادة تشغيل Wine بالكامل لم تحل المشكلة.
 - `mt5.initialize(path=..., portable=True)` وبدون `path` أعادا `(-10005, 'IPC timeout')`.
 - حزمة Python كانت `MetaTrader5 5.0.6180` على Python 3.11.9.
-- المشكلة استمرت حتى عند ترك `mt5.service` متوقفاً ومحاولة جعل Python يبدأ Terminal.
+- استمرت المشكلة تاريخياً حتى عند تجربة بدء Terminal عبر Python نفسه.
 - تحذيرات `libEGL/DRI3` ظهرت في إحدى المحاولات؛ لا يوجد في النتائج الحالية ما يثبت أنها سبب IPC.
-- آخر حالة آمنة: MT5 والبوت متوقفان.
+- هذه نتائج تشخيص تاريخية؛ أبلغ صاحب السيرفر لاحقاً بحل مشكلة IPC.
 
 لذلك عند استكمال التشخيص يجب التركيز على طبقة **MT5 6207 ↔ Wine ↔ MetaTrader5 Python IPC**، وليس تغيير استراتيجية التداول أو Analyzer.
 
@@ -302,7 +298,7 @@ Telegram UI
 
 ## حدود معروفة / أعمال لاحقة
 
-- حل IPC مع MT5 build 6207 تحت Wine قبل إعادة تشغيل التداول.
+- توثيق سبب حل IPC الذي أجراه صاحب السيرفر، والتحقق من نجاح الاتصال بعد أي تحديث لاحق.
 - عدم اعتبار `daily_loss_limit_pct` حماية منفذة حتى يتم ربطها صراحة بمسار منع الدخول.
 - التحقق من filling mode المناسب للوسيط بدلاً من افتراض FOK لكل الرموز.
 - اختبار restart/reconciliation للمراكز المفتوحة بشكل أوسع.
