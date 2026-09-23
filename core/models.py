@@ -48,3 +48,4 @@ class TradeState:
     protection_45_active:bool=False
     best_favorable_price:float=0.0
     last_progress_at:float=0.0
+    signal_bar:int=0
