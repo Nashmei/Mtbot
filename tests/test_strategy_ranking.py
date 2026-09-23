@@ -8,14 +8,33 @@ import unittest
 
 from core.models import Signal, Side
 from core.strategy_ranker import (
+    adaptive_weights,
     choose_best,
     effective_performance_score,
     normalize_average_points,
+    score_signal,
 )
 from storage.db import DB
 
 
 class StrategyRankerTests(unittest.TestCase):
+    def test_adaptive_weight_tiers(self):
+        self.assertEqual(adaptive_weights(0),(0.80,0.20))
+        self.assertEqual(adaptive_weights(9),(0.80,0.20))
+        self.assertEqual(adaptive_weights(10),(0.60,0.40))
+        self.assertEqual(adaptive_weights(29),(0.60,0.40))
+        self.assertEqual(adaptive_weights(30),(0.40,0.60))
+        self.assertEqual(adaptive_weights(50),(0.40,0.60))
+
+    def test_score_exposes_active_weights(self):
+        sig=Signal(Side.BUY,'scalp_trend',.80,10,'')
+        under10=score_signal(sig,{'trades':7,'points':1,'avg_points':1/7})
+        mid=score_signal(sig,{'trades':15,'points':3,'avg_points':.2})
+        mature=score_signal(sig,{'trades':30,'points':6,'avg_points':.2})
+        self.assertEqual((under10['confidence_weight'],under10['performance_weight']),(0.80,0.20))
+        self.assertEqual((mid['confidence_weight'],mid['performance_weight']),(0.60,0.40))
+        self.assertEqual((mature['confidence_weight'],mature['performance_weight']),(0.40,0.60))
+
     def test_performance_scale_is_neutral_at_zero(self):
         self.assertEqual(normalize_average_points(-1), 0.0)
         self.assertEqual(normalize_average_points(0), 50.0)
