@@ -67,6 +67,22 @@ class MarketSafetyTests(unittest.TestCase):
         self.assertEqual(result["time"][0], now - 29)
         self.assertEqual(get.call_count, 1)
 
+    def test_live_quote_clock_offset_does_not_define_freshness(self):
+        """History ticks are UTC even when Wine/MT5 live quote time is terminal-local."""
+        now = time.time()
+        dtype = [("time", "i8"), ("time_msc", "i8"), ("bid", "f8"), ("ask", "f8")]
+        samples = np.array(
+            [(int(now), int((now - 1 + i / 100) * 1000), 1.0, 1.0001) for i in range(100)],
+            dtype=dtype,
+        )
+        latest = float(samples["time_msc"][-1]) / 1000.0
+        self.assertLess(abs(time.time() - latest), fake_config.settings.max_tick_age_seconds)
+        terminal_local_quote = now + 3 * 60 * 60
+        self.assertGreater(
+            abs(time.time() - terminal_local_quote),
+            fake_config.settings.max_tick_age_seconds,
+        )
+
     def test_fill_policy_rejects_unsupported_market_mode(self):
         gateway = MT5Gateway()
         info = types.SimpleNamespace(trade_exemode=2, filling_mode=0)
