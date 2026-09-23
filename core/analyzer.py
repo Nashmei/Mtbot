@@ -167,19 +167,35 @@ class Analyzer:
    if reversion_candidate is not None:
     sig=reversion_candidate; reg=Regime.RANGE; decision='scalp_reversion'
 
+  # Opportunity diagnostics are evaluated even when an existing strategy
+  # already won. This is observation-only unless sig is still None.
+  existing_winner=sig.strategy if sig is not None else None
+  sweep_candidate=scalp_sweep_reversal(ctx)
+  squeeze_candidate=scalp_squeeze_expansion(ctx)
+  opportunity_candidates=[]
+  for candidate in (sweep_candidate,squeeze_candidate):
+   if candidate is not None:
+    opportunity_candidates.append({
+     'strategy':candidate.strategy,
+     'side':candidate.side.value,
+     'confidence':round(float(candidate.confidence),4),
+     'selected':False,
+     'preempted_by':existing_winner,
+    })
+
   # Priority 6: failed-breakout / liquidity-sweep reversal.
-  # New opportunity strategies run only after all existing strategies so
-  # existing signal selection remains unchanged.
-  if sig is None:
-   sweep_candidate=scalp_sweep_reversal(ctx)
-   if sweep_candidate is not None:
-    sig=sweep_candidate; reg=Regime.BREAKOUT; decision='scalp_sweep_reversal'
+  if sig is None and sweep_candidate is not None:
+   sig=sweep_candidate; reg=Regime.BREAKOUT; decision='scalp_sweep_reversal'
+   opportunity_candidates[0]['selected']=True
+   opportunity_candidates[0]['preempted_by']=None
 
   # Priority 7: volatility compression -> expansion.
-  if sig is None:
-   squeeze_candidate=scalp_squeeze_expansion(ctx)
-   if squeeze_candidate is not None:
-    sig=squeeze_candidate; reg=Regime.VOLATILE; decision='scalp_squeeze_expansion'
+  if sig is None and squeeze_candidate is not None:
+   sig=squeeze_candidate; reg=Regime.VOLATILE; decision='scalp_squeeze_expansion'
+   for item in opportunity_candidates:
+    if item['strategy']=='scalp_squeeze_expansion':
+     item['selected']=True
+     item['preempted_by']=None
 
   if sig is None:
    if clear_trend:blockers.append('clear_trend')
@@ -208,5 +224,5 @@ class Analyzer:
    'tick_momentum':round(float(tick_momentum),2),'micro_trend':round(float(micro_trend),2),
    'atr_points':round(float(atrp),2),'adx':round(float(adx),1),
    'di_plus':round(float(dp),1),'di_minus':round(float(dm),1),
-   'context_trend':round(float(context_trend),2),'m15_bias':m15_bias,'h1_bias':h1_bias,'retest_level':retest_level,'ema_cross_tf':ema_cross_tf,'ema_cross_gap':round(float(ema_cross_gap),2),'micro_z':round(float(micro_z),2),'momentum_min':round(float(momentum_min),2),'acceleration_min':round(float(acceleration_min),2),'live':True
+   'context_trend':round(float(context_trend),2),'m15_bias':m15_bias,'h1_bias':h1_bias,'retest_level':retest_level,'ema_cross_tf':ema_cross_tf,'ema_cross_gap':round(float(ema_cross_gap),2),'micro_z':round(float(micro_z),2),'momentum_min':round(float(momentum_min),2),'acceleration_min':round(float(acceleration_min),2),'opportunity_candidates':opportunity_candidates,'live':True
   }
