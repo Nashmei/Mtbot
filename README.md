@@ -1,109 +1,314 @@
-# MT5 Telegram Scalper V1
+# MT5 Telegram Scalper
 
-Safety-first Python/MT5 scalping controller with Telegram UI. **DEMO-only execution in V1**: the Telegram Live button is deliberately locked. Validate on a broker demo account before implementing live unlock.
+بوت تداول آلي لـ MetaTrader 5 يتم التحكم به من Telegram، مكتوب بـ Python ومصمم حالياً للعمل في وضع **DEMO فقط**. المشروع يجمع تحليل السوق متعدد الاستراتيجيات، إدارة المخاطر، تنفيذ ومتابعة الصفقات، واجهة Telegram عربية، وسجل SQLite للتدقيق والإعدادات.
 
-## Features
-- One selected broker symbol at a time.
-- Tick-based market regime selector: breakout, momentum/trend, mean-reversion, or no-trade.
-- Target holding window up to 120 seconds (SL/TP can close earlier).
-- Risk-based lot sizing (default 0.25% equity), R:R configurable.
-- Spread guard: rolling spread average + relative threshold + optional absolute cap.
-- MT5 `deviation` slippage limit and post-fill slippage audit.
-- Profit protection: +1R break-even; +1.5R protect 25% of current favorable move; then dynamic trailing; 120s time exit.
-- Telegram event notifications only; trailing modifications do not spam Telegram.
-- SQLite audit trail.
-- Telegram User-ID allowlist.
+> **تنبيه:** التداول الحقيقي (Live) مقفل في النسخة الحالية. المشروع للاختبار على حساب تجريبي، ولا توجد ضمانات ربح.
 
-> Important: a market order can be filled before post-fill slippage is known. The bot passes an allowed `deviation` to MT5 and audits actual slippage; it cannot truthfully “undo” an already completed fill. Broker execution rules still apply.
+## الحالة الحالية
 
-## Telegram setup (phone)
-1. Open Telegram and chat with **@BotFather**.
-2. Send `/newbot`, choose a display name and a unique username ending in `bot`.
-3. BotFather gives you a token. Keep it secret; paste it only into `.env` as `TELEGRAM_BOT_TOKEN`.
-4. Find your numeric Telegram user ID using a trusted ID-info bot or Telegram API method, and put it in `TELEGRAM_ALLOWED_USER_ID`. Do not use your username here.
-5. Open your new bot and tap **Start**.
+- التطبيق: **DEMO-only**؛ زر Live مقفل.
+- البنية الحالية: **مستخدم Telegram واحد + Terminal MT5 واحد مشترك**.
+- Telegram محمي بـ `TELEGRAM_ALLOWED_USER_ID`.
+- بيانات دخول MT5 التي يدخلها المستخدم من Telegram تحفظ محلياً في `~/.mt5bot_credentials.json` بصلاحية `0600`.
+- الإعدادات التشغيلية تحفظ في SQLite وتستعاد عند إعادة تشغيل البوت.
+- البيئة المستخدمة فعلياً على الخادم: Ubuntu + Wine + Windows Python + MT5.
+- آخر بيئة تم اختبارها: Wine Staging 11.18، Windows Python 3.11.9، حزمة MetaTrader5 5.0.6180.
+- **ملاحظة تشغيلية مهمة (2026-09-23):** بعد تحديث Terminal تلقائياً من build 6204 إلى build 6207 ظهر `(-10005, 'IPC timeout')` بين حزمة Python وMT5 تحت Wine. لذلك يجب عدم اعتبار MT5 جاهزاً لمجرد أن عملية `terminal64.exe` تعمل؛ يلزم نجاح `mt5.initialize()` فعلياً قبل تشغيل التداول. أثناء آخر تشخيص كان `mt5.service` و`mtbot.service` متوقفين.
 
-## AWS Ubuntu reality: MT5 + Python
-MetaTrader 5 is a Windows desktop terminal. MetaQuotes supports running MT5 on Linux through Wine. The official Python integration communicates directly with the running terminal. In practice, on Ubuntu the most compatible arrangement is to run **MT5 and Windows Python inside the same Wine prefix**. Native Linux Python should not be assumed to work with the `MetaTrader5` package.
+## المعمارية
 
-### Recommended AWS instance
-Use Ubuntu 22.04/24.04 x86_64, at least 2 vCPU / 4 GB RAM. Keep the instance close to the broker's trade server when possible. Do **not** expose Telegram or MT5 ports in the Security Group; the Telegram bot uses outbound polling. SSH (22) should be restricted to your IP.
+مسار التشغيل الرئيسي:
 
-### 1. Base packages
-```bash
-sudo apt update && sudo apt upgrade -y
-sudo apt install -y wine64 winbind xvfb unzip wget cabextract
+```text
+main.py
+ ├─ core/config.py          إعدادات .env
+ ├─ storage/db.py           SQLite: settings + audit
+ ├─ core/mt5_gateway.py     طبقة MetaTrader5 API
+ ├─ core/engine.py          دورة التداول وإدارة المراكز
+ │   ├─ core/analyzer.py    تحليل السوق وتوليد الإشارات
+ │   ├─ core/risk.py        السبريد وحساب الحجم
+ │   └─ core/models.py      Signal / TradeState / Regime
+ └─ bot/telegram_app.py     واجهة Telegram
 ```
 
-### 2. Install MT5 under Wine
-Follow MetaQuotes' current Linux/Wine installer instructions. Log into your **DEMO** account in the MT5 terminal first and enable algorithmic trading. In MT5 settings, ensure external Python trading is not disabled.
+`main.py` ينشئ قاعدة البيانات والـGateway والـEngine والواجهة، يستعيد إعدادات المستخدم، ثم يبدأ Telegram polling.
 
-For a headless EC2 host, keep an X virtual framebuffer running:
-```bash
-Xvfb :99 -screen 0 1280x800x24 &
-export DISPLAY=:99
-wine "C:\\Program Files\\MetaTrader 5\\terminal64.exe" &
+## التحليل والاستراتيجيات
+
+`Analyzer` يستخدم أسعار ticks مع شموع MT5 المغلقة والسياق متعدد الأطر الزمنية. تصنيف السوق يتضمن `TREND` و`RANGE` و`BREAKOUT` و`VOLATILE` و`NO_TRADE`.
+
+الاستراتيجيات الموجودة حالياً:
+
+1. `scalp_breakout` — كسر M5 مع retest مباشر وتأكيد M15/H1.
+2. `ema_cross_scalp` — تقاطع EMA 9/21 على شموع مغلقة (M1 أساساً وM5 fallback)، ولا يستخدم لـ XAUUSD.
+3. `scalp_trend` — استمرار اتجاه مع M15 وpullback على EMA20 في M5 وتسارع لحظي.
+4. `gold_scalp` — منطق مخصص لـ XAUUSD للحركة/التوسع اللحظي.
+5. `scalp_m5_reversal` — انعكاس M5 عند دعم/مقاومة في بيئة غير اتجاهية.
+6. `scalp_reversion` — mean reversion عند تطرف قصير المدى مع تأكيد انعكاس لحظي.
+
+التحليل يطبق أيضاً فلاتر مثل spike في السبريد، doji/sideways، زخم ticks، ATR، ADX/DI، EMA، بنية السعر، وانحياز M15/H1 حسب الاستراتيجية. الحد الأدنى الافتراضي للثقة في الـEngine هو 75% ويمكن تغييره من Telegram بين 50% و95%.
+
+## التنفيذ وإدارة المخاطر
+
+قبل إرسال الصفقة يتحقق المحرك من شروطه التشغيلية ومن المخاطر، يحسب حجم الصفقة اعتماداً على Equity والمسافة إلى SL، ثم يستخدم `order_check` قبل `order_send`. أوامر البوت تحمل magic number `4009`.
+
+الإعدادات المهمة:
+
+| الإعداد | الافتراضي / النطاق |
+|---|---|
+| Risk per trade | 0.25% افتراضياً؛ Telegram يسمح 0.25–50% |
+| R:R | 1:3 افتراضياً؛ Telegram يسمح 0.5–10 |
+| Minimum confidence | 75% افتراضياً؛ 50–95% |
+| Protection trigger | 45% افتراضياً؛ 5–90% |
+| Max positions | 1 افتراضياً؛ 1–10 |
+| Consecutive-loss limit | 3 افتراضياً؛ 0–20، و0 يعطل الحد |
+| Max trade duration | 10 دقائق داخل Engine؛ 3–240 من Telegram |
+| Re-entry cooldown | 120 ثانية |
+| Spread multiplier | 1.8 × المتوسط المتحرك |
+| Slippage/deviation | 10 points |
+| Magic number | 4009 |
+
+`Risk` يحتفظ بتاريخ spread مستقل لكل رمز، ويستخدم متوسطاً حديثاً وحداً نسبياً. بعد كل 3 رفضات متتالية بسبب السبريد يوسع الحد تدريجياً 10% لذلك الرمز، ويعيده للوضع الطبيعي بعد فتح صفقة ناجحة.
+
+> `daily_loss_limit_pct` و`cooldown_after_losses_min` موجودان في الإعدادات، لكن لا ينبغي اعتبارهما حماية مكتملة ما لم يوجد تطبيق صريح لهما في مسار التنفيذ.
+
+## متابعة الصفقات
+
+كل مركز يتتبعه `TradeState` مستقل. المحرك يعتمد القيم الفعلية للمركز بعد التنفيذ، ويسجل بيانات الدخول وSL/TP والحجم والاستراتيجية والثقة. توجد آليات حماية/Trailing وإغلاق زمني ضمن الـEngine، مع منع فتح صفقة قديمة غير متتبعة عند بدء المحرك.
+
+زر Stop في Telegram يوقف الدخول الجديد ويحاول إغلاق المراكز التي يديرها البوت، مع تسجيل النتيجة.
+
+## Telegram UI
+
+الواجهة عربية ومبنية على `python-telegram-bot`. تشمل القوائم الرئيسية: Dashboard/الحالة، التداول، التحليل، الإعدادات، والحساب.
+
+الوظائف الحالية تشمل:
+
+- تسجيل دخول MT5 من رسالة واحدة تحتوي `Server` و`Login` و`Password`، ثم محاولة حذف رسالة بيانات الدخول.
+- عرض حالة الحساب وMT5/Algo readiness.
+- اختيار رمز واحد أو عدة رموز، مع قائمة رموز شائعة ومسح سريع للرموز ذات ticks الحديثة.
+- تحليل الأزواج المختارة.
+- Start / Stop.
+- تعديل Risk وConfidence وProtection وR:R وMax Positions وMax Losses ومدة الصفقة.
+- `/clean` لتنظيف الرسائل التي تتبعها الواجهة.
+- معالجة `RetryAfter` و`BadRequest` لتقليل مشاكل Telegram flood.
+- رسائل التداول المصورة يمكن تحديث caption الخاص بها بدلاً من إرسال رسالة جديدة لكل تغير.
+
+الأوامر المسجلة حالياً تشمل `/start`, `/cancel`, `/clean`, `/symbol`, `/symbols`, `/rr`, `/risk`, `/confidence`, `/protection`, `/maxpos`, `/maxloss`.
+
+## قاعدة البيانات
+
+الملف الافتراضي:
+
+```text
+storage/bot.db
 ```
-Exact Wine paths can vary. Verify the terminal opens and logs into the demo account before continuing.
 
-### 3. Install Windows Python in Wine
-Download a supported 64-bit Windows Python installer from python.org, then:
-```bash
-export DISPLAY=:99
-wine python-installer.exe
+الجداول:
+
+- `settings(key, value)` — إعدادات Telegram/Engine المحفوظة.
+- `audit(id, ts, event, symbol, details)` — سجل الأحداث والتنفيذ والأخطاء المهمة.
+
+لا تحذف قاعدة البيانات أثناء deployment إذا كنت تريد الاحتفاظ بالإعدادات والسجل.
+
+## الإعداد عبر .env
+
+`core/config.py` يقرأ `.env` من جذر المشروع. أهم المتغيرات:
+
+```dotenv
+TELEGRAM_BOT_TOKEN=...
+TELEGRAM_ALLOWED_USER_ID=...
+APP_MODE=DEMO
+
+MT5_LOGIN=
+MT5_PASSWORD=
+MT5_SERVER=
+MT5_TERMINAL_PATH=C:\Program Files\MetaTrader 5\terminal64.exe
+
+DEFAULT_SYMBOL=EURUSD
+RISK_PER_TRADE_PCT=0.25
+DAILY_LOSS_LIMIT_PCT=2
+MAX_CONSECUTIVE_LOSSES=3
+COOLDOWN_AFTER_LOSSES_MIN=30
+RR=3
+MIN_HOLD_SECONDS=5
+MAX_HOLD_SECONDS=120
+MIN_SL_POINTS=10
+MAX_TEST_LOT=0.10
+SPREAD_SAMPLE_SIZE=60
+MAX_SPREAD_MULTIPLIER=1.8
+MAX_SPREAD_POINTS=0
+MAX_SLIPPAGE_POINTS=10
+POLL_INTERVAL_MS=150
 ```
-During setup select **Add Python to PATH**. Open Wine cmd and verify:
-```bash
-wine cmd
-python --version
-pip --version
+
+لا ترفع `.env` أو credentials إلى GitHub.
+
+## المتطلبات
+
+```text
+python-telegram-bot==22.5
+MetaTrader5>=5.0.45
+pydantic-settings>=2.6
+python-dotenv>=1.0
+aiosqlite>=0.20
+numpy>=1.26
+pandas>=2.2
 ```
 
-### 4. Upload this project
-Copy the project to the server, then make it visible to Wine. An easy location is:
-```bash
-mkdir -p ~/.wine/drive_c/mt5bot
-cp -r mt5_telegram_scalper/* ~/.wine/drive_c/mt5bot/
-cp mt5_telegram_scalper/.env.example ~/.wine/drive_c/mt5bot/.env
-```
-Edit the secret configuration:
-```bash
-nano ~/.wine/drive_c/mt5bot/.env
-```
-Use the exact broker server name shown by MT5 and a **demo** login/password.
+في Linux/Wine يجب تشغيل **Windows Python داخل نفس Wine prefix الذي يعمل فيه MT5**. لا تعتمد على Python Linux الأصلي لحزمة `MetaTrader5`.
 
-### 5. Install Python dependencies inside Wine
-```bash
-export DISPLAY=:99
-wine cmd /c "cd C:\\mt5bot && python -m pip install --upgrade pip && pip install -r requirements.txt"
+## بيئة الخادم المستخدمة
+
+المسار الحالي للمشروع:
+
+```text
+/home/ubuntu/.wine/drive_c/mt5bot
 ```
 
-### 6. First test
-```bash
-export DISPLAY=:99
-wine cmd /c "cd C:\\mt5bot && python main.py"
+MT5:
+
+```text
+/home/ubuntu/.wine/drive_c/Program Files/MetaTrader 5/terminal64.exe
 ```
-You should see `MT5 connected`. Open Telegram, `/start`, choose `/symbol EURUSD` using the exact symbol name from your broker, then **Analyze**. Only after checking the values should you press Start.
 
-## Configuration defaults
-- `RISK_PER_TRADE_PCT=0.25`
-- `RR=3`
-- `MAX_HOLD_SECONDS=120`
-- `MAX_SPREAD_MULTIPLIER=1.8` relative to rolling average
-- `MAX_SPREAD_POINTS=0` means no absolute cap; set a broker/symbol-specific cap after observing demo data.
-- `MAX_SLIPPAGE_POINTS=10`
+Windows Python:
 
-## Risk controls still recommended before Live
-V1 deliberately leaves Live locked. Before implementing Live, add/validate: daily-loss lockout, consecutive-loss cooldown, persisted trade reconciliation after restart, broker-specific filling-mode negotiation, economic-news policy, minimum stop/freeze levels, and a demo soak test. The configuration already reserves daily-loss/consecutive-loss defaults, but **they are not represented as completed enforcement in this V1**.
+```text
+C:\users\ubuntu\AppData\Local\Programs\Python\Python311\python.exe
+```
 
-## Telegram commands
-- `/start` dashboard
-- `/symbol EURUSD`
-- `/rr 3`
-Buttons: Status, Analyze, Start, Stop, Symbol, R:R, Live (locked).
+Wine prefix:
 
-## Audit
-`storage/bot.db` contains the `audit` table. Spread rejects, order-check rejects, execution rejects, lifecycle events and engine errors are recorded there.
+```text
+/home/ubuntu/.wine
+```
 
-## Security
-Never paste `.env`, Telegram token, MT5 password, or AWS private key into Telegram. Rotate a Telegram token immediately in BotFather if exposed. Restrict SSH by source IP. Demo is the only enabled trading environment in this build.
+واجهة X الحالية تستخدم `DISPLAY=:1` و`XAUTHORITY=/home/ubuntu/.Xauthority`.
+
+## تشغيل يدوي للتطوير
+
+بعد التأكد من أن MT5 وPython IPC يعملان:
+
+```bash
+cd "$HOME/.wine/drive_c/mt5bot"
+
+APP_MODE=DEMO WINEDEBUG=-all PYTHONUNBUFFERED=1 /opt/wine-staging/bin/wine "C:\users\ubuntu\AppData\Local\Programs\Python\Python311\python.exe" -u main.py
+```
+
+لا تشغل نسخة يدوية من MT5 بالتزامن مع `mt5.service`؛ وجود أكثر من Terminal على نفس الـprefix تسبب سابقاً في تشخيصات IPC ملتبسة.
+
+## systemd
+
+الخادم يستخدم وحدتين:
+
+- `mt5.service` لتشغيل MT5 عبر Wine.
+- `mtbot.service` لتشغيل البوت.
+
+افحصهما بـ:
+
+```bash
+systemctl show mt5.service -p ActiveState -p SubState -p MainPID
+systemctl show mtbot.service -p ActiveState -p SubState -p MainPID
+```
+
+**الحالة التشخيصية الأخيرة:** تم تعطيل/إيقاف MT5 والبوت بعد استمرار IPC timeout على build 6207. لا تعِد تشغيل التداول تلقائياً قبل نجاح اختبار API.
+
+اختبار API مستقل:
+
+```bash
+env HOME=/home/ubuntu DISPLAY=:1 XAUTHORITY=/home/ubuntu/.Xauthority WINEPREFIX=/home/ubuntu/.wine WINEDEBUG=-all /opt/wine-staging/bin/wine 'C:\users\ubuntu\AppData\Local\Programs\Python\Python311\python.exe' -c "
+import MetaTrader5 as mt5
+ok = mt5.initialize(
+    r'C:\Program Files\MetaTrader 5\terminal64.exe',
+    timeout=30000,
+    portable=True,
+)
+print('initialize =', ok)
+print('last_error =', mt5.last_error())
+if ok:
+    print(mt5.terminal_info())
+    print(mt5.account_info())
+    mt5.shutdown()
+"
+```
+
+لا تعتبر النظام جاهزاً إلا إذا كانت `initialize=True`، ثم تحقق من `terminal_info().connected` و`trade_allowed` و`tradeapi_disabled` وحالة الحساب.
+
+## Algo Trading
+
+`core/mt5_gateway.py` يحتوي حالياً على `_enable_algo_trading()` التي تعدل `Config/common.ini` مع الحفاظ على encoding، وتضع تحت `[Experts]`:
+
+```ini
+AllowLiveTrading=1
+Enabled=1
+Account=0
+Profile=0
+Api=0
+```
+
+هذه الإعدادات **لا تعالج IPC timeout**. في آخر فحص قبل مشكلة IPC كان الحساب نفسه يسمح بالتداول، لكن حالة Terminal Algo تحتاج دائماً للتحقق من `terminal_info()` بعد نجاح الاتصال.
+
+## مشكلة MT5 build 6207 / IPC
+
+في 2026-09-23 قام MT5 LiveUpdate بتحديث Terminal من build 6204 إلى 6207. بعد التحديث:
+
+- Terminal يبدأ ويظهر في process list.
+- تم التأكد من وجود Terminal واحد فقط أثناء الاختبار.
+- إعادة تشغيل Wine بالكامل لم تحل المشكلة.
+- `mt5.initialize(path=..., portable=True)` وبدون `path` أعادا `(-10005, 'IPC timeout')`.
+- حزمة Python كانت `MetaTrader5 5.0.6180` على Python 3.11.9.
+- المشكلة استمرت حتى عند ترك `mt5.service` متوقفاً ومحاولة جعل Python يبدأ Terminal.
+- تحذيرات `libEGL/DRI3` ظهرت في إحدى المحاولات؛ لا يوجد في النتائج الحالية ما يثبت أنها سبب IPC.
+- آخر حالة آمنة: MT5 والبوت متوقفان.
+
+لذلك عند استكمال التشخيص يجب التركيز على طبقة **MT5 6207 ↔ Wine ↔ MetaTrader5 Python IPC**، وليس تغيير استراتيجية التداول أو Analyzer.
+
+## Deployment من GitHub
+
+الفرع المستخدم هو `main`. على الخادم:
+
+```bash
+cd "$HOME/.wine/drive_c/mt5bot" && git fetch origin main && git reset --hard origin/main
+```
+
+هذا لا ينبغي أن يحذف `.env` غير المتتبع، لكن تحقق دائماً من الأسرار وقاعدة البيانات قبل أي تنظيف يدوي. لا تستخدم أوامر حذف واسعة داخل مجلد المشروع.
+
+## الأمان
+
+- DEMO فقط في النسخة الحالية.
+- لا تضع Telegram token أو كلمة مرور MT5 أو مفاتيح AWS داخل Git.
+- اسمح فقط لـ Telegram user ID الموثوق.
+- ملف credentials المحلي يجب أن يبقى بصلاحيات ضيقة.
+- لا تعرض VNC أو SSH للعالم بشكل دائم؛ قيد Security Group إلى عناوين موثوقة.
+- لا تشغل أكثر من MT5 على نفس Wine prefix دون سبب واضح.
+- لا تشغل المحرك إذا فشل MT5 IPC أو كانت حالة التداول غير جاهزة.
+- راقب `storage/bot.db` وsystemd logs بعد أي deployment.
+
+## ملاحظات للمطور
+
+عند تعديل أي وظيفة، تتبع المسار كاملاً بدلاً من تعديل ملف منفرد فقط:
+
+```text
+Telegram UI
+  → Engine
+    → Analyzer / Risk
+      → MT5Gateway
+        → MetaTrader5 terminal
+  → SQLite settings/audit
+```
+
+أي تغيير في تسجيل الدخول أو التشغيل يجب اختباره مع lifecycle الخاص بـWine/MT5. وأي تغيير في استراتيجية أو إدارة صفقة يجب مراجعته مع إدارة المخاطر، تعدد الرموز، المراكز الحالية، الإشعارات، واستعادة الإعدادات بعد restart.
+
+## حدود معروفة / أعمال لاحقة
+
+- حل IPC مع MT5 build 6207 تحت Wine قبل إعادة تشغيل التداول.
+- عدم اعتبار `daily_loss_limit_pct` حماية منفذة حتى يتم ربطها صراحة بمسار منع الدخول.
+- التحقق من filling mode المناسب للوسيط بدلاً من افتراض FOK لكل الرموز.
+- اختبار restart/reconciliation للمراكز المفتوحة بشكل أوسع.
+- إضافة سياسة أخبار اقتصادية إذا كانت مطلوبة.
+- اختبار Demo soak طويل قبل التفكير في Live.
+
+---
+
+**الوضع الحالي للمشروع: DEMO / safety-first. اختبر كل تغيير على حساب تجريبي أولاً.**
