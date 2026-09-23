@@ -141,6 +141,8 @@ class Analyzer:
        Regime.VOLATILE if market_mode=='expansion' else Regime.RANGE)
   sig=None; decision='waiting_live_momentum'
   blockers=[]
+  trend_checks=None
+  gold_checks=None
 
   # Frequent EMA crossover scalp. Use CLOSED candles only so a forming candle
   # cannot create/disappear a crossover. M1 is primary; M5 is fallback.
@@ -256,6 +258,7 @@ class Analyzer:
    pullback=((side==Side.BUY and l5[-1]<=ema20_5+pull_tol and live>ema20_5) or
              (side==Side.SELL and h5[-1]>=ema20_5-pull_tol and live<ema20_5))
    htf_ok=htf_allows(side)
+   trend_checks={'strong':bool(strong),'acceleration':bool(acceleration),'pullback':bool(pullback),'htf':bool(htf_ok)}
    if strong and acceleration and pullback and htf_ok:
     reg=Regime.TREND
     score=70+min(12,abs(micro_trend)/max(atrp,1)*20)+min(10,abs(tick_momentum)/max(atrp,1)*15)
@@ -273,7 +276,10 @@ class Analyzer:
    gold_momentum=abs(tick_momentum)>=momentum_min
    gold_fast=abs(tick_momentum_fast)>=acceleration_min
    gold_side=Side.BUY if gold_up else (Side.SELL if gold_dn else None)
-   gold_expand=(gold_up or gold_dn) and gold_gap and gold_momentum and gold_fast and tick_range>=max(5.0,atrp*.35) and gold_side is not None and htf_allows(gold_side)
+   gold_range=tick_range>=max(5.0,atrp*.35)
+   gold_htf=gold_side is not None and htf_allows(gold_side)
+   gold_checks={'direction':bool(gold_up or gold_dn),'gap':bool(gold_gap),'momentum':bool(gold_momentum),'acceleration':bool(gold_fast),'expansion_range':bool(gold_range),'htf':bool(gold_htf)}
+   gold_expand=(gold_up or gold_dn) and gold_gap and gold_momentum and gold_fast and gold_range and gold_side is not None and gold_htf
    if gold_expand:
     side=Side.BUY if gold_up else Side.SELL
     reg=Regime.TREND
@@ -336,7 +342,7 @@ class Analyzer:
    elif tick_range>max(8.,atrp*.8):
     reg=Regime.VOLATILE; decision='volatile_no_direction'
   return reg,sig,{
-   'decision':decision,'blockers':blockers,'market_mode':market_mode,'price':round(live,8),'spread_points':round(spread,1),
+   'decision':decision,'blockers':blockers,'trend_checks':trend_checks,'gold_checks':gold_checks,'market_mode':market_mode,'price':round(live,8),'spread_points':round(spread,1),
    'spread_ratio':round(spread_ratio,2),'tick_momentum_fast':round(float(tick_momentum_fast),2),
    'tick_momentum':round(float(tick_momentum),2),'micro_trend':round(float(micro_trend),2),
    'atr_points':round(float(atrp),2),'adx':round(float(adx),1),
