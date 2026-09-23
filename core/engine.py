@@ -391,6 +391,12 @@ class Engine:
    m5=self.gw.rates_m5(symbol,200)
    m1=self.gw.rates_m1(symbol,200)
    reg,sig,meta=self.an.analyze(ticks,info.point,m5,symbol=symbol,rates_m15=self.gw.rates_m15(symbol,200),rates_h1=self.gw.rates_h1(symbol,200),rates_m1=m1)
+   for diagnostic in meta.get('opportunity_diagnostics',[]) or []:
+    await self._log_reject(
+     'OPPORTUNITY_DIAGNOSTIC',symbol,
+     reason=diagnostic.get('strategy',''),
+     **diagnostic,
+    )
    for candidate in meta.get('opportunity_candidates',[]) or []:
     await self._log_reject(
      'OPPORTUNITY_CANDIDATE',symbol,
