@@ -43,6 +43,21 @@ class StrategyRankerTests(unittest.TestCase):
         self.assertEqual(winner['strategy'],'stronger_recent')
         self.assertGreater(ranked[0]['final_score'],ranked[1]['final_score'])
 
+    def test_below_confidence_candidate_cannot_block_eligible_signal(self):
+        below=Signal(Side.BUY,'below',.74,10,'')
+        eligible=Signal(Side.BUY,'eligible',.76,10,'')
+        candidates=[
+            {'signal':below,'regime':None,'decision':'a','legacy_priority':1},
+            {'signal':eligible,'regime':None,'decision':'b','legacy_priority':2},
+        ]
+        perf={
+            'below':{'trades':30,'points':90,'avg_points':3},
+            'eligible':{'trades':30,'points':0,'avg_points':0},
+        }
+        winner,ranked=choose_best(candidates,perf,min_confidence=75)
+        self.assertEqual(winner['strategy'],'eligible')
+        self.assertFalse(next(r for r in ranked if r['strategy']=='below')['eligible'])
+
     def test_new_strategy_is_neutral_not_penalized(self):
         sig=Signal(Side.SELL,'new_strategy',.76,10,'')
         winner,ranked=choose_best(
