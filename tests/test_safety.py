@@ -427,7 +427,7 @@ class MarketSafetyTests(unittest.TestCase):
 
     def test_daily_equity_limit_zero_from_db_disables_limit(self):
         db = FakeDB()
-        db.values["daily_loss_limit_pct"] = "0"
+        db.settings["daily_loss_limit_pct"] = "0"
         async def notify(message, **kwargs):
             pass
         async def check():
@@ -440,7 +440,7 @@ class MarketSafetyTests(unittest.TestCase):
 
     def test_daily_equity_limit_db_value_survives_engine_restart(self):
         db = FakeDB()
-        db.values["daily_loss_limit_pct"] = "4.5"
+        db.settings["daily_loss_limit_pct"] = "4.5"
         async def notify(message, **kwargs):
             pass
         async def check():
@@ -450,6 +450,42 @@ class MarketSafetyTests(unittest.TestCase):
             await second.load_settings()
             self.assertEqual(first.daily_loss_limit_pct, 4.5)
             self.assertEqual(second.daily_loss_limit_pct, 4.5)
+        asyncio.run(check())
+
+
+    def test_telegram_setting_writer_updates_engine_and_db(self):
+        from bot.telegram_app import TelegramUI
+        db = FakeDB()
+        engine = types.SimpleNamespace(
+            risk_pct=2.0, rr=1.5, min_confidence=75.0, protection_pct=40.0,
+            max_trade_minutes=45.0, max_positions=5, max_consecutive_losses=3,
+            daily_loss_limit_pct=2.0, loss_limit_notified=True, daily_loss_notified=True,
+        )
+        async def check():
+            ui = TelegramUI(engine, db)
+            cases = (
+                ("risk", "3.5", "risk_pct", 3.5),
+                ("rr", "2.5", "rr", 2.5),
+                ("confidence", "80", "min_confidence", 80.0),
+                ("protection", "50", "protection_pct", 50.0),
+                ("maxduration", "60", "max_trade_minutes", 60.0),
+                ("maxpos", "4", "max_positions", 4),
+                ("maxloss", "0", "max_consecutive_losses", 0),
+                ("dailyloss", "0", "daily_loss_limit_pct", 0.0),
+            )
+            for key, raw, db_key, expected in cases:
+                await ui._apply_setting(key, raw)
+                self.assertEqual(db.settings[db_key], expected)
+            self.assertEqual(engine.risk_pct, 3.5)
+            self.assertEqual(engine.rr, 2.5)
+            self.assertEqual(engine.min_confidence, 80.0)
+            self.assertEqual(engine.protection_pct, 50.0)
+            self.assertEqual(engine.max_trade_minutes, 60.0)
+            self.assertEqual(engine.max_positions, 4)
+            self.assertEqual(engine.max_consecutive_losses, 0)
+            self.assertEqual(engine.daily_loss_limit_pct, 0.0)
+            self.assertFalse(engine.loss_limit_notified)
+            self.assertFalse(engine.daily_loss_notified)
         asyncio.run(check())
 
 

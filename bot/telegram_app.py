@@ -5,6 +5,46 @@ from core.config import settings
 class TelegramUI:
  def __init__(self,engine,db): self.e=engine;self.db=db;self.login_state={};self.input_state={};self.message_ids=set();self.menu_message_id=None;self.menu_chat_id=None;self.menu_expiry_task=None
  def allowed(self,u): return bool(u and u.id==settings.telegram_allowed_user_id)
+ async def _apply_setting(self,key,value):
+  import math
+  if key=='risk':
+   v=float(value)
+   if not math.isfinite(v) or not 0.25<=v<=50: raise ValueError()
+   self.e.risk_pct=v; db_key='risk_pct'; msg=f'✅ المخاطرة: {v:g}%'
+  elif key=='confidence':
+   v=float(value)
+   if not math.isfinite(v) or not 50<=v<=95: raise ValueError()
+   self.e.min_confidence=v; db_key='min_confidence'; msg=f'✅ الثقة: {v:g}%'
+  elif key=='protection':
+   v=float(value)
+   if not math.isfinite(v) or not 5<=v<=90: raise ValueError()
+   self.e.protection_pct=v; db_key='protection_pct'; msg=f'✅ الحماية: {v:g}%'
+  elif key=='maxduration':
+   v=float(value)
+   if not math.isfinite(v) or not 3<=v<=240: raise ValueError()
+   self.e.max_trade_minutes=v; db_key='max_trade_minutes'; msg=f'✅ حد مدة الصفقة: {v:g} دقيقة'
+  elif key=='rr':
+   v=float(value)
+   if not math.isfinite(v) or not .5<=v<=10: raise ValueError()
+   self.e.rr=v; db_key='rr'; msg=f'✅ R:R = 1:{v:g}'
+  elif key=='maxpos':
+   v=int(value)
+   if str(v)!=str(value).strip() or not 1<=v<=10: raise ValueError()
+   self.e.max_positions=v; db_key='max_positions'; msg=f'✅ حد المراكز: {v}'
+  elif key=='maxloss':
+   v=int(value)
+   if str(v)!=str(value).strip() or not 0<=v<=20: raise ValueError()
+   self.e.max_consecutive_losses=v; self.e.loss_limit_notified=False
+   db_key='max_consecutive_losses'; msg=f'✅ حد الخسائر: {v}'+(' (معطل)' if v==0 else '')
+  elif key=='dailyloss':
+   v=float(value)
+   if not math.isfinite(v) or not 0<=v<=100: raise ValueError()
+   self.e.daily_loss_limit_pct=v; self.e.daily_loss_notified=False
+   db_key='daily_loss_limit_pct'; msg=f'✅ حد Equity اليومي: {v:g}%'+(' (معطل)' if v==0 else '')
+  else:
+   raise ValueError()
+  await self.db.set(db_key,v)
+  return msg
  def _cancel_menu_expiry(self):
   if self.menu_expiry_task and not self.menu_expiry_task.done(): self.menu_expiry_task.cancel()
   self.menu_expiry_task=None
@@ -73,7 +113,19 @@ class TelegramUI:
   if x=='dashboard': return await self._edit(q,'🤖 MT5 BOT • لوحة التحكم\n━━━━━━━━━━━━━━\nاختر القسم:',self.kb())
   if x=='trade_menu': return await self._edit(q,'🤖 التداول وإدارة المحرك',self.trade_kb())
   if x=='analysis_menu': return await self._edit(q,'🔎 التحليل والأسواق',self.analysis_kb())
-  if x=='settings_menu': return await self._edit(q,'⚙️ إعدادات الاستراتيجية والمخاطر',self.settings_kb())
+  if x=='settings_menu':
+   daily=f'{self.e.daily_loss_limit_pct:g}%'+(' (معطل)' if self.e.daily_loss_limit_pct<=0 else '')
+   losses=str(self.e.max_consecutive_losses)+(' (معطل)' if self.e.max_consecutive_losses==0 else '')
+   msg=(f'⚙️ إعدادات الاستراتيجية والمخاطر\n━━━━━━━━━━━━━━\n'
+        f'⚠️ المخاطرة: {self.e.risk_pct:g}%\n'
+        f'⚖️ R:R: 1:{self.e.rr:g}\n'
+        f'🎯 الثقة: {self.e.min_confidence:g}%\n'
+        f'🛡 الحماية: {self.e.protection_pct:g}%\n'
+        f'⏱ مدة الصفقة: {self.e.max_trade_minutes:g} دقيقة\n'
+        f'📂 حد المراكز: {self.e.max_positions}\n'
+        f'❌ حد الخسائر: {losses}\n'
+        f'📉 حد Equity اليومي: {daily}')
+   return await self._edit(q,msg,self.settings_kb())
   if x=='account_menu': return await self._edit(q,'👤 حساب MT5 والإحصائيات',self.account_kb())
   if x=='mt5login':
    if self.e.running:
@@ -257,41 +309,8 @@ class TelegramUI:
   if key:
    try:
     import math
-    if key=='risk':
-     v=float(value)
-     if not math.isfinite(v) or not 0.25<=v<=50: raise ValueError()
-     self.e.risk_pct=v; await self.db.set('risk_pct',v); msg=f'✅ المخاطرة: {v:g}%'
-    elif key=='confidence':
-     v=float(value)
-     if not math.isfinite(v) or not 50<=v<=95: raise ValueError()
-     self.e.min_confidence=v; await self.db.set('min_confidence',v); msg=f'✅ الثقة: {v:g}%'
-    elif key=='protection':
-     v=float(value)
-     if not math.isfinite(v) or not 5<=v<=90: raise ValueError()
-     self.e.protection_pct=v; await self.db.set('protection_pct',v); msg=f'✅ الحماية: {v:g}%'
-    elif key=='maxduration':
-     v=float(value)
-     if not math.isfinite(v) or not 3<=v<=240: raise ValueError()
-     self.e.max_trade_minutes=v; await self.db.set('max_trade_minutes',v); msg=f'✅ حد مدة الصفقة: {v:g} دقيقة'
-    elif key=='rr':
-     v=float(value)
-     if not math.isfinite(v) or not .5<=v<=10: raise ValueError()
-     self.e.rr=v; await self.db.set('rr',v); msg=f'✅ R:R = 1:{v:g}'
-    elif key=='maxpos':
-     v=int(value)
-     if not 1<=v<=10: raise ValueError()
-     self.e.max_positions=v; await self.db.set('max_positions',v); msg=f'✅ حد المراكز: {v}'
-    elif key=='maxloss':
-     v=int(value)
-     if not 0<=v<=20: raise ValueError()
-     self.e.max_consecutive_losses=v; self.e.loss_limit_notified=False
-     await self.db.set('max_consecutive_losses',v); msg=f'✅ حد الخسائر: {v}'+(' (معطل)' if v==0 else '')
-    elif key=='dailyloss':
-     v=float(value)
-     if not math.isfinite(v) or not 0<=v<=100: raise ValueError()
-     self.e.daily_loss_limit_pct=v; self.e.daily_loss_notified=False
-     await self.db.set('daily_loss_limit_pct',v)
-     msg=f'✅ حد Equity اليومي: {v:g}%'+(' (معطل)' if v==0 else '')
+    if key in ('risk','confidence','protection','maxduration','rr','maxpos','maxloss','dailyloss'):
+     msg=await self._apply_setting(key,value)
     elif key=='symbol':
      self.e.symbol=value.upper(); await self.db.set('symbol',self.e.symbol); msg=f'✅ الرمز: {self.e.symbol}'
     elif key=='symbols':
@@ -372,6 +391,12 @@ class TelegramUI:
 
  async def maxloss_prompt(self,u,c):
   await self.ask_value(u,'maxloss','❌ أرسل حد الخسائر المتتالية فقط\n0 = معطل\nالمسموح: 0 إلى 20')
+
+ async def maxduration_prompt(self,u,c):
+  await self.ask_value(u,'maxduration','⏱ أرسل حد مدة الصفقة بالدقائق\nالمسموح: 3 إلى 240')
+
+ async def dailyloss_prompt(self,u,c):
+  await self.ask_value(u,'dailyloss','📉 أرسل حد انخفاض Equity اليومي\n0 = معطل\nالمسموح: 0 إلى 100')
 
  async def symbol_prompt(self,u,c):
   await self.ask_value(u,'symbol','💱 أرسل رمز واحد فقط\nمثال: EURUSD')
@@ -476,6 +501,8 @@ class TelegramUI:
   a.add_handler(CommandHandler('protection',self.protection_prompt))
   a.add_handler(CommandHandler('maxpos',self.maxpos_prompt))
   a.add_handler(CommandHandler('maxloss',self.maxloss_prompt))
+  a.add_handler(CommandHandler('maxduration',self.maxduration_prompt))
+  a.add_handler(CommandHandler('dailyloss',self.dailyloss_prompt))
   a.add_handler(CallbackQueryHandler(self.cb))
   a.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,self.text))
   return a
