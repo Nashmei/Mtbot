@@ -261,6 +261,8 @@ class Analyzer:
              (side==Side.SELL and h5[-1]>=ema20_5-pull_tol and live<ema20_5))
    htf_ok=htf_allows(side)
    trend_checks={'strong':bool(strong),'acceleration':bool(acceleration),'pullback':bool(pullback),'htf':bool(htf_ok)}
+   pullback_distance=((live-ema20_5)/point if side==Side.BUY else (ema20_5-live)/point)
+   trend_values={'side':side.value,'micro_gap':round(float(micro_gap),2),'momentum':round(float(tick_momentum),2),'momentum_abs':round(abs(float(tick_momentum)),2),'momentum_min':round(float(momentum_min),2),'acceleration':round(float(tick_momentum_fast),2),'acceleration_abs':round(abs(float(tick_momentum_fast)),2),'acceleration_min':round(float(acceleration_min),2),'ema20_m5':round(float(ema20_5),8),'live':round(float(live),8),'pullback_distance_points':round(float(pullback_distance),2),'pullback_tolerance_points':round(float(pull_tol/point),2),'m15_bias':m15_bias,'h1_bias':h1_bias}
    if strong and acceleration and pullback and htf_ok:
     reg=Regime.TREND
     score=70+min(12,abs(micro_trend)/max(atrp,1)*20)+min(10,abs(tick_momentum)/max(atrp,1)*15)
@@ -281,6 +283,7 @@ class Analyzer:
    gold_range=tick_range>=max(5.0,atrp*.35)
    gold_htf=gold_side is not None and htf_allows(gold_side)
    gold_checks={'direction':bool(gold_up or gold_dn),'gap':bool(gold_gap),'momentum':bool(gold_momentum),'acceleration':bool(gold_fast),'expansion_range':bool(gold_range),'htf':bool(gold_htf)}
+   gold_values={'side':gold_side.value if gold_side is not None else 'NONE','micro_gap':round(float(micro_gap),2),'gap_min':round(float(momentum_min),2),'momentum':round(float(tick_momentum),2),'momentum_abs':round(abs(float(tick_momentum)),2),'momentum_min':round(float(momentum_min),2),'acceleration':round(float(tick_momentum_fast),2),'acceleration_abs':round(abs(float(tick_momentum_fast)),2),'acceleration_min':round(float(acceleration_min),2),'tick_range':round(float(tick_range),2),'expansion_range_min':round(float(max(5.0,atrp*.35)),2),'micro_trend':round(float(micro_trend),2),'m15_bias':m15_bias,'h1_bias':h1_bias}
    gold_expand=(gold_up or gold_dn) and gold_gap and gold_momentum and gold_fast and gold_range and gold_side is not None and gold_htf
    if gold_expand:
     side=Side.BUY if gold_up else Side.SELL
