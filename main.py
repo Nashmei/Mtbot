@@ -30,7 +30,7 @@ async def main():
  trade_messages={}
  blocked_until={'until':0.0}
 
- async def notify(text,photo_path=None,caption=None,trade_ticket=None,trade_update=False,pin=False):
+ async def notify(text,photo_path=None,caption=None,trade_ticket=None,trade_update=False,pin=False,trade_result=None):
   import time
   app=app_holder.get('app')
   if not app:return
@@ -64,6 +64,10 @@ async def main():
    if trade_update and trade_ticket is not None:
     state=trade_messages.get(int(trade_ticket))
     if not state:return
+    if trade_result is not None:
+     pnl=float(trade_result)
+     result_text=f'🟢 ربح $+{pnl:.2f}' if pnl>=0 else f'🔴 خسارة $-{abs(pnl):.2f}'
+     await app.bot.send_message(chat_id=chat_id,text=result_text,reply_to_message_id=state['message_id'])
     # Final close result must always replace the live price immediately.
     is_final=('🏁 النتيجة:' in text)
     if not is_final and now-state.get('last_edit',0.0)<5.0:return

@@ -956,7 +956,7 @@ class Engine:
 
     await self.db.log(event,t.symbol,exit_price=exit_price,pnl=pnl,reason=reason)
     caption=await self._trade_caption(t,pnl=pnl,closed=True)
-    await self.notify(caption,trade_ticket=t.ticket,trade_update=True)
+    await self.notify(caption,trade_ticket=t.ticket,trade_update=True,trade_result=pnl)
    else:
     await self.db.log('POSITION_CLOSED',t.symbol,reason='history_not_found')
     caption=await self._trade_caption(t,pnl=None,closed=True)
