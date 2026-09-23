@@ -272,7 +272,7 @@ class Analyzer:
     reg=Regime.TREND
     score=70+min(12,abs(micro_trend)/max(atrp,1)*20)+min(10,abs(tick_momentum)/max(atrp,1)*15)
     slp=max(10.,min(1.8*atrp,max(.70*atrp,tick_range*.33)))
-    sig=Signal(side,'scalp_trend',min(.92,score/100.),slp,'M15 bias + M5 EMA20 pullback + live acceleration')
+    sig=Signal(side,'scalp_trend',min(.92,score/100.),slp,f'Trend confirmation {confirmation_score}/4 + M15/H1 direction guard')
     decision='scalp_trend'
    else:
     reg=Regime.TREND; decision='trend_wait_pullback'
@@ -302,7 +302,7 @@ class Analyzer:
     reg=Regime.TREND
     score=72+min(12,abs(tick_momentum)/max(atrp,1)*18)+min(8,micro_gap/max(atrp,1)*12)
     slp=max(12.,min(1.7*atrp,max(.70*atrp,tick_range*.32)))
-    sig=Signal(side,'gold_scalp',min(.92,score/100.),slp,'XAUUSD confirmed live expansion; breakout remains first priority')
+    sig=Signal(side,'gold_scalp',min(.92,score/100.),slp,f'XAUUSD confirmation {gold_confirmation_score}/4 + direction/HTF/range guards')
     decision='gold_scalp'
 
   # Fourth priority: M5 reversal only in a ranging/non-trending context.
