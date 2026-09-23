@@ -67,7 +67,15 @@ async def main():
     if trade_result is not None:
      pnl=float(trade_result)
      result_text=f'🟢 ربح $+{pnl:.2f}' if pnl>=0 else f'🔴 خسارة $-{abs(pnl):.2f}'
-     await app.bot.send_message(chat_id=chat_id,text=result_text,reply_to_message_id=state['message_id'])
+     result_msg=await app.bot.send_message(chat_id=chat_id,text=result_text,reply_to_message_id=state['message_id'])
+     try:
+      await app.bot.unpin_chat_message(chat_id=chat_id,message_id=state['message_id'])
+     except BadRequest as ex:
+      print('Telegram unpin trade message failed:',ex)
+     try:
+      await app.bot.pin_chat_message(chat_id=chat_id,message_id=result_msg.message_id,disable_notification=True)
+     except BadRequest as ex:
+      print('Telegram pin result failed:',ex)
     # Final close result must always replace the live price immediately.
     is_final=('🏁 النتيجة:' in text)
     if not is_final and now-state.get('last_edit',0.0)<5.0:return
