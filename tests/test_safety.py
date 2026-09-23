@@ -103,6 +103,29 @@ class MarketSafetyTests(unittest.TestCase):
         self.assertLessEqual(vol, accepted)
         self.assertTrue(all(b < a for a, b in zip([requested] + checked, checked)))
 
+    def test_aggregate_margin_level_floor_math(self):
+        """A new order is capped so projected margin level stays at or above 200%."""
+        equity = 3211.40
+        current_margin = 1000.0
+        margin_1lot = 800.0
+        min_margin_level_pct = 200.0
+        max_total_margin = equity * 100.0 / min_margin_level_pct
+        remaining_margin = max_total_margin - current_margin
+        capacity = remaining_margin / margin_1lot
+        self.assertAlmostEqual(max_total_margin, 1605.70, places=2)
+        self.assertAlmostEqual(capacity, 0.757125, places=6)
+        projected = current_margin + margin_1lot * capacity
+        self.assertGreaterEqual(equity / projected * 100.0, 200.0)
+
+    def test_aggregate_margin_floor_rejects_min_lot_when_needed(self):
+        equity = 1000.0
+        current_margin = 499.5
+        margin_1lot = 100.0
+        vmin = 0.01
+        max_total_margin = equity / 2.0
+        capacity = (max_total_margin - current_margin) / margin_1lot
+        self.assertLess(capacity, vmin)
+
     def test_no_money_notice_key_is_signal_scoped(self):
         signal_key = ("scalp_trend", "SELL", 12345)
         first = ("order_check_no_money", "NZDUSD", signal_key)
