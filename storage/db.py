@@ -15,3 +15,63 @@ class DB:
   async with aiosqlite.connect(self.path) as d:
    async with d.execute('SELECT value FROM settings WHERE key=?',(k,)) as c:
     r=await c.fetchone(); return r[0] if r else default
+
+ async def strategy_performance(self,window=50):
+  window=max(1,min(int(window),200))
+  sql='''WITH opens AS (
+   SELECT
+    id,ts,symbol,
+    json_extract(details,'$.strategy') AS strategy,
+    LEAD(ts) OVER (PARTITION BY symbol ORDER BY ts) AS next_open_ts
+   FROM audit
+   WHERE event='OPEN'
+     AND json_extract(details,'$.strategy') IS NOT NULL
+  ),
+  paired AS (
+   SELECT
+    o.strategy,o.ts,
+    (
+     SELECT c.id
+     FROM audit c
+     WHERE c.symbol=o.symbol
+       AND c.ts>o.ts
+       AND c.event IN ('TP','SL','POSITION_CLOSED')
+       AND (o.next_open_ts IS NULL OR c.ts<o.next_open_ts)
+     ORDER BY c.ts ASC
+     LIMIT 1
+    ) AS close_id
+   FROM opens o
+  ),
+  scored AS (
+   SELECT
+    p.strategy,p.ts,
+    CASE
+     WHEN c.event='TP' THEN 3.0
+     WHEN CAST(COALESCE(json_extract(c.details,'$.pnl'),0) AS REAL)>0 THEN 1.0
+     WHEN CAST(COALESCE(json_extract(c.details,'$.pnl'),0) AS REAL)=0 THEN 0.0
+     ELSE -1.0
+    END AS points,
+    ROW_NUMBER() OVER (PARTITION BY p.strategy ORDER BY p.ts DESC) AS rn
+   FROM paired p
+   JOIN audit c ON c.id=p.close_id
+   WHERE p.strategy IS NOT NULL
+  )
+  SELECT
+   strategy,
+   COUNT(*) AS trades,
+   COALESCE(SUM(points),0) AS points,
+   COALESCE(AVG(points),0) AS avg_points
+  FROM scored
+  WHERE rn<=?
+  GROUP BY strategy'''
+  out={}
+  async with aiosqlite.connect(self.path) as d:
+   async with d.execute(sql,(window,)) as cur:
+    async for strategy,trades,points,avg_points in cur:
+     out[str(strategy)]={
+      'trades':int(trades or 0),
+      'points':float(points or 0),
+      'avg_points':float(avg_points or 0),
+      'window':window,
+     }
+  return out
