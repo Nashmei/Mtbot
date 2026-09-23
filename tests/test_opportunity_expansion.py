@@ -4,7 +4,10 @@ import unittest
 import numpy as np
 
 from core.models import Side
-from core.strategies import scalp_sweep_reversal, scalp_squeeze_expansion
+from core.strategies import (
+    scalp_sweep_reversal, scalp_squeeze_expansion,
+    diagnose_scalp_sweep_reversal, diagnose_scalp_squeeze_expansion,
+)
 
 
 def _strategy_allowed(name, side=None):
@@ -84,6 +87,31 @@ class OpportunityExpansionTests(unittest.TestCase):
         self.assertIsNotNone(sig)
         self.assertEqual(sig.strategy,'scalp_squeeze_expansion')
         self.assertEqual(sig.side,Side.BUY)
+
+    def test_sweep_diagnostic_reports_candidate_and_thresholds(self):
+        dtype=[('open','f8'),('high','f8'),('low','f8'),('close','f8')]
+        rates=np.zeros(60,dtype=dtype)
+        rates['open']=rates['close']=100.0
+        rates['high']=101.0
+        rates['low']=99.0
+        rates[-1]=(100.0,100.4,98.5,99.6)
+        d=diagnose_scalp_sweep_reversal(_base_ctx(rates))
+        self.assertEqual(d['stage'],'candidate')
+        self.assertEqual(d['candidate_side'],'BUY')
+        self.assertTrue(d['swept_low'])
+        self.assertGreaterEqual(d['lower_wick_ratio'],d['wick_required'])
+
+    def test_squeeze_diagnostic_explains_missing_compression(self):
+        dtype=[('open','f8'),('high','f8'),('low','f8'),('close','f8')]
+        rates=np.zeros(60,dtype=dtype)
+        rates['open']=rates['close']=100.0
+        rates['high']=100.5
+        rates['low']=99.5
+        rates[-1]=(100.0,101.3,99.9,101.2)
+        d=diagnose_scalp_squeeze_expansion(_base_ctx(rates))
+        self.assertEqual(d['stage'],'blocked')
+        self.assertIn('squeeze_ratio',d['failed'])
+        self.assertFalse(d['squeeze_ok'])
 
     def test_squeeze_requires_prior_compression(self):
         dtype=[('open','f8'),('high','f8'),('low','f8'),('close','f8')]
