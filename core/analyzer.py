@@ -142,7 +142,9 @@ class Analyzer:
   sig=None; decision='waiting_live_momentum'
   blockers=[]
   trend_checks=None
+  trend_values=None
   gold_checks=None
+  gold_values=None
 
   # Frequent EMA crossover scalp. Use CLOSED candles only so a forming candle
   # cannot create/disappear a crossover. M1 is primary; M5 is fallback.
@@ -342,7 +344,7 @@ class Analyzer:
    elif tick_range>max(8.,atrp*.8):
     reg=Regime.VOLATILE; decision='volatile_no_direction'
   return reg,sig,{
-   'decision':decision,'blockers':blockers,'trend_checks':trend_checks,'gold_checks':gold_checks,'market_mode':market_mode,'price':round(live,8),'spread_points':round(spread,1),
+   'decision':decision,'blockers':blockers,'trend_checks':trend_checks,'trend_values':trend_values,'gold_checks':gold_checks,'gold_values':gold_values,'market_mode':market_mode,'price':round(live,8),'spread_points':round(spread,1),
    'spread_ratio':round(spread_ratio,2),'tick_momentum_fast':round(float(tick_momentum_fast),2),
    'tick_momentum':round(float(tick_momentum),2),'micro_trend':round(float(micro_trend),2),
    'atr_points':round(float(atrp),2),'adx':round(float(adx),1),
