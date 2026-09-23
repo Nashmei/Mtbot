@@ -18,6 +18,8 @@ for name, value in {
     "ORDER_FILLING_IOC": 1,
     "ORDER_FILLING_RETURN": 2,
     "COPY_TICKS_ALL": -1,
+    "TRADE_RETCODE_DONE": 10009,
+    "TRADE_RETCODE_DONE_PARTIAL": 10010,
 }.items():
     setattr(fake_mt5, name, value)
 sys.modules["MetaTrader5"] = fake_mt5
@@ -158,6 +160,72 @@ class MarketSafetyTests(unittest.TestCase):
             self.assertFalse(await second._daily_entry_allowed(types.SimpleNamespace(equity=970)))
             self.assertEqual(len(alerts), 1)
             self.assertEqual(len(db.events), 1)
+        asyncio.run(check())
+
+
+    def test_start_rejects_existing_untracked_bot_position(self):
+        class Gateway:
+            def account(self):
+                return types.SimpleNamespace(
+                    trade_mode=0, equity=1000, currency="USD"
+                )
+            def algo_status(self):
+                return {
+                    "connected": True,
+                    "trade_allowed": True,
+                    "account_trade_allowed": True,
+                    "trade_expert": True,
+                }
+            def positions(self):
+                return (types.SimpleNamespace(magic=4009, ticket=77),)
+        messages = []
+        async def notify(message, **kwargs):
+            messages.append(message)
+        async def check():
+            engine = Engine(Gateway(), FakeDB(), notify)
+            started = await engine.start()
+            self.assertFalse(started)
+            self.assertFalse(engine.running)
+            self.assertTrue(any("غير متتبعة" in m for m in messages))
+        asyncio.run(check())
+
+    def test_stop_partial_close_keeps_trade_tracked(self):
+        position = types.SimpleNamespace(ticket=42, symbol="EURUSD", volume=0.10)
+        remaining = types.SimpleNamespace(ticket=42, symbol="EURUSD", volume=0.05)
+        class Gateway:
+            def __init__(self):
+                self.lookups = 0
+            def position_by_ticket(self, ticket):
+                self.lookups += 1
+                return position if self.lookups == 1 else remaining
+            def close(self, pos):
+                return types.SimpleNamespace(
+                    retcode=fake_mt5.TRADE_RETCODE_DONE_PARTIAL,
+                    comment="partial",
+                )
+        messages = []
+        async def notify(message, **kwargs):
+            messages.append(message)
+        async def check():
+            engine = Engine(Gateway(), FakeDB(), notify)
+            trade = types.SimpleNamespace(ticket=42, symbol="EURUSD")
+            engine.trades[42] = trade
+            engine.running = True
+            await engine.stop()
+            self.assertFalse(engine.running)
+            self.assertIn(42, engine.trades)
+            self.assertTrue(any(event == "STOP_EXIT_PARTIAL" for event, _ in engine.db.events))
+            self.assertTrue(any("إغلاق جزئي" in m for m in messages))
+        asyncio.run(check())
+
+    def test_daily_equity_limit_blocks_exact_threshold(self):
+        db = FakeDB()
+        async def notify(message, **kwargs):
+            pass
+        async def check():
+            engine = Engine(None, db, notify)
+            self.assertTrue(await engine._daily_entry_allowed(types.SimpleNamespace(equity=1000)))
+            self.assertFalse(await engine._daily_entry_allowed(types.SimpleNamespace(equity=980)))
         asyncio.run(check())
 
 
