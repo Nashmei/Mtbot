@@ -103,6 +103,11 @@ class MarketSafetyTests(unittest.TestCase):
         self.assertEqual(signal.strategy, "gold_scalp")
         self.assertEqual(signal.side.value, "BUY")
         self.assertEqual(meta["decision"], "gold_scalp")
+        self.assertGreaterEqual(meta["gold_values"]["confirmation_score"], 3)
+        self.assertEqual(meta["gold_values"]["confirmation_required"], 3)
+        self.assertTrue(meta["gold_checks"]["direction"])
+        self.assertTrue(meta["gold_checks"]["htf"])
+        self.assertTrue(meta["gold_checks"]["range_floor"])
         self.assertAlmostEqual(signal.confidence, .8759288243371257)
 
     def test_breakout_uses_latest_closed_m5_bar_for_non_gold(self):
@@ -147,6 +152,8 @@ class MarketSafetyTests(unittest.TestCase):
         self.assertIsNone(signal)
         self.assertEqual(meta["market_mode"], "trend")
         self.assertEqual(regime.value, "TREND")
+        self.assertEqual(meta["gold_values"]["confirmation_required"], 3)
+        self.assertIn("range_floor", meta["gold_checks"])
 
     def test_adaptive_thresholds_are_exposed(self):
         ticks = np.array(
