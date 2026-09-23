@@ -260,7 +260,7 @@ class TelegramUI:
     self.e.symbols.remove(symbol)
    else:
     self.e.symbols.append(symbol)
-   self.e.symbol=self.e.symbols[0] if self.e.symbols else settings.default_symbol
+   self.e.symbol=self.e.symbols[0] if self.e.symbols else 'EURUSD'
    import json
    await self.e.save_setting('symbols',json.dumps(self.e.symbols))
    msg=f'✅ الأزواج المختارة: {", ".join(self.e.symbols) if self.e.symbols else "لا يوجد"}'
@@ -312,7 +312,7 @@ class TelegramUI:
     if key in ('risk','confidence','protection','maxduration','rr','maxpos','maxloss','dailyloss'):
      msg=await self._apply_setting(key,value)
     elif key=='symbol':
-     self.e.symbol=value.upper(); await self.e.save_setting('symbol',self.e.symbol); msg=f'✅ الرمز: {self.e.symbol}'
+     self.e.symbol=value.upper(); self.e.symbols=[self.e.symbol]; import json; await self.e.save_setting('symbols',json.dumps(self.e.symbols)); msg=f'✅ الرمز: {self.e.symbol}'
     elif key=='symbols':
      import json
      wanted=value.upper().split()
