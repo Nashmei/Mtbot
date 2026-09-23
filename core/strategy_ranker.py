@@ -1,12 +1,11 @@
 """Dynamic strategy ranking helpers.
 
 Combines the current signal confidence with recent realized strategy performance.
-Performance uses up to the latest 50 closed trades per strategy and gradually
-reaches full influence after 30 samples.
+Performance uses up to the latest 50 closed trades per strategy. Selection
+weights adapt to the amount of closed-trade evidence for each strategy:
+<10 trades = 80/20, 10-29 = 60/40, 30+ = 40/60.
 """
 
-SIGNAL_WEIGHT = 0.70
-PERFORMANCE_WEIGHT = 0.30
 PERFORMANCE_WINDOW = 50
 FULL_SAMPLE_SIZE = 30
 NEUTRAL_PERFORMANCE_SCORE = 50.0
@@ -48,10 +47,21 @@ def effective_performance_score(stats):
     }
 
 
+def adaptive_weights(trades):
+    """Return (confidence_weight, performance_weight) for sample size."""
+    trades=max(0,int(trades or 0))
+    if trades<10:
+        return 0.80,0.20
+    if trades<30:
+        return 0.60,0.40
+    return 0.40,0.60
+
+
 def score_signal(signal, performance_stats=None):
     confidence=_clamp(float(signal.confidence)*100.0,0.0,100.0)
     perf=effective_performance_score(performance_stats)
-    final=(SIGNAL_WEIGHT*confidence)+(PERFORMANCE_WEIGHT*perf['score'])
+    confidence_weight,performance_weight=adaptive_weights(perf['trades'])
+    final=(confidence_weight*confidence)+(performance_weight*perf['score'])
     return {
         'strategy':signal.strategy,
         'side':signal.side.value,
@@ -61,6 +71,8 @@ def score_signal(signal, performance_stats=None):
         'performance_points':round(perf['points'],4),
         'performance_avg_points':round(perf['avg_points'],4),
         'performance_reliability':perf['reliability'],
+        'confidence_weight':confidence_weight,
+        'performance_weight':performance_weight,
         'final_score':round(final,4),
     }
 
