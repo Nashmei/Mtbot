@@ -978,9 +978,7 @@ class Engine:
   target_progress=max(0.0,(favorable/target_distance)*100) if target_distance>0 else 0.0
 
   if t.protection_45_active:
-   idle=max(0.0,time.time()-t.last_progress_at)
-   remaining=max(0,60-int(idle))
-   protection=f'مفعلة 🔐 | الخمول: {remaining}ث'
+   protection='مفعلة 🔐 | تتبع الربح مستمر'
   else:
    protection=f'انتظار {t.protection_pct:g}% | التقدم: {target_progress:.0f}%'
 
@@ -1103,7 +1101,7 @@ class Engine:
    else:
     await self.db.log('PROTECTION_FAILED',t.symbol,result=str(res))
 
-  # بعد التفعيل: أفضل سعر جديد يعيد عداد 60 ثانية ويحرك SL للأمام.
+  # بعد التفعيل: أفضل سعر جديد يحرك SL للأمام. لا يوجد إغلاق بسبب خمول زمني.
   if t.protection_45_active:
    progress=(
     (t.side==Side.BUY and price>t.best_favorable_price)
@@ -1158,24 +1156,3 @@ class Engine:
        target_progress_pct=trailing_progress*100.0
       )
 
-  # بعد تفعيل 45% فقط: 60 ثانية بلا أفضل سعر جديد = إغلاق بالسوق.
-  if t.protection_45_active and (now-t.last_progress_at)>=60:
-   idle=now-t.last_progress_at
-   res=self.gw.close(pos)
-
-   if res and res.retcode in (
-    mt5.TRADE_RETCODE_DONE,
-    mt5.TRADE_RETCODE_DONE_PARTIAL
-   ):
-    await self.db.log(
-     'PROFIT_STALL_EXIT',t.symbol,
-     idle_seconds=idle,result=str(res)
-    )
-
-   else:
-    await self.db.log(
-     'PROFIT_STALL_EXIT_FAILED',t.symbol,
-     idle_seconds=idle,result=str(res)
-    )
-    # تبقى الصفقة تحت المراقبة ونحاول مجددًا بعد 60 ثانية.
-    t.last_progress_at=now
