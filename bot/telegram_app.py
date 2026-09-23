@@ -135,6 +135,11 @@ class TelegramUI:
       reason=str(meta.get('decision','waiting'))
       labels={'waiting_live_momentum':'انتظار زخم لحظي','waiting_momentum':'انتظار تأكيد الزخم','volatile_no_direction':'حركة قوية بلا اتجاه','direction_not_confirmed':'الاتجاه غير مؤكد'}
       lines.append(f'\n💱 {symbol}\n⚪ لا توجد فرصة حالياً\n📊 السوق: {reg.value}\n🔎 السبب: {labels.get(reason,reason)}')
+       checks=meta.get('gold_checks') if reason=='gold_wait_confirmation' else meta.get('trend_checks')
+       if checks:
+        check_labels={'strong':'قوة الزخم','acceleration':'التسارع','pullback':'Pullback','htf':'M15/H1','direction':'الاتجاه اللحظي','gap':'Micro gap','momentum':'الزخم','expansion_range':'مدى التوسع'}
+        detail=['   '+('✅' if ok else '❌')+' '+check_labels.get(name,name) for name,ok in checks.items()]
+        lines[-1]+='\n🧩 شروط الدخول:\n'+'\n'.join(detail)
     msg='\n'.join(lines)
   elif x=='symbols':
    symbols=self.e.gw.available_symbols()
