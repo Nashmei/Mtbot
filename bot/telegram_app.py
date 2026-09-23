@@ -43,7 +43,7 @@ class TelegramUI:
    db_key='daily_loss_limit_pct'; msg=f'✅ حد Equity اليومي: {v:g}%'+(' (معطل)' if v==0 else '')
   else:
    raise ValueError()
-  await self.db.set(db_key,v)
+  await self.e.save_setting(db_key,v)
   return msg
  def _cancel_menu_expiry(self):
   if self.menu_expiry_task and not self.menu_expiry_task.done(): self.menu_expiry_task.cancel()
@@ -262,7 +262,7 @@ class TelegramUI:
     self.e.symbols.append(symbol)
    self.e.symbol=self.e.symbols[0] if self.e.symbols else settings.default_symbol
    import json
-   await self.db.set('symbols',json.dumps(self.e.symbols))
+   await self.e.save_setting('symbols',json.dumps(self.e.symbols))
    msg=f'✅ الأزواج المختارة: {", ".join(self.e.symbols) if self.e.symbols else "لا يوجد"}'
    await self._edit(q,msg,reply_markup=(self.account_kb() if x in ('mt5login','readiness','accountstats') else self.trade_kb() if x in ('start','stop','status') else self.analysis_kb() if x=='analyze' else self.settings_kb()))
    return
@@ -312,7 +312,7 @@ class TelegramUI:
     if key in ('risk','confidence','protection','maxduration','rr','maxpos','maxloss','dailyloss'):
      msg=await self._apply_setting(key,value)
     elif key=='symbol':
-     self.e.symbol=value.upper(); await self.db.set('symbol',self.e.symbol); msg=f'✅ الرمز: {self.e.symbol}'
+     self.e.symbol=value.upper(); await self.e.save_setting('symbol',self.e.symbol); msg=f'✅ الرمز: {self.e.symbol}'
     elif key=='symbols':
      import json
      wanted=value.upper().split()
@@ -324,7 +324,7 @@ class TelegramUI:
       if matches and matches[0] not in selected: selected.append(matches[0])
      if not selected: raise ValueError()
      self.e.symbols=selected; self.e.symbol=selected[0]
-     await self.db.set('symbols',json.dumps(selected)); msg='✅ الأزواج: '+', '.join(selected)
+     await self.e.save_setting('symbols',json.dumps(selected)); msg='✅ الأزواج: '+', '.join(selected)
     else:
      return
     m=await u.message.reply_text(msg,reply_markup=self.kb())
@@ -361,6 +361,8 @@ class TelegramUI:
     from pathlib import Path
     import json,os
     cred_file=Path.home()/'.mt5bot_credentials.json';cred_file.write_text(json.dumps({'login':int(login),'server':server,'password':secret}));os.chmod(cred_file,0o600)
+    # New/different account gets its own defaults or its previously saved profile.
+    await self.e.load_settings(login=int(login),migrate_legacy=False)
     await self.db.log('MT5_LOGIN_SUCCESS',login=int(login),server=server);secret=None
     await wait.edit_text(f'👤 حساب MT5\n━━━━━━━━━━━━━━\n✅ تم الاتصال بنجاح\n🆔 الحساب: {a.login}\n🌐 الخادم: {a.server}\n🔒 الوضع: تجريبي محمي',reply_markup=self.account_kb())
    else:
@@ -421,17 +423,17 @@ class TelegramUI:
   self.message_ids.add((chat,m.message_id))
 
  async def symbol(self,u,c):
-  if self.allowed(u.effective_user) and c.args: self.e.symbol=c.args[0].upper();await self.db.set('symbol',self.e.symbol);await u.message.reply_text(f'الرمز ← {self.e.symbol}',reply_markup=self.kb())
+  if self.allowed(u.effective_user) and c.args: self.e.symbol=c.args[0].upper();await self.e.save_setting('symbol',self.e.symbol);await u.message.reply_text(f'الرمز ← {self.e.symbol}',reply_markup=self.kb())
  async def rr(self,u,c):
   if self.allowed(u.effective_user) and c.args:
    try:v=float(c.args[0])
    except ValueError:return await u.message.reply_text('مثال: /rr 3')
    if not .5<=v<=10:return await u.message.reply_text('يجب أن تكون النسبة بين 0.5 و10')
-   self.e.rr=v;await self.db.set('rr',v);await u.message.reply_text(f'العائد/المخاطرة ← 1:{v:g}',reply_markup=self.kb())
+   self.e.rr=v;await self.e.save_setting('rr',v);await u.message.reply_text(f'العائد/المخاطرة ← 1:{v:g}',reply_markup=self.kb())
  async def risk(self,u,c):
   try:
    v=float(c.args[0]); assert 0.25<=v<=50
-   self.e.risk_pct=v; await self.db.set('risk_pct',v)
+   self.e.risk_pct=v; await self.e.save_setting('risk_pct',v)
    await u.message.reply_text(f'✅ المخاطرة: {v:g}%')
   except: await u.message.reply_text('استخدم /risk 0.25 (من 0.25 إلى 50)')
 
@@ -440,7 +442,7 @@ class TelegramUI:
   try:
    v=float(c.args[0]); assert 50<=v<=95
    self.e.min_confidence=v
-   await self.db.set('min_confidence',v)
+   await self.e.save_setting('min_confidence',v)
    await u.message.reply_text(f'✅ الحد الأدنى للثقة: {v:g}%')
   except:
    await u.message.reply_text('استخدم /confidence 75 (من 50 إلى 95)')
@@ -448,14 +450,14 @@ class TelegramUI:
  async def protection(self,u,c):
   try:
    v=float(c.args[0]); assert 5<=v<=90
-   self.e.protection_pct=v; await self.db.set('protection_pct',v)
+   self.e.protection_pct=v; await self.e.save_setting('protection_pct',v)
    await u.message.reply_text(f'✅ الحماية تبدأ عند: {v:g}%')
   except: await u.message.reply_text('استخدم /protection 45 (من 5 إلى 90)')
 
  async def maxpos(self,u,c):
   try:
    v=int(c.args[0]); assert 1<=v<=10
-   self.e.max_positions=v; await self.db.set('max_positions',v)
+   self.e.max_positions=v; await self.e.save_setting('max_positions',v)
    await u.message.reply_text(f'✅ حد المراكز: {v}')
   except: await u.message.reply_text('استخدم /maxpos 3 (من 1 إلى 10)')
 
@@ -463,7 +465,7 @@ class TelegramUI:
   try:
    v=int(c.args[0]); assert 0<=v<=20
    self.e.max_consecutive_losses=v; self.e.loss_limit_notified=False
-   await self.db.set('max_consecutive_losses',v)
+   await self.e.save_setting('max_consecutive_losses',v)
    await u.message.reply_text(f'✅ حد الخسائر المتتالية: {v}')
   except: await u.message.reply_text('استخدم /maxloss 0 (0 = معطل، من 1 إلى 20 = حد الخسائر)')
 
@@ -485,7 +487,7 @@ class TelegramUI:
    return
   self.e.symbols=selected
   self.e.symbol=selected[0]
-  await self.db.set('symbols',json.dumps(selected))
+  await self.e.save_setting('symbols',json.dumps(selected))
   await u.message.reply_text('✅ الأزواج المختارة: '+', '.join(selected))
 
  def app(self):
