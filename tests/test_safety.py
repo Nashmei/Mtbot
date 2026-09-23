@@ -425,5 +425,33 @@ class MarketSafetyTests(unittest.TestCase):
         asyncio.run(check())
 
 
+    def test_daily_equity_limit_zero_from_db_disables_limit(self):
+        db = FakeDB()
+        db.values["daily_loss_limit_pct"] = "0"
+        async def notify(message, **kwargs):
+            pass
+        async def check():
+            engine = Engine(None, db, notify)
+            await engine.load_settings()
+            self.assertEqual(engine.daily_loss_limit_pct, 0.0)
+            self.assertTrue(await engine._daily_entry_allowed(types.SimpleNamespace(equity=1)))
+            self.assertFalse(any(event == "DAILY_EQUITY_LIMIT" for event, _ in db.events))
+        asyncio.run(check())
+
+    def test_daily_equity_limit_db_value_survives_engine_restart(self):
+        db = FakeDB()
+        db.values["daily_loss_limit_pct"] = "4.5"
+        async def notify(message, **kwargs):
+            pass
+        async def check():
+            first = Engine(None, db, notify)
+            await first.load_settings()
+            second = Engine(None, db, notify)
+            await second.load_settings()
+            self.assertEqual(first.daily_loss_limit_pct, 4.5)
+            self.assertEqual(second.daily_loss_limit_pct, 4.5)
+        asyncio.run(check())
+
+
 if __name__ == "__main__":
     unittest.main()

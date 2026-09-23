@@ -29,6 +29,7 @@ class Engine:
   self.blocked_signal_by_symbol={}
   self.max_positions=1
   self.max_consecutive_losses=settings.max_consecutive_losses
+  self.daily_loss_limit_pct=settings.daily_loss_limit_pct
   self.consecutive_losses=0
   self.loss_limit_notified=False
   self.daily_loss_notified=False
@@ -68,6 +69,7 @@ class Engine:
    self.max_trade_minutes=float(await self.db.get('max_trade_minutes',self.max_trade_minutes))
    self.max_positions=int(await self.db.get('max_positions',self.max_positions))
    self.max_consecutive_losses=int(await self.db.get('max_consecutive_losses',self.max_consecutive_losses))
+   self.daily_loss_limit_pct=float(await self.db.get('daily_loss_limit_pct',self.daily_loss_limit_pct))
    self.consecutive_losses=max(0,int(await self.db.get('consecutive_losses',0)))
   except (TypeError,ValueError):
    pass
@@ -89,6 +91,8 @@ class Engine:
    f'🛡 الحماية: {self.protection_pct:g}%\n'
    f'⏱ حد الصفقة: {self.max_trade_minutes:g} دقيقة\n'
    f'❌ الخسائر المتتالية: {self.consecutive_losses} / {self.max_consecutive_losses}\n'
+   f'📉 حد Equity اليومي: {self.daily_loss_limit_pct:g}%'
+   f'{" (معطل)" if self.daily_loss_limit_pct<=0 else ""}\n'
    f'⚖️ العائد/المخاطرة: 1:{self.rr:g}\n'
    f'💰 Equity: {a.equity:.2f} {a.currency}'
   )
@@ -98,8 +102,8 @@ class Engine:
   if not (math.isfinite(self.risk_pct) and 0<self.risk_pct<=50
           and math.isfinite(self.rr) and .5<=self.rr<=10
           and 1<=self.max_positions<=10
-          and math.isfinite(settings.daily_loss_limit_pct)
-          and 0<=settings.daily_loss_limit_pct<=100):
+          and math.isfinite(self.daily_loss_limit_pct)
+          and 0<=self.daily_loss_limit_pct<=100):
    await self.notify('⚠️ إعدادات المخاطرة أو العائد أو حد المراكز غير صالحة.')
    return False
   account=self.gw.account()
@@ -138,7 +142,8 @@ class Engine:
    risk_pct=self.risk_pct,
    protection_pct=self.protection_pct,
    max_positions=self.max_positions,
-   max_consecutive_losses=self.max_consecutive_losses
+   max_consecutive_losses=self.max_consecutive_losses,
+   daily_loss_limit_pct=self.daily_loss_limit_pct
   )
 
   await self.notify(
@@ -275,7 +280,7 @@ class Engine:
   equity=float(getattr(account,'equity',0) or 0)
   if not math.isfinite(equity) or equity<=0:
    return False
-  if settings.daily_loss_limit_pct<=0:
+  if self.daily_loss_limit_pct<=0:
    return True
   today=date.today().isoformat()
   saved_day=await self.db.get('daily_equity_date')
@@ -285,10 +290,10 @@ class Engine:
    await self.db.set('daily_equity_baseline',baseline)
    await self.db.set('daily_equity_date',today)
    self.daily_loss_notified=False
-  allowed=equity>baseline*(1-settings.daily_loss_limit_pct/100.0)
+  allowed=equity>baseline*(1-self.daily_loss_limit_pct/100.0)
   if not allowed and not self.daily_loss_notified:
    self.daily_loss_notified=True
-   await self.db.log('DAILY_EQUITY_LIMIT',equity=equity,baseline=baseline,limit_pct=settings.daily_loss_limit_pct)
+   await self.db.log('DAILY_EQUITY_LIMIT',equity=equity,baseline=baseline,limit_pct=self.daily_loss_limit_pct)
    await self.notify('🛑 توقف الدخول: حد انخفاض Equity اليومي. تستمر إدارة المراكز المفتوحة.')
   return allowed
 
