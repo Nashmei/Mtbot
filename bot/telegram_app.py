@@ -423,7 +423,7 @@ class TelegramUI:
   self.message_ids.add((chat,m.message_id))
 
  async def symbol(self,u,c):
-  if self.allowed(u.effective_user) and c.args: self.e.symbol=c.args[0].upper();await self.e.save_setting('symbol',self.e.symbol);await u.message.reply_text(f'الرمز ← {self.e.symbol}',reply_markup=self.kb())
+  if self.allowed(u.effective_user) and c.args: self.e.symbol=c.args[0].upper();await self.e.save_setting('symbols','[\"'+self.e.symbol+'\"]');await u.message.reply_text(f'الرمز ← {self.e.symbol}',reply_markup=self.kb())
  async def rr(self,u,c):
   if self.allowed(u.effective_user) and c.args:
    try:v=float(c.args[0])
