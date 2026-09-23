@@ -696,13 +696,55 @@ class Engine:
    sl=actual_sl
    tp=actual_tp
    vol=float(pos.volume or vol)
+
+   # Recalculate risk and R:R from the broker-confirmed fill/SL/TP/volume.
+   # Pre-send values can drift slightly because the actual fill may differ.
+   post_fill_loss=mt5.order_calc_profit(typ,symbol,vol,fill,actual_sl)
+   post_fill_reward=mt5.order_calc_profit(typ,symbol,vol,fill,actual_tp)
+   if post_fill_loss is not None and abs(float(post_fill_loss))>0:
+    actual_risk=abs(float(post_fill_loss))
+   else:
+    # Defensive fallback: preserve the already-validated pre-send estimate.
+    actual_risk=float(actual_risk)
+   actual_risk_pct=(actual_risk/float(account.equity)*100.0) if account.equity else 0.0
+   actual_rr=(
+    abs(float(post_fill_reward))/actual_risk
+    if post_fill_reward is not None and actual_risk>0
+    else self.rr
+   )
+   if not math.isfinite(actual_rr) or actual_rr<=0:
+    actual_rr=self.rr
+
+   risk_drift_cash=actual_risk-risk_cash
+   risk_drift_pct=((actual_risk/risk_cash)-1.0)*100.0 if risk_cash>0 else 0.0
+   if abs(risk_drift_cash)>0.01:
+    await self.db.log(
+     'POST_FILL_RISK_DRIFT',symbol,
+     ticket=pos.ticket,planned_risk_cash=risk_cash,actual_risk_cash=actual_risk,
+     drift_cash=risk_drift_cash,drift_pct=risk_drift_pct,
+     planned_entry=price,actual_entry=fill,actual_sl=actual_sl,
+     volume=vol,actual_rr=actual_rr,
+    )
+
    self.trades[pos.ticket]=t
-   self.trade_alert_meta[pos.ticket]={'risk_cash':actual_risk,'risk_pct':actual_risk_pct}
+   self.trade_alert_meta[pos.ticket]={
+    'risk_cash':actual_risk,
+    'risk_pct':actual_risk_pct,
+    'rr_actual':actual_rr,
+    'planned_risk_cash':risk_cash,
+    'risk_drift_cash':risk_drift_cash,
+    'risk_drift_pct':risk_drift_pct,
+   }
    self.execution_notice_once.discard(('margin_min',symbol))
    # A successful trade resets this symbol to the normal spread baseline.
    self.risk.reset_spread_relaxation(symbol)
 
-   await self.db.log('OPEN',symbol,ticket=pos.ticket,entry=fill,sl=sl,tp=tp,volume=vol,side=sig.side.value,strategy=sig.strategy,regime=reg.value,confidence=float(sig.confidence),reason=sig.reason)
+   await self.db.log(
+    'OPEN',symbol,ticket=pos.ticket,entry=fill,sl=sl,tp=tp,volume=vol,
+    side=sig.side.value,strategy=sig.strategy,regime=reg.value,
+    confidence=float(sig.confidence),reason=sig.reason,
+    risk_cash=actual_risk,risk_pct=actual_risk_pct,rr_actual=actual_rr,
+   )
    asyncio.create_task(self._send_trade_chart(t,actual_risk,actual_risk_pct))
 
  async def _handle_invalid_initial_r(self,symbol,pos,fill,actual_sl):
@@ -744,6 +786,7 @@ class Engine:
   meta=self.trade_alert_meta.get(t.ticket,{})
   risk_cash=float(meta.get('risk_cash',0) or 0)
   risk_pct=float(meta.get('risk_pct',self.risk_pct) or self.risk_pct)
+  rr_actual=float(meta.get('rr_actual',self.rr) or self.rr)
 
   if closed:
    if pnl is None:
@@ -771,7 +814,7 @@ class Engine:
    f'🛑 الوقف: {t.sl:.{digits}f}\n'
    f'💰 الهدف: {t.tp:.{digits}f}\n'
    f'{live_line}\n'
-   f'🛡 الحماية: {t.protection_pct:g}% | ⚖️ R:R 1:{self.rr:g}'
+   f'🛡 الحماية: {t.protection_pct:g}% | ⚖️ R:R 1:{rr_actual:.2f}'
   )
 
  async def _send_trade_chart(self,t,actual_risk,actual_risk_pct):
