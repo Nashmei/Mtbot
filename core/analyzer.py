@@ -82,8 +82,14 @@ class Analyzer:
    return m15_bias==want and h1_bias in (0,want)
 
   # Closed M5 is context only. Entry direction is driven by live MT5 ticks.
-  momentum_min=max(1.25,atrp*.07)
-  acceleration_min=max(1.0,atrp*.035)
+  # Opportunity thresholds are ATR-adaptive with symbol-specific floors.
+  # Keep HTF, pullback, spread, risk, and direction guards unchanged.
+  if is_gold:
+   momentum_min=max(8.0,atrp*.03)
+   acceleration_min=max(5.0,atrp*.015)
+  else:
+   momentum_min=max(.8,atrp*.03)
+   acceleration_min=max(.4,atrp*.015)
   live_up=micro_trend>0 and tick_momentum>0 and tick_momentum_fast>=-max(1.,atrp*.08)
   live_dn=micro_trend<0 and tick_momentum<0 and tick_momentum_fast<=max(1.,atrp*.08)
   context_up=(not have) or context_trend>=-atrp*.20
@@ -241,7 +247,7 @@ class Analyzer:
   # pullback/retest instead of chasing an already extended impulse.
   if sig is None and (bull or bear) and have and strategy_allowed('scalp_trend'):
    side=Side.BUY if bull else Side.SELL
-   strong=micro_gap>=max(1.25,atrp*.07) and abs(tick_momentum)>=max(1.25,atrp*.07)
+   strong=micro_gap>=momentum_min and abs(tick_momentum)>=momentum_min
    acceleration=((side==Side.BUY and tick_momentum_fast>=acceleration_min) or
                  (side==Side.SELL and tick_momentum_fast<=-acceleration_min))
    c5=np.asarray(rates['close'],float); h5=np.asarray(rates['high'],float); l5=np.asarray(rates['low'],float)
@@ -263,9 +269,9 @@ class Analyzer:
   if sig is None and is_gold:
    gold_up=micro_trend>0 and tick_momentum>0 and tick_momentum_fast>0 and context_up
    gold_dn=micro_trend<0 and tick_momentum<0 and tick_momentum_fast<0 and context_dn
-   gold_gap=micro_gap>=max(1.5,atrp*.07)
-   gold_momentum=abs(tick_momentum)>=max(1.5,atrp*.07)
-   gold_fast=abs(tick_momentum_fast)>=max(1.0,atrp*.035)
+   gold_gap=micro_gap>=momentum_min
+   gold_momentum=abs(tick_momentum)>=momentum_min
+   gold_fast=abs(tick_momentum_fast)>=acceleration_min
    gold_side=Side.BUY if gold_up else (Side.SELL if gold_dn else None)
    gold_expand=(gold_up or gold_dn) and gold_gap and gold_momentum and gold_fast and tick_range>=max(5.0,atrp*.35) and gold_side is not None and htf_allows(gold_side)
    if gold_expand:
