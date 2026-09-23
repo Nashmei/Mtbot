@@ -63,10 +63,11 @@ class Engine:
 
 
  async def _account_key(self,key,login=None):
-  if login is None:
+  if login is None and self.gw is not None:
    account=self.gw.account()
-   login=int(account.login) if account else None
-  return f'account:{int(login)}:{key}' if login is not None else None
+   raw_login=getattr(account,'login',None) if account else None
+   login=int(raw_login) if raw_login is not None else None
+  return f'account:{int(login)}:{key}' if login is not None else key
 
  async def save_setting(self,key,value):
   db_key=await self._account_key(key)
@@ -77,9 +78,10 @@ class Engine:
  async def load_settings(self,login=None,migrate_legacy=False):
   # Every MT5 account owns an independent Telegram-managed profile.
   # A newly linked account starts from safe built-in defaults.
-  if login is None:
+  if login is None and self.gw is not None:
    account=self.gw.account()
-   login=int(account.login) if account else None
+   raw_login=getattr(account,'login',None) if account else None
+   login=int(raw_login) if raw_login is not None else None
   if login is None:
    await self._refresh_strategy_performance(force=True)
    return
