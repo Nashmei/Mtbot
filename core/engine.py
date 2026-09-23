@@ -4,6 +4,10 @@ from .config import settings
 from .models import TradeState,Side
 from .analyzer import Analyzer
 from .risk import Risk
+
+def _signal_key(strategy,side_value,signal_bar):
+ return (strategy,side_value,signal_bar)
+
 class Engine:
  def __init__(self,gw,db,notify):
   self.gw=gw
@@ -395,9 +399,8 @@ class Engine:
     return
 
    # بعد الإغلاق: مهلة قصيرة، ثم يجب أن تتجدد الإشارة قبل تكرار نفس الاستراتيجية/الاتجاه.
-   is_gold=symbol.upper().startswith('XAUUSD')
    signal_bar=int(m1['time'][-1]) if m1 is not None and len(m1) and sig.strategy=='ema_cross_scalp' else (int(m5['time'][-1]) if m5 is not None and len(m5) else int(ticks['time'][-1]//60*60))
-   signal_key=(sig.strategy,sig.side.value) if is_gold else (sig.strategy,sig.side.value,signal_bar)
+   signal_key=_signal_key(sig.strategy,sig.side.value,signal_bar)
    last_close=self.last_close_by_symbol.get(symbol,0)
    if last_close and time.time()-last_close<self.reentry_cooldown_seconds:
     await self._log_reject('REENTRY_REJECT',symbol,reason='COOLDOWN',strategy=sig.strategy,side=sig.side.value)
@@ -658,10 +661,7 @@ class Engine:
    initial_r=abs(fill-actual_sl)
 
    if initial_r<=0:
-    await self.db.log(
-     'INVALID_INITIAL_R',symbol,
-     ticket=pos.ticket,entry=fill,sl=actual_sl
-    )
+    await self._handle_invalid_initial_r(symbol,pos,fill,actual_sl)
     return
 
    t=TradeState(
@@ -682,6 +682,38 @@ class Engine:
 
    await self.db.log('OPEN',symbol,ticket=pos.ticket,entry=fill,sl=sl,tp=tp,volume=vol,side=sig.side.value,strategy=sig.strategy,regime=reg.value,confidence=float(sig.confidence),reason=sig.reason)
    asyncio.create_task(self._send_trade_chart(t,actual_risk,actual_risk_pct))
+
+ async def _handle_invalid_initial_r(self,symbol,pos,fill,actual_sl):
+  await self.db.log(
+   'INVALID_INITIAL_R',symbol,
+   ticket=pos.ticket,entry=fill,sl=actual_sl
+  )
+  close_res=self.gw.close(pos)
+  close_ok=(
+   close_res is not None
+   and getattr(close_res,'retcode',None) in (
+    mt5.TRADE_RETCODE_DONE,mt5.TRADE_RETCODE_DONE_PARTIAL
+   )
+  )
+  remaining=self.gw.position_by_ticket(pos.ticket)
+  await self.db.log(
+   'INVALID_INITIAL_R_EXIT',symbol,
+   ticket=pos.ticket,
+   retcode=getattr(close_res,'retcode',None),
+   comment=getattr(close_res,'comment','') if close_res is not None else ''
+  )
+  if not close_ok or remaining is not None:
+   self.running=False
+   await self.notify(
+    f'🚨 {symbol}: المركز {pos.ticket} لديه R ابتدائية غير صالحة '
+    'ولم يُغلق بالكامل؛ تم إيقاف المحرك لمنع مركز غير متتبع.'
+   )
+   return False
+  await self.notify(
+   f'⚠️ {symbol}: أُغلقت الصفقة {pos.ticket} حمايةً لأن '
+   'المسافة الابتدائية إلى وقف الخسارة غير صالحة.'
+  )
+  return True
 
  async def _trade_caption(self,t,current_price=None,pnl=None,closed=False):
   info=self.gw.info(t.symbol)
@@ -926,9 +958,8 @@ class Engine:
     await self.notify(caption,trade_ticket=t.ticket,trade_update=True)
 
    self.last_close_by_symbol[t.symbol]=time.time()
-   self.blocked_signal_by_symbol[t.symbol]=(
-    (t.strategy,t.side.value) if t.symbol.upper().startswith('XAUUSD')
-    else (t.strategy,t.side.value,t.signal_bar)
+   self.blocked_signal_by_symbol[t.symbol]=_signal_key(
+    t.strategy,t.side.value,t.signal_bar
    )
    self.trades.pop(t.ticket,None)
    self.trade_alert_meta.pop(t.ticket,None)

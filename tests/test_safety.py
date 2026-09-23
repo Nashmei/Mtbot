@@ -34,8 +34,13 @@ fake_config.settings = types.SimpleNamespace(
 )
 sys.modules["core.config"] = fake_config
 
-from core.analyzer import Analyzer
-from core.engine import Engine
+from core.analyzer import (
+    Analyzer,
+    _M5_REVERSAL_CLOSED_INDEX,
+    _M5_BREAKOUT_CLOSED_INDEX,
+    _M5_SIDEWAYS_OVERLAP_INDICES,
+)
+from core.engine import Engine, _signal_key
 from core.mt5_gateway import MT5Gateway
 from core.risk import Risk
 
@@ -330,6 +335,93 @@ class MarketSafetyTests(unittest.TestCase):
             engine = Engine(None, db, notify)
             self.assertTrue(await engine._daily_entry_allowed(types.SimpleNamespace(equity=1000)))
             self.assertFalse(await engine._daily_entry_allowed(types.SimpleNamespace(equity=980)))
+        asyncio.run(check())
+
+
+    # Stage 1 critical bug regressions.
+    def test_gold_m5_reversal_uses_latest_closed_bar(self):
+        self.assertEqual(_M5_REVERSAL_CLOSED_INDEX, -1)
+
+    def test_gold_breakout_uses_latest_closed_bar(self):
+        self.assertEqual(_M5_BREAKOUT_CLOSED_INDEX, -1)
+
+    def test_gold_m5_sideways_uses_latest_five_bar_window(self):
+        self.assertEqual(tuple(_M5_SIDEWAYS_OVERLAP_INDICES), (-5, -4, -3, -2, -1))
+
+    def test_gold_signal_key_matches_manage_and_scan(self):
+        manage_key = _signal_key("gold_scalp", "SELL", 1000)
+        scan_key = _signal_key("gold_scalp", "SELL", 1000)
+        self.assertEqual(manage_key, scan_key)
+        self.assertEqual(scan_key, ("gold_scalp", "SELL", 1000))
+
+    def test_gold_same_bar_signal_is_blocked(self):
+        blocked = _signal_key("gold_scalp", "SELL", 1000)
+        current = _signal_key("gold_scalp", "SELL", 1000)
+        self.assertEqual(blocked, current)
+
+    def test_gold_new_bar_signal_key_changes_after_cooldown(self):
+        blocked = _signal_key("gold_scalp", "SELL", 1000)
+        current = _signal_key("gold_scalp", "SELL", 1300)
+        self.assertNotEqual(blocked, current)
+
+    def test_invalid_r_successful_close_keeps_engine_running(self):
+        position = types.SimpleNamespace(ticket=91)
+        class Gateway:
+            def close(self, pos):
+                return types.SimpleNamespace(
+                    retcode=fake_mt5.TRADE_RETCODE_DONE, comment="done"
+                )
+            def position_by_ticket(self, ticket):
+                return None
+        async def notify(message, **kwargs):
+            pass
+        async def check():
+            engine = Engine(Gateway(), FakeDB(), notify)
+            engine.running = True
+            ok = await engine._handle_invalid_initial_r("XAUUSD", position, 100.0, 100.0)
+            self.assertTrue(ok)
+            self.assertTrue(engine.running)
+            self.assertEqual(
+                [event for event, _ in engine.db.events],
+                ["INVALID_INITIAL_R", "INVALID_INITIAL_R_EXIT"],
+            )
+        asyncio.run(check())
+
+    def test_invalid_r_failed_close_with_remaining_position_stops_engine(self):
+        position = types.SimpleNamespace(ticket=92)
+        class Gateway:
+            def close(self, pos):
+                return types.SimpleNamespace(retcode=10030, comment="rejected")
+            def position_by_ticket(self, ticket):
+                return position
+        async def notify(message, **kwargs):
+            pass
+        async def check():
+            engine = Engine(Gateway(), FakeDB(), notify)
+            engine.running = True
+            ok = await engine._handle_invalid_initial_r("XAUUSD", position, 100.0, 100.0)
+            self.assertFalse(ok)
+            self.assertFalse(engine.running)
+        asyncio.run(check())
+
+    def test_invalid_r_close_none_stops_engine(self):
+        position = types.SimpleNamespace(ticket=93)
+        class Gateway:
+            def close(self, pos):
+                return None
+            def position_by_ticket(self, ticket):
+                return position
+        async def notify(message, **kwargs):
+            pass
+        async def check():
+            engine = Engine(Gateway(), FakeDB(), notify)
+            engine.running = True
+            ok = await engine._handle_invalid_initial_r("XAUUSD", position, 100.0, 100.0)
+            self.assertFalse(ok)
+            self.assertFalse(engine.running)
+            exit_events = [data for event, data in engine.db.events if event == "INVALID_INITIAL_R_EXIT"]
+            self.assertEqual(exit_events[0]["retcode"], None)
+            self.assertEqual(exit_events[0]["comment"], "")
         asyncio.run(check())
 
 
