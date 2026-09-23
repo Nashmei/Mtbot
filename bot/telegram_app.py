@@ -43,7 +43,10 @@ class TelegramUI:
    db_key='daily_loss_limit_pct'; msg=f'✅ حد Equity اليومي: {v:g}%'+(' (معطل)' if v==0 else '')
   else:
    raise ValueError()
-  await self.e.save_setting(db_key,v)
+  if hasattr(self.e,'save_setting'):
+   await self.e.save_setting(db_key,v)
+  else:
+   await self.db.set(db_key,v)
   return msg
  def _cancel_menu_expiry(self):
   if self.menu_expiry_task and not self.menu_expiry_task.done(): self.menu_expiry_task.cancel()
