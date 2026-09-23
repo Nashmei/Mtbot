@@ -108,5 +108,57 @@ class StrategyPerformanceDBTests(unittest.TestCase):
                 pass
 
 
+    def test_reset_cutoff_starts_performance_from_zero_without_deleting_audit(self):
+        fd,path=tempfile.mkstemp(suffix='.db')
+        os.close(fd)
+        try:
+            db=DB(path)
+            asyncio.run(db.init())
+            con=sqlite3.connect(path)
+
+            con.execute(
+                'INSERT INTO audit(ts,event,symbol,details) VALUES(?,?,?,?)',
+                (1000.0,'OPEN','EURUSD',json.dumps({'strategy':'scalp_trend'})),
+            )
+            con.execute(
+                'INSERT INTO audit(ts,event,symbol,details) VALUES(?,?,?,?)',
+                (1000.5,'TP','EURUSD',json.dumps({'pnl':100.0})),
+            )
+            con.commit()
+            con.close()
+
+            before=asyncio.run(db.strategy_performance(50))
+            self.assertEqual(before['scalp_trend']['points'],3.0)
+
+            asyncio.run(db.reset_strategy_performance(at_ts=2000.0))
+            after=asyncio.run(db.strategy_performance(50))
+            self.assertEqual(after,{})
+
+            con=sqlite3.connect(path)
+            old_rows=con.execute(
+                "SELECT COUNT(*) FROM audit WHERE event IN ('OPEN','TP')"
+            ).fetchone()[0]
+            con.execute(
+                'INSERT INTO audit(ts,event,symbol,details) VALUES(?,?,?,?)',
+                (2001.0,'OPEN','EURUSD',json.dumps({'strategy':'scalp_trend'})),
+            )
+            con.execute(
+                'INSERT INTO audit(ts,event,symbol,details) VALUES(?,?,?,?)',
+                (2001.5,'SL','EURUSD',json.dumps({'pnl':-50.0})),
+            )
+            con.commit()
+            con.close()
+
+            self.assertEqual(old_rows,2)
+            fresh=asyncio.run(db.strategy_performance(50))
+            self.assertEqual(fresh['scalp_trend']['trades'],1)
+            self.assertEqual(fresh['scalp_trend']['points'],-1.0)
+        finally:
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+
+
 if __name__ == '__main__':
     unittest.main()
