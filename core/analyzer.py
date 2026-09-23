@@ -5,6 +5,7 @@ from .strategies import (
  scalp_breakout, ema_cross_scalp, scalp_trend, gold_scalp,
  m5_reversal_candidate, scalp_m5_reversal, scalp_reversion,
  scalp_sweep_reversal, scalp_squeeze_expansion,
+ diagnose_scalp_sweep_reversal, diagnose_scalp_squeeze_expansion,
 )
 
 # MT5Gateway.rates() starts at position 1, so -1 is the latest fully closed M5 bar.
@@ -172,6 +173,10 @@ class Analyzer:
   existing_winner=sig.strategy if sig is not None else None
   sweep_candidate=scalp_sweep_reversal(ctx)
   squeeze_candidate=scalp_squeeze_expansion(ctx)
+  opportunity_diagnostics=[
+   diagnose_scalp_sweep_reversal(ctx),
+   diagnose_scalp_squeeze_expansion(ctx),
+  ]
   opportunity_candidates=[]
   for candidate in (sweep_candidate,squeeze_candidate):
    if candidate is not None:
@@ -224,5 +229,5 @@ class Analyzer:
    'tick_momentum':round(float(tick_momentum),2),'micro_trend':round(float(micro_trend),2),
    'atr_points':round(float(atrp),2),'adx':round(float(adx),1),
    'di_plus':round(float(dp),1),'di_minus':round(float(dm),1),
-   'context_trend':round(float(context_trend),2),'m15_bias':m15_bias,'h1_bias':h1_bias,'retest_level':retest_level,'ema_cross_tf':ema_cross_tf,'ema_cross_gap':round(float(ema_cross_gap),2),'micro_z':round(float(micro_z),2),'momentum_min':round(float(momentum_min),2),'acceleration_min':round(float(acceleration_min),2),'opportunity_candidates':opportunity_candidates,'live':True
+   'context_trend':round(float(context_trend),2),'m15_bias':m15_bias,'h1_bias':h1_bias,'retest_level':retest_level,'ema_cross_tf':ema_cross_tf,'ema_cross_gap':round(float(ema_cross_gap),2),'micro_z':round(float(micro_z),2),'momentum_min':round(float(momentum_min),2),'acceleration_min':round(float(acceleration_min),2),'opportunity_candidates':opportunity_candidates,'opportunity_diagnostics':opportunity_diagnostics,'live':True
   }
