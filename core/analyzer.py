@@ -34,6 +34,8 @@ class Analyzer:
   if ticks is None or len(ticks)<80 or point<=0:
    return Regime.NO_TRADE,None,{'decision':'insufficient_ticks'}
 
+  is_gold=str(symbol or '').upper().startswith('XAUUSD')
+
   bid=np.asarray(ticks['bid'],dtype=float); ask=np.asarray(ticks['ask'],dtype=float)
   mid=(bid+ask)/2.; spreads=(ask-bid)/point
   good=spreads[np.isfinite(spreads)&(spreads>0)]
@@ -130,11 +132,12 @@ class Analyzer:
   # cannot create/disappear a crossover. M1 is primary; M5 is fallback.
   ema_cross_side=None; ema_cross_tf=None; ema_cross_gap=0.0
   cross_rates=rates_m1 if rates_m1 is not None and len(rates_m1)>=30 else rates
-  if cross_rates is not None and len(cross_rates)>=30:
+  if cross_rates is not None and len(cross_rates)>=(30 if is_gold else 31):
    cc=np.asarray(cross_rates['close'],float)
    # rates() already returns closed candles; compare the last two closed bars.
    ema9_now=self._ema(cc[-24:],9); ema21_now=self._ema(cc[-30:],21)
-   ema9_prev=self._ema(cc[-25:-1],9); ema21_prev=self._ema(cc[-30:-1],21)
+   ema9_prev=self._ema(cc[-25:-1],9)
+   ema21_prev=self._ema(cc[-30:-1] if is_gold else cc[-31:-1],21)
    cross_up=ema9_prev<=ema21_prev and ema9_now>ema21_now
    cross_dn=ema9_prev>=ema21_prev and ema9_now<ema21_now
    ema_cross_gap=abs(ema9_now-ema21_now)/point
@@ -158,8 +161,9 @@ class Analyzer:
   if have and len(rates)>=25:
    o=np.asarray(rates['open'],float); h=np.asarray(rates['high'],float)
    l=np.asarray(rates['low'],float); c=np.asarray(rates['close'],float)
-   # MT5 rates may include the forming bar: use -2 as the confirmed closed bar.
-   i=-2
+   # Gateway starts at bar position 1, so -1 is the latest closed bar.
+   # Retain the existing gold candle selection unchanged.
+   i=-2 if is_gold else -1
    body=abs(c[i]-o[i]); candle_range=max(h[i]-l[i],point)
    upper=h[i]-max(o[i],c[i]); lower=min(o[i],c[i])-l[i]
    m5_doji=body<=candle_range*.12
@@ -168,12 +172,13 @@ class Analyzer:
    prev_body_hi=max(o[i-1],c[i-1]); prev_body_lo=min(o[i-1],c[i-1])
    bull_engulf=c[i]>o[i] and c[i-1]<o[i-1] and o[i]<=prev_body_lo and c[i]>=prev_body_hi
    bear_engulf=c[i]<o[i] and c[i-1]>o[i-1] and o[i]>=prev_body_hi and c[i]<=prev_body_lo
-   prior_low=float(np.min(l[-22:-2])); prior_high=float(np.max(h[-22:-2]))
+   prior_end=-2 if is_gold else -1
+   prior_low=float(np.min(l[-22:prior_end])); prior_high=float(np.max(h[-22:prior_end]))
    sr_tol=max(atrp*.18*point,4*point)
    at_support=l[i]<=prior_low+sr_tol
    at_resistance=h[i]>=prior_high-sr_tol
-   recent_ranges=h[-8:-2]-l[-8:-2]
-   overlap=sum(1 for j in range(-7,-2) if h[j]>=l[j-1] and l[j]<=h[j-1])
+   recent_ranges=h[-8:prior_end]-l[-8:prior_end]
+   overlap=sum(1 for j in (range(-7,-2) if is_gold else range(-5,0)) if h[j]>=l[j-1] and l[j]<=h[j-1])
    m5_sideways=(float(np.mean(recent_ranges))/max(atrp*point,point)<.55 and overlap>=4)
    if not m5_doji and not m5_sideways:
     if at_support and (hammer or bull_engulf):
@@ -191,8 +196,9 @@ class Analyzer:
   if have and len(rates)>=25:
    o5=np.asarray(rates['open'],float); h5=np.asarray(rates['high'],float)
    l5=np.asarray(rates['low'],float); c5=np.asarray(rates['close'],float)
-   prior_hi=float(np.max(h5[-22:-2])); prior_lo=float(np.min(l5[-22:-2]))
-   closed_hi=float(h5[-2]); closed_lo=float(l5[-2]); closed_close=float(c5[-2])
+   closed_index=-2 if is_gold else -1
+   prior_hi=float(np.max(h5[-22:closed_index])); prior_lo=float(np.min(l5[-22:closed_index]))
+   closed_hi=float(h5[closed_index]); closed_lo=float(l5[closed_index]); closed_close=float(c5[closed_index])
    retest_tol=max(3.0*point,atrp*.15*point)
    broke_up=closed_hi>prior_hi and closed_close>prior_hi
    broke_dn=closed_lo<prior_lo and closed_close<prior_lo
@@ -215,7 +221,6 @@ class Analyzer:
    decision='scalp_breakout_retest'
 
   # Frequent EMA 9/21 crossover setup. XAUUSD is reserved for its dedicated gold_scalp logic.
-  is_gold=str(symbol or '').upper().startswith('XAUUSD')
   if sig is None and not is_gold and ema_cross_side is not None and strategy_allowed('ema_cross_scalp',ema_cross_side):
    side=ema_cross_side
    reg=Regime.TREND
