@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     max_spread_multiplier: float = 1.8
     max_spread_points: float = 0.0
     max_slippage_points: int = 10
+    min_sl_points: float = 10.0
     poll_interval_ms: int = 150
     max_tick_age_seconds: float = 15.0
     db_path: str = str(BASE_DIR/'storage'/'bot.db')
