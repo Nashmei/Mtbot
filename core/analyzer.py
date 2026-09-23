@@ -43,7 +43,7 @@ class Analyzer:
    dx.append(100*abs(pp-mm)/max(pp+mm,1e-12))
   return (float(np.mean(dx[-n:])) if dx else 0.),p,m
 
- def analyze(self,ticks,point,rates=None,symbol=None,rates_m15=None,rates_h1=None,rates_m1=None,strategy_performance=None):
+ def analyze(self,ticks,point,rates=None,symbol=None,rates_m15=None,rates_h1=None,rates_m1=None,strategy_performance=None,min_confidence=None):
   if ticks is None or len(ticks)<80 or point<=0:
    return Regime.NO_TRADE,None,{'decision':'insufficient_ticks'}
 
@@ -176,7 +176,7 @@ class Analyzer:
    if winner is not None:
     sig=winner['signal']; reg=winner['regime']; decision=winner['decision']
   else:
-   winner,ranked=choose_best(candidates,strategy_performance)
+   winner,ranked=choose_best(candidates,strategy_performance,min_confidence=min_confidence)
    selection_rows=[
     {
      'strategy':row['strategy'],
@@ -189,6 +189,7 @@ class Analyzer:
      'performance_reliability':row['performance_reliability'],
      'final_score':row['final_score'],
      'legacy_priority':row['legacy_priority'],
+     'eligible':bool(row.get('eligible',True)),
      'selected':bool(winner is not None and row['strategy']==winner['strategy'] and row['side']==winner['side']),
     }
     for row in ranked
