@@ -110,25 +110,9 @@ async def main():
      pass
 
  e=Engine(gw,db,notify)
- await e.load_settings()
-
- # استرجاع إعدادات Telegram المحفوظة
- import json
-
- raw_symbols=await db.get('symbols')
- if raw_symbols:
-  try:
-   saved=json.loads(raw_symbols)
-   if isinstance(saved,list) and saved:
-    e.symbols=[str(x) for x in saved]
-    e.symbol=e.symbols[0]
-  except Exception:
-   pass
- else:
-  old_symbol=await db.get('symbol')
-  if old_symbol:
-   e.symbols=[old_symbol]
-   e.symbol=old_symbol
+ # Existing saved account: migrate the old global Telegram preferences once
+ # into this account's profile. Newly linked accounts do not inherit them.
+ await e.load_settings(migrate_legacy=bool(gw.account()))
 
  ui=TelegramUI(e,db)
 

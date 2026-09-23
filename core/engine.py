@@ -16,10 +16,10 @@ class Engine:
   self.running=False
 
   # إعدادات قابلة للتحكم من Telegram
-  self.symbols=[settings.default_symbol]
-  self.symbol=settings.default_symbol
-  self.rr=settings.rr
-  self.risk_pct=settings.risk_per_trade_pct
+  self.symbols=['EURUSD']
+  self.symbol='EURUSD'
+  self.rr=3.0
+  self.risk_pct=0.25
   self.min_confidence=75.0
   self.protection_pct=45.0
   self.trailing_gap_pct=5.0
@@ -28,8 +28,8 @@ class Engine:
   self.last_close_by_symbol={}
   self.blocked_signal_by_symbol={}
   self.max_positions=1
-  self.max_consecutive_losses=settings.max_consecutive_losses
-  self.daily_loss_limit_pct=settings.daily_loss_limit_pct
+  self.max_consecutive_losses=3
+  self.daily_loss_limit_pct=2.0
   self.consecutive_losses=0
   self.loss_limit_notified=False
   self.daily_loss_notified=False
@@ -62,22 +62,108 @@ class Engine:
   # الإعدادات المحفوظة تُحمّل لاحقاً داخل سياق async
 
 
- async def load_settings(self):
-  try:
-   self.rr=float(await self.db.get('rr',self.rr))
-   self.risk_pct=float(await self.db.get('risk_pct',self.risk_pct))
-   self.min_confidence=float(await self.db.get('min_confidence',self.min_confidence))
-   self.protection_pct=float(await self.db.get('protection_pct',self.protection_pct))
-   self.trailing_gap_pct=float(await self.db.get('trailing_gap_pct',self.trailing_gap_pct))
-   self.max_trade_minutes=float(await self.db.get('max_trade_minutes',self.max_trade_minutes))
-   self.max_positions=int(await self.db.get('max_positions',self.max_positions))
-   self.max_consecutive_losses=int(await self.db.get('max_consecutive_losses',self.max_consecutive_losses))
-   self.daily_loss_limit_pct=float(await self.db.get('daily_loss_limit_pct',self.daily_loss_limit_pct))
-   self.consecutive_losses=max(0,int(await self.db.get('consecutive_losses',0)))
-  except (TypeError,ValueError):
-   pass
+ async def _account_key(self,key,login=None):
+  if login is None and self.gw is not None:
+   account=self.gw.account()
+   raw_login=getattr(account,'login',None) if account else None
+   login=int(raw_login) if raw_login is not None else None
+  return f'account:{int(login)}:{key}' if login is not None else key
+
+ async def save_setting(self,key,value):
+  db_key=await self._account_key(key)
+  if db_key is None:
+   raise RuntimeError('MT5 account is not connected')
+  await self.db.set(db_key,value)
+
+ async def load_settings(self,login=None,migrate_legacy=False):
+  # Every MT5 account owns an independent Telegram-managed profile.
+  # A newly linked account starts from safe built-in defaults.
+  if login is None and self.gw is not None:
+   account=self.gw.account()
+   raw_login=getattr(account,'login',None) if account else None
+   login=int(raw_login) if raw_login is not None else None
+  # Compatibility path for isolated/unit use without an MT5 account:
+  # load legacy global DB settings, but never use this path for a connected account.
+  if login is None:
+   legacy={
+    'rr':('rr',float),'risk_pct':('risk_pct',float),
+    'min_confidence':('min_confidence',float),
+    'protection_pct':('protection_pct',float),
+    'trailing_gap_pct':('trailing_gap_pct',float),
+    'max_trade_minutes':('max_trade_minutes',float),
+    'max_positions':('max_positions',int),
+    'max_consecutive_losses':('max_consecutive_losses',int),
+    'daily_loss_limit_pct':('daily_loss_limit_pct',float),
+    'consecutive_losses':('consecutive_losses',int),
+   }
+   for key,(attr,cast) in legacy.items():
+    raw=await self.db.get(key)
+    if raw is None:
+     continue
+    try:
+     value=cast(raw)
+     if key=='consecutive_losses': value=max(0,value)
+     setattr(self,attr,value)
+    except (TypeError,ValueError):
+     pass
+   await self._refresh_strategy_performance(force=True)
+   return
+
+  defaults={
+   'rr':3.0,'risk_pct':0.25,'min_confidence':75.0,
+   'protection_pct':45.0,'trailing_gap_pct':5.0,
+   'max_trade_minutes':10.0,'max_positions':1,
+   'max_consecutive_losses':3,'daily_loss_limit_pct':2.0,
+   'consecutive_losses':0,
+  }
+  attrs={
+   'rr':'rr','risk_pct':'risk_pct','min_confidence':'min_confidence',
+   'protection_pct':'protection_pct','trailing_gap_pct':'trailing_gap_pct',
+   'max_trade_minutes':'max_trade_minutes','max_positions':'max_positions',
+   'max_consecutive_losses':'max_consecutive_losses',
+   'daily_loss_limit_pct':'daily_loss_limit_pct',
+   'consecutive_losses':'consecutive_losses',
+  }
+  int_keys={'max_positions','max_consecutive_losses','consecutive_losses'}
+  for key,default in defaults.items():
+   scoped=await self._account_key(key,login)
+   raw=await self.db.get(scoped)
+   if raw is None and migrate_legacy:
+    raw=await self.db.get(key)
+    if raw is not None:
+     await self.db.set(scoped,raw)
+   if raw is None:
+    raw=default
+    await self.db.set(scoped,raw)
+   try:
+    value=int(raw) if key in int_keys else float(raw)
+    if key=='consecutive_losses': value=max(0,value)
+    setattr(self,attrs[key],value)
+   except (TypeError,ValueError):
+    setattr(self,attrs[key],default)
+
+  symbols_key=await self._account_key('symbols',login)
+  raw_symbols=await self.db.get(symbols_key)
+  if raw_symbols is None and migrate_legacy:
+   raw_symbols=await self.db.get('symbols')
+   if raw_symbols is not None:
+    await self.db.set(symbols_key,raw_symbols)
+  if raw_symbols:
+   try:
+    import json
+    saved=json.loads(raw_symbols)
+    if isinstance(saved,list) and saved:
+     self.symbols=[str(x) for x in saved]
+     self.symbol=self.symbols[0]
+   except Exception:
+    pass
+  else:
+   self.symbols=['EURUSD'];self.symbol='EURUSD'
+   import json
+   await self.db.set(symbols_key,json.dumps(self.symbols))
 
   await self._refresh_strategy_performance(force=True)
+
 
  async def _refresh_strategy_performance(self,force=False):
   now=time.monotonic()
@@ -300,12 +386,14 @@ class Engine:
   if self.daily_loss_limit_pct<=0:
    return True
   today=date.today().isoformat()
-  saved_day=await self.db.get('daily_equity_date')
-  baseline=float(await self.db.get('daily_equity_baseline',0) or 0)
+  day_key=await self._account_key('daily_equity_date')
+  baseline_key=await self._account_key('daily_equity_baseline')
+  saved_day=await self.db.get(day_key)
+  baseline=float(await self.db.get(baseline_key,0) or 0)
   if saved_day!=today or not math.isfinite(baseline) or baseline<=0:
    baseline=equity
-   await self.db.set('daily_equity_baseline',baseline)
-   await self.db.set('daily_equity_date',today)
+   await self.db.set(baseline_key,baseline)
+   await self.db.set(day_key,today)
    self.daily_loss_notified=False
   allowed=equity>baseline*(1-self.daily_loss_limit_pct/100.0)
   if not allowed and not self.daily_loss_notified:
@@ -1046,7 +1134,7 @@ class Engine:
      self.consecutive_losses+=1
     elif pnl > 0:
      self.consecutive_losses=0
-    await self.db.set("consecutive_losses",self.consecutive_losses)
+    await self.save_setting("consecutive_losses",self.consecutive_losses)
 
     await self.db.log(
      event,t.symbol,ticket=t.ticket,strategy=t.strategy,

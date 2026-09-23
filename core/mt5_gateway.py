@@ -60,13 +60,8 @@ class MT5Gateway:
 
     def connect(self):
         for attempt in range(self.MAX_RETRIES):
-            if settings.mt5_login and settings.mt5_password and settings.mt5_server:
-                res = self.login(settings.mt5_login, settings.mt5_password, settings.mt5_server)
-                if res[0]:  # success
-                    return res[2]  # account info
-            else:
-                if self.initialize_terminal():
-                    return mt5.account_info()
+            if self.initialize_terminal():
+                return mt5.account_info()
             if attempt < self.MAX_RETRIES - 1:
                 time.sleep(self.RETRY_DELAY)
         return None
