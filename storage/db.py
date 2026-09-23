@@ -16,8 +16,18 @@ class DB:
    async with d.execute('SELECT value FROM settings WHERE key=?',(k,)) as c:
     r=await c.fetchone(); return r[0] if r else default
 
+ async def reset_strategy_performance(self,at_ts=None):
+  reset_ts=float(time.time() if at_ts is None else at_ts)
+  await self.set('strategy_performance_reset_ts',reset_ts)
+  await self.log('STRATEGY_PERFORMANCE_RESET',reset_ts=reset_ts)
+  return reset_ts
+
  async def strategy_performance(self,window=50):
   window=max(1,min(int(window),200))
+  try:
+   reset_ts=float(await self.get('strategy_performance_reset_ts',0) or 0)
+  except (TypeError,ValueError):
+   reset_ts=0.0
   sql='''WITH opens AS (
    SELECT
     id,ts,symbol,
@@ -25,6 +35,7 @@ class DB:
     LEAD(ts) OVER (PARTITION BY symbol ORDER BY ts) AS next_open_ts
    FROM audit
    WHERE event='OPEN'
+     AND ts>=?
      AND json_extract(details,'$.strategy') IS NOT NULL
   ),
   paired AS (
@@ -66,7 +77,7 @@ class DB:
   GROUP BY strategy'''
   out={}
   async with aiosqlite.connect(self.path) as d:
-   async with d.execute(sql,(window,)) as cur:
+   async with d.execute(sql,(reset_ts,window)) as cur:
     async for strategy,trades,points,avg_points in cur:
      out[str(strategy)]={
       'trades':int(trades or 0),
