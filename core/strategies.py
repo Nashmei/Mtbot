@@ -327,6 +327,50 @@ SCALP_SQUEEZE_EXPANSION = {
     'sl_range_factor': .30,
 }
 
+def diagnose_scalp_sweep_reversal(ctx):
+    rates=ctx['rates']; n=SCALP_SWEEP_REVERSAL['lookback']
+    out={'strategy':SCALP_SWEEP_REVERSAL['name']}
+    if not ctx['have'] or rates is None or len(rates)<n+2:
+        out.update({'stage':'insufficient_data','have':bool(ctx['have']),'bars':0 if rates is None else len(rates),'required_bars':n+2})
+        return out
+    point=ctx['point']
+    o=np.asarray(rates['open'],float); h=np.asarray(rates['high'],float)
+    l=np.asarray(rates['low'],float); c=np.asarray(rates['close'],float)
+    prior_hi=float(np.max(h[-(n+1):-1])); prior_lo=float(np.min(l[-(n+1):-1]))
+    body=abs(float(c[-1]-o[-1])); body_ref=max(body,point)
+    upper=float(h[-1]-max(o[-1],c[-1])); lower=float(min(o[-1],c[-1])-l[-1])
+    swept_low=bool(l[-1]<prior_lo and c[-1]>prior_lo)
+    swept_high=bool(h[-1]>prior_hi and c[-1]<prior_hi)
+    lower_ratio=float(lower/body_ref); upper_ratio=float(upper/body_ref)
+    wick_required=float(SCALP_SWEEP_REVERSAL['wick_body_ratio'])
+    buy_wick=bool(swept_low and lower_ratio>=wick_required)
+    sell_wick=bool(swept_high and upper_ratio>=wick_required)
+    fast=float(ctx['tick_momentum_fast']); h1=int(ctx['h1_bias'])
+    buy_live=fast>0; sell_live=fast<0
+    buy_h1=h1 in (0,1); sell_h1=h1 in (0,-1)
+    buy_allowed=bool(ctx['strategy_allowed'](SCALP_SWEEP_REVERSAL['name'],Side.BUY))
+    sell_allowed=bool(ctx['strategy_allowed'](SCALP_SWEEP_REVERSAL['name'],Side.SELL))
+    candidate_side='BUY' if buy_wick and buy_live and buy_h1 and buy_allowed else ('SELL' if sell_wick and sell_live and sell_h1 and sell_allowed else None)
+    failed=[]
+    if not (swept_low or swept_high): failed.append('no_sweep')
+    if swept_low and not buy_wick: failed.append('buy_wick_ratio')
+    if swept_high and not sell_wick: failed.append('sell_wick_ratio')
+    if buy_wick and not buy_live: failed.append('buy_live_momentum')
+    if sell_wick and not sell_live: failed.append('sell_live_momentum')
+    if buy_wick and not buy_h1: failed.append('buy_h1_guard')
+    if sell_wick and not sell_h1: failed.append('sell_h1_guard')
+    if buy_wick and buy_live and buy_h1 and not buy_allowed: failed.append('buy_strategy_allowed')
+    if sell_wick and sell_live and sell_h1 and not sell_allowed: failed.append('sell_strategy_allowed')
+    out.update({
+        'stage':'candidate' if candidate_side else 'blocked','candidate_side':candidate_side,
+        'swept_low':swept_low,'swept_high':swept_high,
+        'lower_wick_ratio':round(lower_ratio,3),'upper_wick_ratio':round(upper_ratio,3),'wick_required':wick_required,
+        'tick_momentum_fast':round(fast,3),'h1_bias':h1,
+        'buy_allowed':buy_allowed,'sell_allowed':sell_allowed,'failed':failed,
+    })
+    return out
+
+
 def scalp_squeeze_expansion(ctx):
     rates=ctx['rates']
     need=SCALP_SQUEEZE_EXPANSION['long_atr']+2
@@ -365,3 +409,52 @@ def scalp_squeeze_expansion(ctx):
     score=SCALP_SQUEEZE_EXPANSION['score_base']+min(7,compression*12)+min(7,max(0.,expansion-SCALP_SQUEEZE_EXPANSION['expansion_body_atr'])*5)
     slp=max(10.,min(SCALP_SQUEEZE_EXPANSION['sl_atr_max']*atrp,max(SCALP_SQUEEZE_EXPANSION['sl_atr_min']*atrp,ctx['tick_range']*SCALP_SQUEEZE_EXPANSION['sl_range_factor'])))
     return Signal(side,SCALP_SQUEEZE_EXPANSION['name'],min(SCALP_SQUEEZE_EXPANSION['score_cap'],score/100.),slp,'M5 volatility squeeze + closed-bar expansion + live momentum confirmation')
+
+
+def diagnose_scalp_squeeze_expansion(ctx):
+    rates=ctx['rates']; need=SCALP_SQUEEZE_EXPANSION['long_atr']+2
+    out={'strategy':SCALP_SQUEEZE_EXPANSION['name']}
+    if not ctx['have'] or rates is None or len(rates)<need:
+        out.update({'stage':'insufficient_data','have':bool(ctx['have']),'bars':0 if rates is None else len(rates),'required_bars':need})
+        return out
+    point=ctx['point']
+    o=np.asarray(rates['open'],float); h=np.asarray(rates['high'],float)
+    l=np.asarray(rates['low'],float); c=np.asarray(rates['close'],float)
+    prev=c[:-1]
+    tr=np.maximum(h[1:]-l[1:],np.maximum(np.abs(h[1:]-prev),np.abs(l[1:]-prev)))
+    prior_tr=tr[:-1]
+    short_n=SCALP_SQUEEZE_EXPANSION['short_atr']; long_n=SCALP_SQUEEZE_EXPANSION['long_atr']
+    if len(prior_tr)<long_n:
+        out.update({'stage':'insufficient_tr','tr_bars':len(prior_tr),'required_tr_bars':long_n})
+        return out
+    atr_short=float(np.mean(prior_tr[-short_n:])); atr_long=float(np.mean(prior_tr[-long_n:]))
+    ratio=float(atr_short/atr_long) if atr_long>0 else float('inf')
+    squeeze_required=float(SCALP_SQUEEZE_EXPANSION['squeeze_ratio'])
+    squeeze_ok=bool(atr_long>0 and ratio<squeeze_required)
+    body=float(c[-1]-o[-1]); body_abs=abs(body)
+    expansion_required=float(SCALP_SQUEEZE_EXPANSION['expansion_body_atr'])
+    expansion_ratio=float(body_abs/max(atr_short,point))
+    expansion_ok=bool(expansion_ratio>=expansion_required)
+    tm=float(ctx['tick_momentum']); micro=float(ctx['micro_trend']); h1=int(ctx['h1_bias'])
+    buy_direction=body>0; sell_direction=body<0
+    buy_live=tm>0 and micro>0 and bool(ctx['context_up']) and h1 in (0,1)
+    sell_live=tm<0 and micro<0 and bool(ctx['context_dn']) and h1 in (0,-1)
+    buy_allowed=bool(ctx['strategy_allowed'](SCALP_SQUEEZE_EXPANSION['name'],Side.BUY))
+    sell_allowed=bool(ctx['strategy_allowed'](SCALP_SQUEEZE_EXPANSION['name'],Side.SELL))
+    candidate_side='BUY' if squeeze_ok and expansion_ok and buy_direction and buy_live and buy_allowed else ('SELL' if squeeze_ok and expansion_ok and sell_direction and sell_live and sell_allowed else None)
+    failed=[]
+    if not squeeze_ok: failed.append('squeeze_ratio')
+    if not expansion_ok: failed.append('expansion_body')
+    if buy_direction and not buy_live: failed.append('buy_live_context')
+    if sell_direction and not sell_live: failed.append('sell_live_context')
+    if buy_direction and buy_live and not buy_allowed: failed.append('buy_strategy_allowed')
+    if sell_direction and sell_live and not sell_allowed: failed.append('sell_strategy_allowed')
+    out.update({
+        'stage':'candidate' if candidate_side else 'blocked','candidate_side':candidate_side,
+        'squeeze_ratio':round(ratio,4) if np.isfinite(ratio) else None,'squeeze_required_lt':squeeze_required,'squeeze_ok':squeeze_ok,
+        'expansion_ratio':round(expansion_ratio,4),'expansion_required_gte':expansion_required,'expansion_ok':expansion_ok,
+        'body_direction':'BUY' if buy_direction else ('SELL' if sell_direction else 'FLAT'),
+        'tick_momentum':round(tm,3),'micro_trend':round(micro,3),'context_up':bool(ctx['context_up']),'context_dn':bool(ctx['context_dn']),'h1_bias':h1,
+        'buy_allowed':buy_allowed,'sell_allowed':sell_allowed,'failed':failed,
+    })
+    return out
