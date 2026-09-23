@@ -361,12 +361,14 @@ class Engine:
   if self.daily_loss_limit_pct<=0:
    return True
   today=date.today().isoformat()
-  saved_day=await self.db.get('daily_equity_date')
-  baseline=float(await self.db.get('daily_equity_baseline',0) or 0)
+  day_key=await self._account_key('daily_equity_date')
+  baseline_key=await self._account_key('daily_equity_baseline')
+  saved_day=await self.db.get(day_key)
+  baseline=float(await self.db.get(baseline_key,0) or 0)
   if saved_day!=today or not math.isfinite(baseline) or baseline<=0:
    baseline=equity
-   await self.db.set('daily_equity_baseline',baseline)
-   await self.db.set('daily_equity_date',today)
+   await self.db.set(baseline_key,baseline)
+   await self.db.set(day_key,today)
    self.daily_loss_notified=False
   allowed=equity>baseline*(1-self.daily_loss_limit_pct/100.0)
   if not allowed and not self.daily_loss_notified:
