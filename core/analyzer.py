@@ -126,7 +126,13 @@ class Analyzer:
    # markets; their own entry rules still decide the actual signal.
    return True
 
-  sig=None; reg=Regime.RANGE; decision='waiting_live_momentum'
+  # Keep the reported regime aligned with the router even while no signal exists.
+  # This is diagnostic/display state only; it does not change entry eligibility.
+  reg=(Regime.TREND if market_mode=='trend' else
+       Regime.RANGE if market_mode=='range' else
+       Regime.VOLATILE if market_mode=='expansion' else Regime.RANGE)
+  sig=None; decision='waiting_live_momentum'
+  blockers=[]
 
   # Frequent EMA crossover scalp. Use CLOSED candles only so a forming candle
   # cannot create/disappear a crossover. M1 is primary; M5 is fallback.
@@ -289,6 +295,22 @@ class Analyzer:
     decision='scalp_reversion'
 
   if sig is None:
+   # Explain *why* the current scan did not become a trade. These flags are
+   # observational only and intentionally do not participate in entry logic.
+   if clear_trend:
+    blockers.append('clear_trend')
+   if not (live_up or live_dn):
+    blockers.append('live_direction_missing')
+   if abs(tick_momentum)<max(1.25,atrp*.07):
+    blockers.append('momentum_below_trend_threshold')
+   if abs(tick_momentum_fast)<max(1.0,atrp*.035):
+    blockers.append('acceleration_below_trend_threshold')
+   if m15_bias and h1_bias and m15_bias!=h1_bias:
+    blockers.append('m15_h1_conflict')
+   if is_gold and m15_bias and h1_bias and m15_bias==h1_bias:
+    want=1 if tick_momentum>0 else (-1 if tick_momentum<0 else 0)
+    if want and want!=m15_bias:
+     blockers.append('gold_live_vs_htf_conflict')
    if m5_doji:
     reg=Regime.NO_TRADE; decision='m5_doji_no_trade'
    elif m5_sideways:
@@ -301,7 +323,7 @@ class Analyzer:
    elif tick_range>max(8.,atrp*.8):
     reg=Regime.VOLATILE; decision='volatile_no_direction'
   return reg,sig,{
-   'decision':decision,'market_mode':market_mode,'price':round(live,8),'spread_points':round(spread,1),
+   'decision':decision,'blockers':blockers,'market_mode':market_mode,'price':round(live,8),'spread_points':round(spread,1),
    'spread_ratio':round(spread_ratio,2),'tick_momentum_fast':round(float(tick_momentum_fast),2),
    'tick_momentum':round(float(tick_momentum),2),'micro_trend':round(float(micro_trend),2),
    'atr_points':round(float(atrp),2),'adx':round(float(adx),1),
