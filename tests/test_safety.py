@@ -34,8 +34,13 @@ fake_config.settings = types.SimpleNamespace(
 )
 sys.modules["core.config"] = fake_config
 
-from core.analyzer import Analyzer
-from core.engine import Engine
+from core.analyzer import (
+    Analyzer,
+    _M5_REVERSAL_CLOSED_INDEX,
+    _M5_BREAKOUT_CLOSED_INDEX,
+    _M5_SIDEWAYS_OVERLAP_INDICES,
+)
+from core.engine import Engine, _signal_key
 from core.mt5_gateway import MT5Gateway
 from core.risk import Risk
 
@@ -330,6 +335,157 @@ class MarketSafetyTests(unittest.TestCase):
             engine = Engine(None, db, notify)
             self.assertTrue(await engine._daily_entry_allowed(types.SimpleNamespace(equity=1000)))
             self.assertFalse(await engine._daily_entry_allowed(types.SimpleNamespace(equity=980)))
+        asyncio.run(check())
+
+
+    # Stage 1 critical bug regressions.
+    def test_gold_m5_reversal_uses_latest_closed_bar(self):
+        self.assertEqual(_M5_REVERSAL_CLOSED_INDEX, -1)
+
+    def test_gold_breakout_uses_latest_closed_bar(self):
+        self.assertEqual(_M5_BREAKOUT_CLOSED_INDEX, -1)
+
+    def test_gold_m5_sideways_uses_latest_five_bar_window(self):
+        self.assertEqual(tuple(_M5_SIDEWAYS_OVERLAP_INDICES), (-5, -4, -3, -2, -1))
+
+    def test_gold_signal_key_matches_manage_and_scan(self):
+        manage_key = _signal_key("gold_scalp", "SELL", 1000)
+        scan_key = _signal_key("gold_scalp", "SELL", 1000)
+        self.assertEqual(manage_key, scan_key)
+        self.assertEqual(scan_key, ("gold_scalp", "SELL", 1000))
+
+    def test_gold_same_bar_signal_is_blocked(self):
+        blocked = _signal_key("gold_scalp", "SELL", 1000)
+        current = _signal_key("gold_scalp", "SELL", 1000)
+        self.assertEqual(blocked, current)
+
+    def test_gold_new_bar_signal_key_changes_after_cooldown(self):
+        blocked = _signal_key("gold_scalp", "SELL", 1000)
+        current = _signal_key("gold_scalp", "SELL", 1300)
+        self.assertNotEqual(blocked, current)
+
+    def test_invalid_r_successful_close_keeps_engine_running(self):
+        position = types.SimpleNamespace(ticket=91)
+        class Gateway:
+            def close(self, pos):
+                return types.SimpleNamespace(
+                    retcode=fake_mt5.TRADE_RETCODE_DONE, comment="done"
+                )
+            def position_by_ticket(self, ticket):
+                return None
+        async def notify(message, **kwargs):
+            pass
+        async def check():
+            engine = Engine(Gateway(), FakeDB(), notify)
+            engine.running = True
+            ok = await engine._handle_invalid_initial_r("XAUUSD", position, 100.0, 100.0)
+            self.assertTrue(ok)
+            self.assertTrue(engine.running)
+            self.assertEqual(
+                [event for event, _ in engine.db.events],
+                ["INVALID_INITIAL_R", "INVALID_INITIAL_R_EXIT"],
+            )
+        asyncio.run(check())
+
+    def test_invalid_r_failed_close_with_remaining_position_stops_engine(self):
+        position = types.SimpleNamespace(ticket=92)
+        class Gateway:
+            def close(self, pos):
+                return types.SimpleNamespace(retcode=10030, comment="rejected")
+            def position_by_ticket(self, ticket):
+                return position
+        async def notify(message, **kwargs):
+            pass
+        async def check():
+            engine = Engine(Gateway(), FakeDB(), notify)
+            engine.running = True
+            ok = await engine._handle_invalid_initial_r("XAUUSD", position, 100.0, 100.0)
+            self.assertFalse(ok)
+            self.assertFalse(engine.running)
+        asyncio.run(check())
+
+    def test_invalid_r_close_none_stops_engine(self):
+        position = types.SimpleNamespace(ticket=93)
+        class Gateway:
+            def close(self, pos):
+                return None
+            def position_by_ticket(self, ticket):
+                return position
+        async def notify(message, **kwargs):
+            pass
+        async def check():
+            engine = Engine(Gateway(), FakeDB(), notify)
+            engine.running = True
+            ok = await engine._handle_invalid_initial_r("XAUUSD", position, 100.0, 100.0)
+            self.assertFalse(ok)
+            self.assertFalse(engine.running)
+            exit_events = [data for event, data in engine.db.events if event == "INVALID_INITIAL_R_EXIT"]
+            self.assertEqual(exit_events[0]["retcode"], None)
+            self.assertEqual(exit_events[0]["comment"], "")
+        asyncio.run(check())
+
+
+    def test_daily_equity_limit_zero_from_db_disables_limit(self):
+        db = FakeDB()
+        db.settings["daily_loss_limit_pct"] = "0"
+        async def notify(message, **kwargs):
+            pass
+        async def check():
+            engine = Engine(None, db, notify)
+            await engine.load_settings()
+            self.assertEqual(engine.daily_loss_limit_pct, 0.0)
+            self.assertTrue(await engine._daily_entry_allowed(types.SimpleNamespace(equity=1)))
+            self.assertFalse(any(event == "DAILY_EQUITY_LIMIT" for event, _ in db.events))
+        asyncio.run(check())
+
+    def test_daily_equity_limit_db_value_survives_engine_restart(self):
+        db = FakeDB()
+        db.settings["daily_loss_limit_pct"] = "4.5"
+        async def notify(message, **kwargs):
+            pass
+        async def check():
+            first = Engine(None, db, notify)
+            await first.load_settings()
+            second = Engine(None, db, notify)
+            await second.load_settings()
+            self.assertEqual(first.daily_loss_limit_pct, 4.5)
+            self.assertEqual(second.daily_loss_limit_pct, 4.5)
+        asyncio.run(check())
+
+
+    def test_telegram_setting_writer_updates_engine_and_db(self):
+        from bot.telegram_app import TelegramUI
+        db = FakeDB()
+        engine = types.SimpleNamespace(
+            risk_pct=2.0, rr=1.5, min_confidence=75.0, protection_pct=40.0,
+            max_trade_minutes=45.0, max_positions=5, max_consecutive_losses=3,
+            daily_loss_limit_pct=2.0, loss_limit_notified=True, daily_loss_notified=True,
+        )
+        async def check():
+            ui = TelegramUI(engine, db)
+            cases = (
+                ("risk", "3.5", "risk_pct", 3.5),
+                ("rr", "2.5", "rr", 2.5),
+                ("confidence", "80", "min_confidence", 80.0),
+                ("protection", "50", "protection_pct", 50.0),
+                ("maxduration", "60", "max_trade_minutes", 60.0),
+                ("maxpos", "4", "max_positions", 4),
+                ("maxloss", "0", "max_consecutive_losses", 0),
+                ("dailyloss", "0", "daily_loss_limit_pct", 0.0),
+            )
+            for key, raw, db_key, expected in cases:
+                await ui._apply_setting(key, raw)
+                self.assertEqual(db.settings[db_key], expected)
+            self.assertEqual(engine.risk_pct, 3.5)
+            self.assertEqual(engine.rr, 2.5)
+            self.assertEqual(engine.min_confidence, 80.0)
+            self.assertEqual(engine.protection_pct, 50.0)
+            self.assertEqual(engine.max_trade_minutes, 60.0)
+            self.assertEqual(engine.max_positions, 4)
+            self.assertEqual(engine.max_consecutive_losses, 0)
+            self.assertEqual(engine.daily_loss_limit_pct, 0.0)
+            self.assertFalse(engine.loss_limit_notified)
+            self.assertFalse(engine.daily_loss_notified)
         asyncio.run(check())
 
 

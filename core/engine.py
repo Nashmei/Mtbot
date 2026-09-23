@@ -4,6 +4,10 @@ from .config import settings
 from .models import TradeState,Side
 from .analyzer import Analyzer
 from .risk import Risk
+
+def _signal_key(strategy,side_value,signal_bar):
+ return (strategy,side_value,signal_bar)
+
 class Engine:
  def __init__(self,gw,db,notify):
   self.gw=gw
@@ -25,6 +29,7 @@ class Engine:
   self.blocked_signal_by_symbol={}
   self.max_positions=1
   self.max_consecutive_losses=settings.max_consecutive_losses
+  self.daily_loss_limit_pct=settings.daily_loss_limit_pct
   self.consecutive_losses=0
   self.loss_limit_notified=False
   self.daily_loss_notified=False
@@ -64,6 +69,7 @@ class Engine:
    self.max_trade_minutes=float(await self.db.get('max_trade_minutes',self.max_trade_minutes))
    self.max_positions=int(await self.db.get('max_positions',self.max_positions))
    self.max_consecutive_losses=int(await self.db.get('max_consecutive_losses',self.max_consecutive_losses))
+   self.daily_loss_limit_pct=float(await self.db.get('daily_loss_limit_pct',self.daily_loss_limit_pct))
    self.consecutive_losses=max(0,int(await self.db.get('consecutive_losses',0)))
   except (TypeError,ValueError):
    pass
@@ -85,6 +91,8 @@ class Engine:
    f'🛡 الحماية: {self.protection_pct:g}%\n'
    f'⏱ حد الصفقة: {self.max_trade_minutes:g} دقيقة\n'
    f'❌ الخسائر المتتالية: {self.consecutive_losses} / {self.max_consecutive_losses}\n'
+   f'📉 حد Equity اليومي: {self.daily_loss_limit_pct:g}%'
+   f'{" (معطل)" if self.daily_loss_limit_pct<=0 else ""}\n'
    f'⚖️ العائد/المخاطرة: 1:{self.rr:g}\n'
    f'💰 Equity: {a.equity:.2f} {a.currency}'
   )
@@ -94,8 +102,8 @@ class Engine:
   if not (math.isfinite(self.risk_pct) and 0<self.risk_pct<=50
           and math.isfinite(self.rr) and .5<=self.rr<=10
           and 1<=self.max_positions<=10
-          and math.isfinite(settings.daily_loss_limit_pct)
-          and 0<=settings.daily_loss_limit_pct<=100):
+          and math.isfinite(self.daily_loss_limit_pct)
+          and 0<=self.daily_loss_limit_pct<=100):
    await self.notify('⚠️ إعدادات المخاطرة أو العائد أو حد المراكز غير صالحة.')
    return False
   account=self.gw.account()
@@ -134,7 +142,8 @@ class Engine:
    risk_pct=self.risk_pct,
    protection_pct=self.protection_pct,
    max_positions=self.max_positions,
-   max_consecutive_losses=self.max_consecutive_losses
+   max_consecutive_losses=self.max_consecutive_losses,
+   daily_loss_limit_pct=self.daily_loss_limit_pct
   )
 
   await self.notify(
@@ -271,7 +280,7 @@ class Engine:
   equity=float(getattr(account,'equity',0) or 0)
   if not math.isfinite(equity) or equity<=0:
    return False
-  if settings.daily_loss_limit_pct<=0:
+  if self.daily_loss_limit_pct<=0:
    return True
   today=date.today().isoformat()
   saved_day=await self.db.get('daily_equity_date')
@@ -281,10 +290,10 @@ class Engine:
    await self.db.set('daily_equity_baseline',baseline)
    await self.db.set('daily_equity_date',today)
    self.daily_loss_notified=False
-  allowed=equity>baseline*(1-settings.daily_loss_limit_pct/100.0)
+  allowed=equity>baseline*(1-self.daily_loss_limit_pct/100.0)
   if not allowed and not self.daily_loss_notified:
    self.daily_loss_notified=True
-   await self.db.log('DAILY_EQUITY_LIMIT',equity=equity,baseline=baseline,limit_pct=settings.daily_loss_limit_pct)
+   await self.db.log('DAILY_EQUITY_LIMIT',equity=equity,baseline=baseline,limit_pct=self.daily_loss_limit_pct)
    await self.notify('🛑 توقف الدخول: حد انخفاض Equity اليومي. تستمر إدارة المراكز المفتوحة.')
   return allowed
 
@@ -395,9 +404,8 @@ class Engine:
     return
 
    # بعد الإغلاق: مهلة قصيرة، ثم يجب أن تتجدد الإشارة قبل تكرار نفس الاستراتيجية/الاتجاه.
-   is_gold=symbol.upper().startswith('XAUUSD')
    signal_bar=int(m1['time'][-1]) if m1 is not None and len(m1) and sig.strategy=='ema_cross_scalp' else (int(m5['time'][-1]) if m5 is not None and len(m5) else int(ticks['time'][-1]//60*60))
-   signal_key=(sig.strategy,sig.side.value) if is_gold else (sig.strategy,sig.side.value,signal_bar)
+   signal_key=_signal_key(sig.strategy,sig.side.value,signal_bar)
    last_close=self.last_close_by_symbol.get(symbol,0)
    if last_close and time.time()-last_close<self.reentry_cooldown_seconds:
     await self._log_reject('REENTRY_REJECT',symbol,reason='COOLDOWN',strategy=sig.strategy,side=sig.side.value)
@@ -658,10 +666,7 @@ class Engine:
    initial_r=abs(fill-actual_sl)
 
    if initial_r<=0:
-    await self.db.log(
-     'INVALID_INITIAL_R',symbol,
-     ticket=pos.ticket,entry=fill,sl=actual_sl
-    )
+    await self._handle_invalid_initial_r(symbol,pos,fill,actual_sl)
     return
 
    t=TradeState(
@@ -682,6 +687,38 @@ class Engine:
 
    await self.db.log('OPEN',symbol,ticket=pos.ticket,entry=fill,sl=sl,tp=tp,volume=vol,side=sig.side.value,strategy=sig.strategy,regime=reg.value,confidence=float(sig.confidence),reason=sig.reason)
    asyncio.create_task(self._send_trade_chart(t,actual_risk,actual_risk_pct))
+
+ async def _handle_invalid_initial_r(self,symbol,pos,fill,actual_sl):
+  await self.db.log(
+   'INVALID_INITIAL_R',symbol,
+   ticket=pos.ticket,entry=fill,sl=actual_sl
+  )
+  close_res=self.gw.close(pos)
+  close_ok=(
+   close_res is not None
+   and getattr(close_res,'retcode',None) in (
+    mt5.TRADE_RETCODE_DONE,mt5.TRADE_RETCODE_DONE_PARTIAL
+   )
+  )
+  remaining=self.gw.position_by_ticket(pos.ticket)
+  await self.db.log(
+   'INVALID_INITIAL_R_EXIT',symbol,
+   ticket=pos.ticket,
+   retcode=getattr(close_res,'retcode',None),
+   comment=getattr(close_res,'comment','') if close_res is not None else ''
+  )
+  if not close_ok or remaining is not None:
+   self.running=False
+   await self.notify(
+    f'🚨 {symbol}: المركز {pos.ticket} لديه R ابتدائية غير صالحة '
+    'ولم يُغلق بالكامل؛ تم إيقاف المحرك لمنع مركز غير متتبع.'
+   )
+   return False
+  await self.notify(
+   f'⚠️ {symbol}: أُغلقت الصفقة {pos.ticket} حمايةً لأن '
+   'المسافة الابتدائية إلى وقف الخسارة غير صالحة.'
+  )
+  return True
 
  async def _trade_caption(self,t,current_price=None,pnl=None,closed=False):
   info=self.gw.info(t.symbol)
@@ -926,9 +963,8 @@ class Engine:
     await self.notify(caption,trade_ticket=t.ticket,trade_update=True)
 
    self.last_close_by_symbol[t.symbol]=time.time()
-   self.blocked_signal_by_symbol[t.symbol]=(
-    (t.strategy,t.side.value) if t.symbol.upper().startswith('XAUUSD')
-    else (t.strategy,t.side.value,t.signal_bar)
+   self.blocked_signal_by_symbol[t.symbol]=_signal_key(
+    t.strategy,t.side.value,t.signal_bar
    )
    self.trades.pop(t.ticket,None)
    self.trade_alert_meta.pop(t.ticket,None)

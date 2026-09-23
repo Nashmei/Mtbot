@@ -2,6 +2,12 @@ import time
 import numpy as np
 from .models import Regime, Signal, Side
 
+# MT5Gateway.rates() starts at position 1, so -1 is the latest fully closed M5 bar.
+_M5_REVERSAL_CLOSED_INDEX=-1
+_M5_BREAKOUT_CLOSED_INDEX=-1
+# XAUUSD intentionally moves its sideways window two bars forward with the -1 unification.
+_M5_SIDEWAYS_OVERLAP_INDICES=range(-5,0)
+
 class Analyzer:
  def _ema(self,a,n):
   a=np.asarray(a,dtype=float)
@@ -179,9 +185,8 @@ class Analyzer:
   if have and len(rates)>=25:
    o=np.asarray(rates['open'],float); h=np.asarray(rates['high'],float)
    l=np.asarray(rates['low'],float); c=np.asarray(rates['close'],float)
-   # Gateway starts at bar position 1, so -1 is the latest closed bar.
-   # Retain the existing gold candle selection unchanged.
-   i=-2 if is_gold else -1
+   # Gateway starts at bar position 1, so -1 is the latest closed bar for every symbol.
+   i=_M5_REVERSAL_CLOSED_INDEX
    body=abs(c[i]-o[i]); candle_range=max(h[i]-l[i],point)
    upper=h[i]-max(o[i],c[i]); lower=min(o[i],c[i])-l[i]
    m5_doji=body<=candle_range*.12
@@ -190,13 +195,13 @@ class Analyzer:
    prev_body_hi=max(o[i-1],c[i-1]); prev_body_lo=min(o[i-1],c[i-1])
    bull_engulf=c[i]>o[i] and c[i-1]<o[i-1] and o[i]<=prev_body_lo and c[i]>=prev_body_hi
    bear_engulf=c[i]<o[i] and c[i-1]>o[i-1] and o[i]>=prev_body_hi and c[i]<=prev_body_lo
-   prior_end=-2 if is_gold else -1
+   prior_end=-1
    prior_low=float(np.min(l[-22:prior_end])); prior_high=float(np.max(h[-22:prior_end]))
    sr_tol=max(atrp*.18*point,4*point)
    at_support=l[i]<=prior_low+sr_tol
    at_resistance=h[i]>=prior_high-sr_tol
    recent_ranges=h[-8:prior_end]-l[-8:prior_end]
-   overlap=sum(1 for j in (range(-7,-2) if is_gold else range(-5,0)) if h[j]>=l[j-1] and l[j]<=h[j-1])
+   overlap=sum(1 for j in _M5_SIDEWAYS_OVERLAP_INDICES if h[j]>=l[j-1] and l[j]<=h[j-1])
    m5_sideways=(float(np.mean(recent_ranges))/max(atrp*point,point)<.55 and overlap>=4)
    if not m5_doji and not m5_sideways:
     if at_support and (hammer or bull_engulf):
@@ -214,7 +219,7 @@ class Analyzer:
   if have and len(rates)>=25:
    o5=np.asarray(rates['open'],float); h5=np.asarray(rates['high'],float)
    l5=np.asarray(rates['low'],float); c5=np.asarray(rates['close'],float)
-   closed_index=-2 if is_gold else -1
+   closed_index=_M5_BREAKOUT_CLOSED_INDEX
    prior_hi=float(np.max(h5[-22:closed_index])); prior_lo=float(np.min(l5[-22:closed_index]))
    closed_hi=float(h5[closed_index]); closed_lo=float(l5[closed_index]); closed_close=float(c5[closed_index])
    retest_tol=max(3.0*point,atrp*.15*point)

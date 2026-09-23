@@ -115,17 +115,6 @@ async def main():
    e.symbols=[old_symbol]
    e.symbol=old_symbol
 
- try:
-  e.rr=float(await db.get('rr',e.rr))
-  e.risk_pct=float(await db.get('risk_pct',e.risk_pct))
-  e.min_confidence=float(await db.get('min_confidence',75.0))
-  e.protection_pct=float(await db.get('protection_pct',e.protection_pct))
-  e.max_positions=int(await db.get('max_positions',e.max_positions))
-  e.max_consecutive_losses=int(await db.get('max_consecutive_losses',e.max_consecutive_losses))
-  e.consecutive_losses=max(0,int(await db.get('consecutive_losses',0)))
- except (TypeError,ValueError):
-  pass
-
  ui=TelegramUI(e,db)
 
  app=ui.app()
