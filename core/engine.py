@@ -1056,7 +1056,8 @@ class Engine:
 
     await self.db.log(
      'PROTECTION_ACTIVATED',t.symbol,
-     sl=level45,price=price,target_progress=target_progress
+     ticket=t.ticket,sl=level45,price=price,
+     target_progress=target_progress,target_progress_pct=target_progress*100.0
     )
 
    else:
@@ -1104,9 +1105,17 @@ class Engine:
      if res and res.retcode==mt5.TRADE_RETCODE_DONE:
       oldsl=t.sl
       t.sl=cand
+      trailing_progress=(
+       ((t.best_favorable_price-t.entry)/target_distance)
+       if t.side==Side.BUY
+       else ((t.entry-t.best_favorable_price)/target_distance)
+      ) if target_distance>0 else 0.0
       await self.db.log(
        'TRAILING_PROTECTION',t.symbol,
-       old_sl=oldsl,new_sl=cand,best_price=t.best_favorable_price
+       ticket=t.ticket,old_sl=oldsl,new_sl=cand,
+       best_price=t.best_favorable_price,
+       target_progress=trailing_progress,
+       target_progress_pct=trailing_progress*100.0
       )
 
   # بعد تفعيل 45% فقط: 60 ثانية بلا أفضل سعر جديد = إغلاق بالسوق.
