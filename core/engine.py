@@ -280,6 +280,37 @@ class Engine:
     else sl<=protection_level
    )
 
+   # Rebuild display/risk metadata so adopted positions receive the same
+   # Telegram trade panel lifecycle as newly opened positions.
+   try:
+    risk_cash=float((meta or {}).get('risk_cash',0) or 0)
+   except (TypeError,ValueError):
+    risk_cash=0.0
+   try:
+    risk_pct=float((meta or {}).get('risk_pct',0) or 0)
+   except (TypeError,ValueError):
+    risk_pct=0.0
+   try:
+    rr_actual=float((meta or {}).get('rr_actual',self.rr) or self.rr)
+   except (TypeError,ValueError):
+    rr_actual=self.rr
+   if source=='manual' or risk_cash<=0:
+    order_type=(
+     getattr(mt5,'ORDER_TYPE_BUY',0)
+     if side==Side.BUY
+     else getattr(mt5,'ORDER_TYPE_SELL',1)
+    )
+    risk_sl=original_sl if original_sl>0 else sl
+    estimated=mt5.order_calc_profit(order_type,symbol,volume,entry,risk_sl)
+    if estimated is not None:
+     risk_cash=max(0.0,-float(estimated))
+    account=self.gw.account()
+    equity=float(getattr(account,'equity',0) or 0) if account else 0.0
+    risk_pct=(risk_cash/equity*100.0) if equity>0 else 0.0
+    reward=mt5.order_calc_profit(order_type,symbol,volume,entry,tp)
+    if risk_cash>0 and reward is not None and float(reward)>0:
+     rr_actual=float(reward)/risk_cash
+
    t=TradeState(
     ticket=ticket,symbol=symbol,side=side,entry=entry,sl=sl,tp=tp,
     initial_r=initial_r,opened_at=opened_at,
@@ -296,6 +327,7 @@ class Engine:
     'entry':entry,'sl':sl,'tp':tp,'volume':volume,
     'opened_at':opened_at,'protection_pct':adopted_protection,
     'trailing_gap_pct':adopted_gap,'protection_active':protection_active,
+    'risk_cash':risk_cash,'risk_pct':risk_pct,'rr_actual':rr_actual,
    })
 
   if errors:
@@ -446,7 +478,15 @@ class Engine:
 
   old_meta=dict(self.trade_alert_meta)
   self.trades=adopted
-  self.trade_alert_meta={ticket:old_meta[ticket] for ticket in adopted if ticket in old_meta}
+  self.trade_alert_meta={}
+  for row in adoption_rows:
+   ticket=row['ticket']
+   rebuilt={
+    'risk_cash':float(row.get('risk_cash',0) or 0),
+    'risk_pct':float(row.get('risk_pct',0) or 0),
+    'rr_actual':float(row.get('rr_actual',self.rr) or self.rr),
+   }
+   self.trade_alert_meta[ticket]=old_meta.get(ticket,rebuilt)
   self.trade=None
   self.mode='RUNNING'
   self.running=True
@@ -486,6 +526,15 @@ class Engine:
    f'🛡 الحماية: {self.protection_pct:g}%\n'
    f'🎯 هدف الجلسة: {target}'
   )
+
+  # Give adopted positions the same pinned/live Telegram panel lifecycle.
+  for ticket,t in adopted.items():
+   alert=self.trade_alert_meta.get(ticket,{})
+   asyncio.create_task(self._send_trade_chart(
+    t,
+    float(alert.get('risk_cash',0) or 0),
+    float(alert.get('risk_pct',0) or 0),
+   ))
 
   if self.loop_task is None or self.loop_task.done():
    self.loop_task=asyncio.create_task(self.loop())
