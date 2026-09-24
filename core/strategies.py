@@ -482,25 +482,43 @@ def _scalp_rates(ctx, minimum=35):
     r=ctx.get('rates_m1')
     return r if r is not None and len(r)>=minimum else ctx['rates']
 
-MACD_STRATEGY={'name':'macd_momentum','fast':8,'slow':21,'signal':5,'recent_bars':3,'score_base':75,'score_cap':.91}
+MACD_STRATEGY={'name':'macd_momentum','fast':6,'slow':13,'signal':5,'ema_filter':200,'rsi_period':14,'recent_bars':2,'score_base':75,'score_cap':.91}
 def macd_momentum(ctx):
-    rates=_scalp_rates(ctx,35)
-    if rates is None or len(rates)<35:return None
+    # M1 is preferred for scalping. Require enough closed candles for EMA200;
+    # fall back to M5 only when M1 history is unavailable.
+    rates=_scalp_rates(ctx,205)
+    if rates is None or len(rates)<205:return None
     c=np.asarray(rates['close'],float)
     fast=_series_ema(c,MACD_STRATEGY['fast']); slow=_series_ema(c,MACD_STRATEGY['slow'])
     macd=fast-slow; sig=_series_ema(macd,MACD_STRATEGY['signal']); hist=macd-sig
+    ema200=_series_ema(c,MACD_STRATEGY['ema_filter'])[-1]
+    rsi14=_rsi(c,MACD_STRATEGY['rsi_period'])
     recent=MACD_STRATEGY['recent_bars']
+
+    # Keep the trigger fresh without forcing a single-scan timing window:
+    # a cross on either of the last two fully closed candles is accepted.
     cross_up=any(macd[i-1]<=sig[i-1] and macd[i]>sig[i] for i in range(-recent,0))
     cross_dn=any(macd[i-1]>=sig[i-1] and macd[i]<sig[i] for i in range(-recent,0))
-    buy=cross_up and hist[-1]>0 and hist[-1]>=hist[-2] and ctx['tick_momentum_fast']>0 and ctx['micro_trend']>0
-    sell=cross_dn and hist[-1]<0 and hist[-1]<=hist[-2] and ctx['tick_momentum_fast']<0 and ctx['micro_trend']<0
+
+    buy=(cross_up and hist[-1]>0 and hist[-1]>=hist[-2]
+         and c[-1]>ema200 and rsi14>50.
+         and ctx['tick_momentum_fast']>0 and ctx['micro_trend']>0)
+    sell=(cross_dn and hist[-1]<0 and hist[-1]<=hist[-2]
+          and c[-1]<ema200 and rsi14<50.
+          and ctx['tick_momentum_fast']<0 and ctx['micro_trend']<0)
     side=Side.BUY if buy else (Side.SELL if sell else None)
     if side is None or not ctx['strategy_allowed'](MACD_STRATEGY['name'],side):return None
-    # M15 is a guard, but neutral is allowed for fast scalp entries.
-    if ctx['m15_bias'] not in (0,1 if side==Side.BUY else -1):return None
+
+    # Light M15 guard: neutral or same direction. Do not add a second
+    # sideways filter because strategy_allowed already blocks clear_range.
+    wanted=1 if side==Side.BUY else -1
+    if ctx['m15_bias'] not in (0,wanted):return None
+
     strength=abs(hist[-1])/max(ctx['atrp']*ctx['point'],ctx['point'])
-    score=MACD_STRATEGY['score_base']+min(10,strength*18)+min(6,abs(ctx['tick_momentum_fast'])/max(ctx['atrp'],1)*12)
-    return Signal(side,MACD_STRATEGY['name'],min(MACD_STRATEGY['score_cap'],score/100.),_indicator_sl(ctx,.55,1.30,.24),'Scalp MACD 8/21/5 recent cross + rising histogram + live momentum')
+    trend_bonus=min(4,abs(c[-1]-ema200)/max(ctx['atrp']*ctx['point'],ctx['point'])*2)
+    rsi_bonus=min(3,abs(rsi14-50.)/10.)
+    score=MACD_STRATEGY['score_base']+min(8,strength*16)+min(5,abs(ctx['tick_momentum_fast'])/max(ctx['atrp'],1)*10)+trend_bonus+rsi_bonus
+    return Signal(side,MACD_STRATEGY['name'],min(MACD_STRATEGY['score_cap'],score/100.),_indicator_sl(ctx,.55,1.30,.24),'Scalp MACD 6/13/5 recent closed-bar cross + EMA200 + RSI14 + M15/live confirmation')
 
 ALLIGATOR_STRATEGY={'name':'alligator_trend','jaw':13,'teeth':8,'lips':5,'score_base':75,'score_cap':.91}
 def alligator_trend(ctx):
