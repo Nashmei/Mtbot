@@ -5,7 +5,7 @@ class DB:
  async def init(self):
   Path(self.path).parent.mkdir(parents=True,exist_ok=True)
   async with aiosqlite.connect(self.path) as d:
-   await d.executescript('''CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,ts REAL,event TEXT,symbol TEXT,details TEXT); CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT);'''); await d.commit()
+   await d.executescript('''CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,ts REAL,event TEXT,symbol TEXT,details TEXT); CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT); CREATE TABLE IF NOT EXISTS push_devices(token TEXT PRIMARY KEY,enabled INTEGER NOT NULL DEFAULT 1,preferences TEXT NOT NULL DEFAULT '{}',updated_at REAL NOT NULL);'''); await d.commit()
  async def log(self,event,symbol='',**details):
   async with aiosqlite.connect(self.path) as d:
    await d.execute('INSERT INTO audit(ts,event,symbol,details) VALUES(?,?,?,?)',(time.time(),event,symbol,json.dumps(details,ensure_ascii=False,default=str))); await d.commit()
@@ -109,3 +109,62 @@ class DB:
       'details':parsed if isinstance(parsed,dict) else {'value':parsed},
      })
   return rows
+
+
+ async def closed_trades(self,limit=100):
+  limit=max(1,min(int(limit),500))
+  rows=await self.recent_audit(min(5000,max(500,limit*20)))
+  opens={}
+  closed=[]
+  for row in reversed(rows):
+   details=row.get('details') or {}
+   ticket=details.get('ticket')
+   try: ticket=int(ticket)
+   except (TypeError,ValueError): ticket=0
+   if row.get('event')=='OPEN' and ticket:
+    opens[ticket]=row
+    continue
+   if row.get('event') not in ('TP','SL','POSITION_CLOSED'):
+    continue
+   opened=opens.get(ticket,{}) if ticket else {}
+   open_details=opened.get('details') or {}
+   closed.append({
+    'id':int(row.get('id') or 0),
+    'ticket':ticket,
+    'symbol':str(row.get('symbol') or opened.get('symbol') or ''),
+    'side':str(open_details.get('side') or ''),
+    'strategy':str(open_details.get('strategy') or ''),
+    'opened_at':float(opened.get('ts') or 0),
+    'closed_at':float(row.get('ts') or 0),
+    'entry':float(open_details.get('entry') or 0),
+    'exit':float(details.get('exit_price') or 0),
+    'sl':float(open_details.get('sl') or 0),
+    'tp':float(open_details.get('tp') or 0),
+    'volume':float(open_details.get('volume') or 0),
+    'pnl':float(details.get('pnl') or 0),
+    'result':str(row.get('event') or ''),
+    'reason':str(details.get('reason') or ''),
+   })
+  return list(reversed(closed[-limit:]))
+
+ async def upsert_push_device(self,token,enabled=True,preferences=None):
+  token=str(token or '').strip()
+  if not token:return
+  payload=json.dumps(preferences or {},ensure_ascii=False,default=str)
+  async with aiosqlite.connect(self.path) as d:
+   await d.execute(
+    'INSERT INTO push_devices(token,enabled,preferences,updated_at) VALUES(?,?,?,?) '
+    'ON CONFLICT(token) DO UPDATE SET enabled=excluded.enabled,preferences=excluded.preferences,updated_at=excluded.updated_at',
+    (token,1 if enabled else 0,payload,time.time())
+   )
+   await d.commit()
+
+ async def active_push_devices(self):
+  out=[]
+  async with aiosqlite.connect(self.path) as d:
+   async with d.execute('SELECT token,preferences FROM push_devices WHERE enabled=1') as cur:
+    async for token,preferences in cur:
+     try:prefs=json.loads(preferences or '{}')
+     except Exception:prefs={}
+     out.append({'token':str(token),'preferences':prefs if isinstance(prefs,dict) else {}})
+  return out
