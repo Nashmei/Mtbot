@@ -1,10 +1,7 @@
 name: T4Bot API checks
 
 on:
-  pull_request:
-  push:
-    branches:
-      - "feature/t4bot-control-api"
+  workflow_dispatch:
 
 concurrency:
   group: t4bot-api-checks-${{ github.ref }}
