@@ -462,6 +462,7 @@ def diagnose_scalp_squeeze_expansion(ctx):
 
 # ============================================================
 # EXPERIMENTAL INDICATOR STRATEGIES (branch: 5test)
+# Scalp-oriented: M1 trigger when available, M5 context, live confirmation.
 # ============================================================
 
 def _series_ema(values, period):
@@ -473,58 +474,72 @@ def _series_ema(values, period):
         out[i]=k*values[i]+(1.0-k)*out[i-1]
     return out
 
-def _indicator_sl(ctx, min_atr=.65, max_atr=1.7, range_factor=.30):
+def _indicator_sl(ctx, min_atr=.55, max_atr=1.35, range_factor=.25):
     atrp=ctx['atrp']
-    return max(10.,min(max_atr*atrp,max(min_atr*atrp,ctx['tick_range']*range_factor)))
+    return max(8.,min(max_atr*atrp,max(min_atr*atrp,ctx['tick_range']*range_factor)))
 
-MACD_STRATEGY={'name':'macd_momentum','fast':12,'slow':26,'signal':9,'score_base':74,'score_cap':.91}
+def _scalp_rates(ctx, minimum=35):
+    r=ctx.get('rates_m1')
+    return r if r is not None and len(r)>=minimum else ctx['rates']
+
+MACD_STRATEGY={'name':'macd_momentum','fast':8,'slow':21,'signal':5,'recent_bars':3,'score_base':75,'score_cap':.91}
 def macd_momentum(ctx):
-    rates=ctx['rates']
-    if rates is None or len(rates)<45:return None
+    rates=_scalp_rates(ctx,35)
+    if rates is None or len(rates)<35:return None
     c=np.asarray(rates['close'],float)
     fast=_series_ema(c,MACD_STRATEGY['fast']); slow=_series_ema(c,MACD_STRATEGY['slow'])
     macd=fast-slow; sig=_series_ema(macd,MACD_STRATEGY['signal']); hist=macd-sig
-    cross_up=macd[-2]<=sig[-2] and macd[-1]>sig[-1]
-    cross_dn=macd[-2]>=sig[-2] and macd[-1]<sig[-1]
-    side=Side.BUY if cross_up and hist[-1]>0 and ctx['tick_momentum_fast']>0 else (Side.SELL if cross_dn and hist[-1]<0 and ctx['tick_momentum_fast']<0 else None)
+    recent=MACD_STRATEGY['recent_bars']
+    cross_up=any(macd[i-1]<=sig[i-1] and macd[i]>sig[i] for i in range(-recent,0))
+    cross_dn=any(macd[i-1]>=sig[i-1] and macd[i]<sig[i] for i in range(-recent,0))
+    buy=cross_up and hist[-1]>0 and hist[-1]>=hist[-2] and ctx['tick_momentum_fast']>0 and ctx['micro_trend']>0
+    sell=cross_dn and hist[-1]<0 and hist[-1]<=hist[-2] and ctx['tick_momentum_fast']<0 and ctx['micro_trend']<0
+    side=Side.BUY if buy else (Side.SELL if sell else None)
     if side is None or not ctx['strategy_allowed'](MACD_STRATEGY['name'],side):return None
+    # M15 is a guard, but neutral is allowed for fast scalp entries.
     if ctx['m15_bias'] not in (0,1 if side==Side.BUY else -1):return None
     strength=abs(hist[-1])/max(ctx['atrp']*ctx['point'],ctx['point'])
-    score=MACD_STRATEGY['score_base']+min(12,strength*18)+min(5,abs(ctx['tick_momentum_fast'])/max(ctx['atrp'],1)*8)
-    return Signal(side,MACD_STRATEGY['name'],min(MACD_STRATEGY['score_cap'],score/100.),_indicator_sl(ctx),'MACD 12/26/9 cross + histogram + live momentum')
+    score=MACD_STRATEGY['score_base']+min(10,strength*18)+min(6,abs(ctx['tick_momentum_fast'])/max(ctx['atrp'],1)*12)
+    return Signal(side,MACD_STRATEGY['name'],min(MACD_STRATEGY['score_cap'],score/100.),_indicator_sl(ctx,.55,1.30,.24),'Scalp MACD 8/21/5 recent cross + rising histogram + live momentum')
 
-ALLIGATOR_STRATEGY={'name':'alligator_trend','jaw':13,'teeth':8,'lips':5,'score_base':73,'score_cap':.90}
+ALLIGATOR_STRATEGY={'name':'alligator_trend','jaw':13,'teeth':8,'lips':5,'score_base':75,'score_cap':.91}
 def alligator_trend(ctx):
-    rates=ctx['rates']
+    rates=_scalp_rates(ctx,35)
     if rates is None or len(rates)<35:return None
     c=np.asarray(rates['close'],float)
     jaw=_series_ema(c,13)[-1]; teeth=_series_ema(c,8)[-1]; lips=_series_ema(c,5)[-1]
     gap=(max(jaw,teeth,lips)-min(jaw,teeth,lips))/ctx['point']
-    min_gap=max(2.,ctx['atrp']*.08)
-    buy=lips>teeth>jaw and ctx['live']>lips and ctx['tick_momentum']>0
-    sell=lips<teeth<jaw and ctx['live']<lips and ctx['tick_momentum']<0
+    min_gap=max(1.5,ctx['atrp']*.045)
+    buy=lips>teeth>jaw and ctx['live']>lips and ctx['tick_momentum_fast']>0 and ctx['micro_trend']>0
+    sell=lips<teeth<jaw and ctx['live']<lips and ctx['tick_momentum_fast']<0 and ctx['micro_trend']<0
     side=Side.BUY if buy else (Side.SELL if sell else None)
     if side is None or gap<min_gap or not ctx['strategy_allowed'](ALLIGATOR_STRATEGY['name'],side):return None
-    if not ctx['htf_allows'](side):return None
-    score=ALLIGATOR_STRATEGY['score_base']+min(12,gap/max(ctx['atrp'],1)*20)+min(5,abs(ctx['tick_momentum'])/max(ctx['atrp'],1)*8)
-    return Signal(side,ALLIGATOR_STRATEGY['name'],min(ALLIGATOR_STRATEGY['score_cap'],score/100.),_indicator_sl(ctx,.70,1.8,.32),'Alligator 5/8/13 aligned + HTF trend + momentum')
+    # For scalping, require M15 agreement; H1 may be neutral/opposite because it is too slow for the trigger.
+    wanted=1 if side==Side.BUY else -1
+    if ctx['m15_bias'] not in (0,wanted):return None
+    score=ALLIGATOR_STRATEGY['score_base']+min(10,gap/max(ctx['atrp'],1)*18)+min(6,abs(ctx['tick_momentum_fast'])/max(ctx['atrp'],1)*12)
+    return Signal(side,ALLIGATOR_STRATEGY['name'],min(ALLIGATOR_STRATEGY['score_cap'],score/100.),_indicator_sl(ctx,.58,1.35,.26),'Scalp Alligator 5/8/13 alignment + M15 guard + live momentum')
 
-MOVING_AVERAGE_STRATEGY={'name':'moving_average_trend','fast':20,'slow':50,'score_base':72,'score_cap':.89}
+MOVING_AVERAGE_STRATEGY={'name':'moving_average_trend','fast':9,'slow':21,'recent_bars':3,'score_base':74,'score_cap':.90}
 def moving_average_trend(ctx):
-    rates=ctx['rates']
-    if rates is None or len(rates)<60:return None
+    rates=_scalp_rates(ctx,35)
+    if rates is None or len(rates)<35:return None
     c=np.asarray(rates['close'],float)
-    f=_series_ema(c,20); s=_series_ema(c,50)
-    cross_up=f[-2]<=s[-2] and f[-1]>s[-1]
-    cross_dn=f[-2]>=s[-2] and f[-1]<s[-1]
-    side=Side.BUY if cross_up and ctx['live']>f[-1] and ctx['tick_momentum_fast']>0 else (Side.SELL if cross_dn and ctx['live']<f[-1] and ctx['tick_momentum_fast']<0 else None)
+    f=_series_ema(c,MOVING_AVERAGE_STRATEGY['fast']); s=_series_ema(c,MOVING_AVERAGE_STRATEGY['slow'])
+    recent=MOVING_AVERAGE_STRATEGY['recent_bars']
+    cross_up=any(f[i-1]<=s[i-1] and f[i]>s[i] for i in range(-recent,0))
+    cross_dn=any(f[i-1]>=s[i-1] and f[i]<s[i] for i in range(-recent,0))
+    buy=cross_up and f[-1]>s[-1] and ctx['live']>f[-1] and ctx['tick_momentum_fast']>0 and ctx['micro_trend']>0
+    sell=cross_dn and f[-1]<s[-1] and ctx['live']<f[-1] and ctx['tick_momentum_fast']<0 and ctx['micro_trend']<0
+    side=Side.BUY if buy else (Side.SELL if sell else None)
     if side is None or not ctx['strategy_allowed'](MOVING_AVERAGE_STRATEGY['name'],side):return None
-    if ctx['h1_bias'] not in (0,1 if side==Side.BUY else -1):return None
+    wanted=1 if side==Side.BUY else -1
+    if ctx['m15_bias'] not in (0,wanted):return None
     gap=abs(f[-1]-s[-1])/ctx['point']
-    score=MOVING_AVERAGE_STRATEGY['score_base']+min(12,gap/max(ctx['atrp'],1)*15)+min(5,abs(ctx['tick_momentum_fast'])/max(ctx['atrp'],1)*8)
-    return Signal(side,MOVING_AVERAGE_STRATEGY['name'],min(MOVING_AVERAGE_STRATEGY['score_cap'],score/100.),_indicator_sl(ctx),'EMA 20/50 cross + H1 guard + live confirmation')
+    score=MOVING_AVERAGE_STRATEGY['score_base']+min(10,gap/max(ctx['atrp']*.04,1.)*3)+min(6,abs(ctx['tick_momentum_fast'])/max(ctx['atrp'],1)*12)
+    return Signal(side,MOVING_AVERAGE_STRATEGY['name'],min(MOVING_AVERAGE_STRATEGY['score_cap'],score/100.),_indicator_sl(ctx,.55,1.30,.24),'Scalp EMA 9/21 recent cross + M15 guard + live momentum')
 
-RSI_STRATEGY={'name':'rsi_reversal','period':14,'oversold':30.,'overbought':70.,'score_base':73,'score_cap':.90}
+RSI_STRATEGY={'name':'rsi_reversal','period':7,'oversold':35.,'overbought':65.,'score_base':75,'score_cap':.90}
 def _rsi(values, period=14):
     v=np.asarray(values,dtype=float)
     if len(v)<period+2:return 50.
@@ -534,31 +549,33 @@ def _rsi(values, period=14):
     return 100.-100./(1.+ag/al)
 
 def rsi_reversal(ctx):
-    rates=ctx['rates']
-    if rates is None or len(rates)<25 or not ctx['range_ok']:return None
+    rates=_scalp_rates(ctx,25)
+    if rates is None or len(rates)<25:return None
     c=np.asarray(rates['close'],float)
-    prev=_rsi(c[:-1],14); now=_rsi(c,14)
-    buy=prev<=RSI_STRATEGY['oversold'] and now>RSI_STRATEGY['oversold'] and ctx['tick_momentum_fast']>0
-    sell=prev>=RSI_STRATEGY['overbought'] and now<RSI_STRATEGY['overbought'] and ctx['tick_momentum_fast']<0
+    p=RSI_STRATEGY['period']; prev=_rsi(c[:-1],p); now=_rsi(c,p)
+    buy=prev<=RSI_STRATEGY['oversold'] and now>prev and ctx['tick_momentum_fast']>0 and ctx['micro_trend']>0
+    sell=prev>=RSI_STRATEGY['overbought'] and now<prev and ctx['tick_momentum_fast']<0 and ctx['micro_trend']<0
     side=Side.BUY if buy else (Side.SELL if sell else None)
     if side is None or not ctx['strategy_allowed'](RSI_STRATEGY['name'],side):return None
+    # Reversal remains range/mixed only; clear trends are still blocked by strategy_allowed.
     extreme=max(0.,RSI_STRATEGY['oversold']-prev) if side==Side.BUY else max(0.,prev-RSI_STRATEGY['overbought'])
-    score=RSI_STRATEGY['score_base']+min(12,extreme*.8)+min(5,abs(ctx['tick_momentum_fast'])/max(ctx['atrp'],1)*8)
-    return Signal(side,RSI_STRATEGY['name'],min(RSI_STRATEGY['score_cap'],score/100.),_indicator_sl(ctx,.65,1.5,.28),'RSI 14 exits extreme + live reversal confirmation')
+    score=RSI_STRATEGY['score_base']+min(9,extreme*.65)+min(6,abs(ctx['tick_momentum_fast'])/max(ctx['atrp'],1)*12)
+    return Signal(side,RSI_STRATEGY['name'],min(RSI_STRATEGY['score_cap'],score/100.),_indicator_sl(ctx,.52,1.25,.23),'Scalp RSI 7 reversal from 35/65 zone + live momentum')
 
-BOLLINGER_STRATEGY={'name':'bollinger_reversion','period':20,'stddev':2.0,'score_base':74,'score_cap':.91}
+BOLLINGER_STRATEGY={'name':'bollinger_reversion','period':20,'stddev':1.8,'score_base':75,'score_cap':.91}
 def bollinger_reversion(ctx):
-    rates=ctx['rates']
-    if rates is None or len(rates)<25 or not ctx['range_ok']:return None
-    c=np.asarray(rates['close'],float); window=c[-20:]
-    mean=float(np.mean(window)); std=max(float(np.std(window)),ctx['point'])
-    upper=mean+2.*std; lower=mean-2.*std
-    prev_window=c[-21:-1]; pm=float(np.mean(prev_window)); ps=max(float(np.std(prev_window)),ctx['point'])
-    prev_upper=pm+2.*ps; prev_lower=pm-2.*ps
-    buy=c[-2]<=prev_lower and c[-1]>lower and ctx['tick_momentum_fast']>0
-    sell=c[-2]>=prev_upper and c[-1]<upper and ctx['tick_momentum_fast']<0
+    rates=_scalp_rates(ctx,25)
+    if rates is None or len(rates)<25:return None
+    c=np.asarray(rates['close'],float); n=BOLLINGER_STRATEGY['period']; mult=BOLLINGER_STRATEGY['stddev']
+    window=c[-n:]; mean=float(np.mean(window)); std=max(float(np.std(window)),ctx['point'])
+    upper=mean+mult*std; lower=mean-mult*std
+    prev_window=c[-(n+1):-1]; pm=float(np.mean(prev_window)); ps=max(float(np.std(prev_window)),ctx['point'])
+    prev_upper=pm+mult*ps; prev_lower=pm-mult*ps
+    # Scalp trigger: touch/pierce the previous band and show immediate live rejection.
+    buy=c[-2]<=prev_lower and c[-1]>c[-2] and ctx['tick_momentum_fast']>0 and ctx['micro_trend']>0
+    sell=c[-2]>=prev_upper and c[-1]<c[-2] and ctx['tick_momentum_fast']<0 and ctx['micro_trend']<0
     side=Side.BUY if buy else (Side.SELL if sell else None)
     if side is None or not ctx['strategy_allowed'](BOLLINGER_STRATEGY['name'],side):return None
     excursion=(prev_lower-c[-2])/std if side==Side.BUY else (c[-2]-prev_upper)/std
-    score=BOLLINGER_STRATEGY['score_base']+min(12,max(0.,excursion)*10)+min(5,abs(ctx['tick_momentum_fast'])/max(ctx['atrp'],1)*8)
-    return Signal(side,BOLLINGER_STRATEGY['name'],min(BOLLINGER_STRATEGY['score_cap'],score/100.),_indicator_sl(ctx,.65,1.55,.28),'Bollinger 20/2 re-entry + range guard + live reversal')
+    score=BOLLINGER_STRATEGY['score_base']+min(9,max(0.,excursion)*9)+min(6,abs(ctx['tick_momentum_fast'])/max(ctx['atrp'],1)*12)
+    return Signal(side,BOLLINGER_STRATEGY['name'],min(BOLLINGER_STRATEGY['score_cap'],score/100.),_indicator_sl(ctx,.52,1.25,.23),'Scalp Bollinger 20/1.8 band rejection + live reversal')
