@@ -59,7 +59,7 @@ class ControlAPI:
     Analyzer, Risk and MT5Gateway rather than duplicating that logic.
     """
 
-    def __init__(self, engine, db, gateway, event_hub, token):
+    def __init__(self, engine, db, gateway, event_hub, token, push_service=None):
         token = (token or '').strip()
         if len(token) < 24:
             raise ValueError('CONTROL_API_TOKEN must be at least 24 characters')
@@ -68,6 +68,7 @@ class ControlAPI:
         self.db = db
         self.gateway = gateway
         self.event_hub = event_hub
+        self.push_service = push_service
         self._token = token
         self._analysis_cache = {}
 
@@ -270,6 +271,36 @@ class ControlAPI:
             )
             return {'ok': True, 'message': 'تم حفظ إعدادات الإشعارات.'}
 
+        @app.get('/v1/notifications/status')
+        async def notification_status(_=Depends(auth)):
+            if self.push_service is not None:
+                return await self.push_service.status()
+
+            devices = await self.db.active_push_devices()
+            return {
+                'configured': False,
+                'registered_devices': len(devices),
+                'environment': 'unconfigured',
+            }
+
+        @app.post('/v1/notifications/test')
+        async def notification_test(_=Depends(auth)):
+            if self.push_service is None:
+                return {
+                    'ok': False,
+                    'message': 'APNs غير مهيأ على خادم Mtbot.',
+                    'sent': 0,
+                    'failed': 0,
+                }
+
+            result = await self.push_service.send_test()
+            return {
+                'ok': bool(result.get('ok')),
+                'message': str(result.get('message') or ''),
+                'sent': int(result.get('sent') or 0),
+                'failed': int(result.get('failed') or 0),
+            }
+
 
         @app.websocket('/v1/ws')
         async def websocket_endpoint(websocket: WebSocket):
@@ -277,19 +308,41 @@ class ControlAPI:
                 await websocket.close(code=4401)
                 return
 
-            await self.event_hub.connect(websocket)
+            queue = await self.event_hub.connect(websocket)
+            last_state = None
+            last_snapshot_sent = 0.0
+            next_snapshot = 0.0
+
             try:
-                # Stream live server state directly to T4Bot. This removes the
-                # old client-side polling delay while keeping MT5 as the source
-                # of truth. EventHub messages still arrive immediately between
-                # snapshots for command/state invalidation.
                 while True:
-                    await websocket.send_json({
-                        'type': 'snapshot',
-                        'ts': time.time(),
-                        'payload': await self.snapshot(),
-                    })
-                    await asyncio.sleep(0.05)
+                    now = time.monotonic()
+                    timeout = max(0.0, next_snapshot - now)
+
+                    try:
+                        event = await asyncio.wait_for(queue.get(), timeout=timeout)
+                        await websocket.send_json(event)
+                        continue
+                    except asyncio.TimeoutError:
+                        pass
+
+                    payload = await self.snapshot()
+                    comparable = dict(payload)
+                    comparable['server_time'] = 0.0
+                    now = time.monotonic()
+
+                    if comparable != last_state or now - last_snapshot_sent >= 1.0:
+                        await websocket.send_json({
+                            'type': 'snapshot',
+                            'ts': time.time(),
+                            'payload': payload,
+                        })
+                        last_state = comparable
+                        last_snapshot_sent = now
+
+                    # MT5-backed values are sampled at 20 Hz, while unchanged
+                    # payloads are coalesced. Engine events bypass this cadence
+                    # through the queue above and are sent immediately.
+                    next_snapshot = time.monotonic() + 0.05
             except WebSocketDisconnect:
                 pass
             except Exception:
