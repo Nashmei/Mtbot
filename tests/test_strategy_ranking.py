@@ -99,14 +99,15 @@ class StrategyPerformanceDBTests(unittest.TestCase):
             ts=1000.0
             # Old 10 winners should fall outside the latest-50 window.
             for i in range(60):
-                open_details=json.dumps({'strategy':'scalp_trend','side':'BUY'})
+                ticket=10000+i
+                open_details=json.dumps({'ticket':ticket,'strategy':'scalp_trend','side':'BUY'})
                 con.execute(
                     'INSERT INTO audit(ts,event,symbol,details) VALUES(?,?,?,?)',
                     (ts,'OPEN','EURUSD',open_details),
                 )
                 points_win=i<10
                 close_event='TP' if points_win else 'SL'
-                close_details=json.dumps({'pnl':100.0 if points_win else -100.0})
+                close_details=json.dumps({'ticket':ticket,'pnl':100.0 if points_win else -100.0})
                 con.execute(
                     'INSERT INTO audit(ts,event,symbol,details) VALUES(?,?,?,?)',
                     (ts+0.5,close_event,'EURUSD',close_details),
@@ -127,6 +128,47 @@ class StrategyPerformanceDBTests(unittest.TestCase):
                 pass
 
 
+    def test_manual_adopted_close_does_not_score_bot_strategy(self):
+        fd,path=tempfile.mkstemp(suffix='.db')
+        os.close(fd)
+        try:
+            db=DB(path)
+            asyncio.run(db.init())
+            con=sqlite3.connect(path)
+            con.execute(
+                'INSERT INTO audit(ts,event,symbol,details) VALUES(?,?,?,?)',
+                (1000.0,'OPEN','EURUSD',json.dumps({
+                    'ticket':30001,'strategy':'scalp_trend'
+                })),
+            )
+            # A separately adopted manual position closes on the same symbol.
+            # Ticket matching must prevent it from being credited to scalp_trend.
+            con.execute(
+                'INSERT INTO audit(ts,event,symbol,details) VALUES(?,?,?,?)',
+                (1000.5,'POSITION_CLOSED','EURUSD',json.dumps({
+                    'ticket':39999,'strategy':'manual_adopted','pnl':150.0
+                })),
+            )
+            con.execute(
+                'INSERT INTO audit(ts,event,symbol,details) VALUES(?,?,?,?)',
+                (1001.0,'SL','EURUSD',json.dumps({
+                    'ticket':30001,'pnl':-25.0
+                })),
+            )
+            con.commit()
+            con.close()
+
+            stats=asyncio.run(db.strategy_performance(50))
+            self.assertEqual(stats['scalp_trend']['trades'],1)
+            self.assertEqual(stats['scalp_trend']['points'],-1.0)
+            self.assertNotIn('manual_adopted',stats)
+        finally:
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+
+
     def test_reset_cutoff_starts_performance_from_zero_without_deleting_audit(self):
         fd,path=tempfile.mkstemp(suffix='.db')
         os.close(fd)
@@ -137,11 +179,11 @@ class StrategyPerformanceDBTests(unittest.TestCase):
 
             con.execute(
                 'INSERT INTO audit(ts,event,symbol,details) VALUES(?,?,?,?)',
-                (1000.0,'OPEN','EURUSD',json.dumps({'strategy':'scalp_trend'})),
+                (1000.0,'OPEN','EURUSD',json.dumps({'ticket':20001,'strategy':'scalp_trend'})),
             )
             con.execute(
                 'INSERT INTO audit(ts,event,symbol,details) VALUES(?,?,?,?)',
-                (1000.5,'TP','EURUSD',json.dumps({'pnl':100.0})),
+                (1000.5,'TP','EURUSD',json.dumps({'ticket':20001,'pnl':100.0})),
             )
             con.commit()
             con.close()
@@ -159,11 +201,11 @@ class StrategyPerformanceDBTests(unittest.TestCase):
             ).fetchone()[0]
             con.execute(
                 'INSERT INTO audit(ts,event,symbol,details) VALUES(?,?,?,?)',
-                (2001.0,'OPEN','EURUSD',json.dumps({'strategy':'scalp_trend'})),
+                (2001.0,'OPEN','EURUSD',json.dumps({'ticket':20002,'strategy':'scalp_trend'})),
             )
             con.execute(
                 'INSERT INTO audit(ts,event,symbol,details) VALUES(?,?,?,?)',
-                (2001.5,'SL','EURUSD',json.dumps({'pnl':-50.0})),
+                (2001.5,'SL','EURUSD',json.dumps({'ticket':20002,'pnl':-50.0})),
             )
             con.commit()
             con.close()
