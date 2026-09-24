@@ -41,6 +41,12 @@ class TelegramUI:
    if not math.isfinite(v) or not 0<=v<=100: raise ValueError()
    self.e.daily_loss_limit_pct=v; self.e.daily_loss_notified=False
    db_key='daily_loss_limit_pct'; msg=f'✅ حد Equity اليومي: {v:g}%'+(' (معطل)' if v==0 else '')
+  elif key=='sessionprofit':
+   v=float(value)
+   if not math.isfinite(v) or not 0<=v<=1000000000: raise ValueError()
+   self.e.session_profit_target=v
+   db_key='session_profit_target'
+   msg=('✅ هدف ربح الجلسة: معطل' if v==0 else '✅ هدف ربح الجلسة: $'+f'{v:g}')
   else:
    raise ValueError()
   if hasattr(self.e,'save_setting'):
@@ -98,7 +104,7 @@ class TelegramUI:
   return InlineKeyboardMarkup([[InlineKeyboardButton('📊 لوحة التحكم',callback_data='dashboard')],[InlineKeyboardButton('🤖 التداول',callback_data='trade_menu'),InlineKeyboardButton('🔎 التحليل',callback_data='analysis_menu')],[InlineKeyboardButton('⚙️ الإعدادات',callback_data='settings_menu'),InlineKeyboardButton('👤 الحساب',callback_data='account_menu')]])
  def trade_kb(self): return InlineKeyboardMarkup([[InlineKeyboardButton('▶️ تشغيل المحرك',callback_data='start'),InlineKeyboardButton('⏹ إيقاف',callback_data='stop')],[InlineKeyboardButton('📊 الحالة',callback_data='status'),InlineKeyboardButton('↩️ الرئيسية',callback_data='dashboard')]])
  def analysis_kb(self): return InlineKeyboardMarkup([[InlineKeyboardButton('🔎 تحليل الآن',callback_data='analyze')],[InlineKeyboardButton('💱 الأزواج',callback_data='symbols'),InlineKeyboardButton('🔥 الأنشط',callback_data='active')],[InlineKeyboardButton('↩️ الرئيسية',callback_data='dashboard')]])
- def settings_kb(self): return InlineKeyboardMarkup([[InlineKeyboardButton('⚠️ المخاطرة',callback_data='risk'),InlineKeyboardButton('⚖️ R:R',callback_data='rr')],[InlineKeyboardButton('🎯 الثقة',callback_data='confidence'),InlineKeyboardButton('🛡 الحماية',callback_data='protection')],[InlineKeyboardButton('⏱ مدة الصفقة',callback_data='maxduration'),InlineKeyboardButton('📂 حد المراكز',callback_data='maxpos')],[InlineKeyboardButton('❌ حد الخسائر',callback_data='maxloss'),InlineKeyboardButton('📉 حد Equity اليومي',callback_data='dailyloss')],[InlineKeyboardButton('↩️ الرئيسية',callback_data='dashboard')]])
+ def settings_kb(self): return InlineKeyboardMarkup([[InlineKeyboardButton('⚠️ المخاطرة',callback_data='risk'),InlineKeyboardButton('⚖️ R:R',callback_data='rr')],[InlineKeyboardButton('🎯 الثقة',callback_data='confidence'),InlineKeyboardButton('🛡 الحماية',callback_data='protection')],[InlineKeyboardButton('⏱ مدة الصفقة',callback_data='maxduration'),InlineKeyboardButton('📂 حد المراكز',callback_data='maxpos')],[InlineKeyboardButton('❌ حد الخسائر',callback_data='maxloss'),InlineKeyboardButton('📉 حد Equity اليومي',callback_data='dailyloss')],[InlineKeyboardButton('💰 هدف ربح الجلسة',callback_data='sessionprofit')],[InlineKeyboardButton('↩️ الرئيسية',callback_data='dashboard')]])
  def account_kb(self): return InlineKeyboardMarkup([[InlineKeyboardButton('🔐 ربط MT5',callback_data='mt5login'),InlineKeyboardButton('📈 الإحصائيات',callback_data='accountstats')],[InlineKeyboardButton('🧪 فحص الجاهزية',callback_data='readiness')],[InlineKeyboardButton('↩️ الرئيسية',callback_data='dashboard')]])
  async def start(self,u,c):
   if not self.allowed(u.effective_user) or u.effective_chat.id!=settings.telegram_allowed_user_id:return
@@ -119,6 +125,7 @@ class TelegramUI:
   if x=='settings_menu':
    daily=f'{self.e.daily_loss_limit_pct:g}%'+(' (معطل)' if self.e.daily_loss_limit_pct<=0 else '')
    losses=str(self.e.max_consecutive_losses)+(' (معطل)' if self.e.max_consecutive_losses==0 else '')
+   session_target=('0 (معطل)' if self.e.session_profit_target<=0 else '$'+f'{self.e.session_profit_target:g}')
    msg=(f'⚙️ إعدادات الاستراتيجية والمخاطر\n━━━━━━━━━━━━━━\n'
         f'⚠️ المخاطرة: {self.e.risk_pct:g}%\n'
         f'⚖️ R:R: 1:{self.e.rr:g}\n'
@@ -127,7 +134,8 @@ class TelegramUI:
         f'⏱ مدة الصفقة: {self.e.max_trade_minutes:g} دقيقة\n'
         f'📂 حد المراكز: {self.e.max_positions}\n'
         f'❌ حد الخسائر: {losses}\n'
-        f'📉 حد Equity اليومي: {daily}')
+        f'📉 حد Equity اليومي: {daily}\n'
+        f'💰 هدف ربح الجلسة: {session_target}')
    return await self._edit(q,msg,self.settings_kb())
   if x=='account_menu': return await self._edit(q,'👤 حساب MT5 والإحصائيات',self.account_kb())
   if x=='mt5login':
@@ -141,8 +149,10 @@ class TelegramUI:
     started=await self.e.start()
     msg='🟢 تم تشغيل البوت على الحساب التجريبي.' if started else '⚠️ لم يبدأ المحرك. راجع رسالة السبب وفحص الجاهزية.'
   elif x=='stop':
-   await self._edit(q,'⏳ جاري إيقاف المحرك.',self.trade_kb(),arm=False)
-   await self.e.stop(); msg='⏹ تم إيقاف البوت.'
+   await self._edit(q,'⏳ جاري إيقاف الدخول الجديد.',self.trade_kb(),arm=False)
+   state=await self.e.stop()
+   msg=('🟡 تم إيقاف الدخول الجديد، وتستمر مراقبة الصفقات المفتوحة حتى انتهائها.'
+        if state=='DRAINING' else '⏹ تم إيقاف البوت بالكامل.')
   elif x=='readiness':
    st=self.e.gw.algo_status()
    msg=('🧪 فحص الجاهزية\n━━━━━━━━━━━━━━\n'+('✅ MT5 متصل\n' if st['connected'] else '❌ MT5 غير متصل\n')+('✅ الحساب يسمح بالتداول\n' if st['account_trade_allowed'] else '❌ الحساب يمنع التداول\n')+('✅ التداول الآلي مسموح للحساب\n' if st['trade_expert'] else '❌ التداول الآلي ممنوع للحساب\n')+('✅ Algo Trading مفعّل' if st['trade_allowed'] else '❌ Algo Trading غير مفعّل'))
@@ -291,6 +301,10 @@ class TelegramUI:
   elif x=='dailyloss':
    self.input_state[q.from_user.id]='dailyloss'
    msg=f'📉 حد Equity اليومي الحالي: {self.e.daily_loss_limit_pct:g}%\nأرسل النسبة فقط\n0 = تعطيل الحد\nالمسموح: 0 إلى 100'
+  elif x=='sessionprofit':
+   self.input_state[q.from_user.id]='sessionprofit'
+   current=('معطل' if self.e.session_profit_target<=0 else '$'+f'{self.e.session_profit_target:g}')
+   msg=f'💰 هدف ربح الجلسة الحالي: {current}\nأرسل المبلغ بالدولار\nمثال: 100\n0 = تعطيل الهدف'
   elif x=='rr':
    self.input_state[q.from_user.id]='rr'
    msg='⚖️ أرسل الرقم فقط\nمثال: 3 يعني 1:3\nالمسموح: 0.5 إلى 10'
@@ -312,7 +326,7 @@ class TelegramUI:
   if key:
    try:
     import math
-    if key in ('risk','confidence','protection','maxduration','rr','maxpos','maxloss','dailyloss'):
+    if key in ('risk','confidence','protection','maxduration','rr','maxpos','maxloss','dailyloss','sessionprofit'):
      msg=await self._apply_setting(key,value)
     elif key=='symbol':
      self.e.symbol=value.upper(); self.e.symbols=[self.e.symbol]; import json; await self.e.save_setting('symbols',json.dumps(self.e.symbols)); msg=f'✅ الرمز: {self.e.symbol}'
@@ -402,6 +416,9 @@ class TelegramUI:
 
  async def dailyloss_prompt(self,u,c):
   await self.ask_value(u,'dailyloss','📉 أرسل حد انخفاض Equity اليومي\n0 = معطل\nالمسموح: 0 إلى 100')
+
+ async def sessionprofit_prompt(self,u,c):
+  await self.ask_value(u,'sessionprofit','💰 أرسل هدف ربح الجلسة بالدولار\nمثال: 100\n0 = معطل')
 
  async def symbol_prompt(self,u,c):
   await self.ask_value(u,'symbol','💱 أرسل رمز واحد فقط\nمثال: EURUSD')
@@ -508,6 +525,7 @@ class TelegramUI:
   a.add_handler(CommandHandler('maxloss',self.maxloss_prompt))
   a.add_handler(CommandHandler('maxduration',self.maxduration_prompt))
   a.add_handler(CommandHandler('dailyloss',self.dailyloss_prompt))
+  a.add_handler(CommandHandler('sessionprofit',self.sessionprofit_prompt))
   a.add_handler(CallbackQueryHandler(self.cb))
   a.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,self.text))
   return a
