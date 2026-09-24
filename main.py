@@ -31,6 +31,8 @@ async def main():
   print('MT5: no saved account; login is available from an enabled control surface')
 
  event_hub=EventHub()
+ from api.push import APNsPushService
+ push_service=APNsPushService(db,settings)
  app_holder={}
  trade_messages={}
  blocked_until={'until':0.0}
@@ -51,6 +53,14 @@ async def main():
     'media_id':media_id,
    }
   )
+  if push_service.configured:
+   asyncio.create_task(
+    push_service.send_engine_notification(
+     text,
+     trade_result=trade_result,
+     trade_ticket=trade_ticket,
+    )
+   )
 
   app=app_holder.get('app')
   if not app:
