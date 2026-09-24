@@ -35,7 +35,7 @@ class SettingsPatch(BaseModel):
 
 class SymbolsPayload(BaseModel):
     model_config = ConfigDict(extra='forbid')
-    symbols: list[str] = Field(min_length=1, max_length=20)
+    symbols: list[str] = Field(min_length=1)
 
 
 class PushRegistrationPayload(BaseModel):
