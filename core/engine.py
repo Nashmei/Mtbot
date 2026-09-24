@@ -456,6 +456,14 @@ class Engine:
  async def _scan_symbol(self,symbol,account):
    # صفقة واحدة كحد أقصى لكل رمز
    if any(t.symbol==symbol for t in self.trades.values()):return
+   # No new entries around the daily rollover when spreads commonly widen.
+   # Server is configured to Asia/Riyadh; use local server time intentionally.
+   from datetime import datetime
+   now_local=datetime.now()
+   mins=now_local.hour*60+now_local.minute
+   if mins>=23*60+45 or mins<30:
+    await self._log_reject('TIME_REJECT',symbol,reason='DAILY_ROLLOVER_2345_0030')
+    return
    # Avoid stacking the same USD directional exposure across correlated FX pairs.
    usd_group={'EURUSD','GBPUSD','AUDUSD','NZDUSD'}
    info=self.gw.info(symbol); tick=self.gw.tick(symbol)
