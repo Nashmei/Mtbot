@@ -256,7 +256,19 @@ class Engine:
    initial_r=abs(entry-original_sl) if original_sl>0 else abs(entry-sl)
    if initial_r<=0:
     initial_r=target_distance/max(float(self.rr),0.5)
-   trigger=self.protection_pct/100.0
+   try:
+    adopted_protection=float((meta or {}).get('protection_pct',self.protection_pct) or self.protection_pct)
+   except (TypeError,ValueError):
+    adopted_protection=self.protection_pct
+   try:
+    adopted_gap=float((meta or {}).get('trailing_gap_pct',self.trailing_gap_pct) or self.trailing_gap_pct)
+   except (TypeError,ValueError):
+    adopted_gap=self.trailing_gap_pct
+   if not 5<=adopted_protection<=90:
+    adopted_protection=self.protection_pct
+   if not 0<adopted_gap<=50:
+    adopted_gap=self.trailing_gap_pct
+   trigger=adopted_protection/100.0
    protection_level=(
     entry+(target_distance*trigger)
     if side==Side.BUY
@@ -272,8 +284,8 @@ class Engine:
     ticket=ticket,symbol=symbol,side=side,entry=entry,sl=sl,tp=tp,
     initial_r=initial_r,opened_at=opened_at,
     strategy=strategy,regime=regime,confidence=confidence,reason=reason,
-    volume=volume,protection_pct=self.protection_pct,
-    trailing_gap_pct=self.trailing_gap_pct,
+    volume=volume,protection_pct=adopted_protection,
+    trailing_gap_pct=adopted_gap,
     protection_45_active=protection_active,trailing=protection_active,
     best_favorable_price=entry,last_progress_at=now,
     signal_bar=int((meta or {}).get('signal_bar',0) or 0),
@@ -282,7 +294,8 @@ class Engine:
    rows.append({
     'ticket':ticket,'symbol':symbol,'source':source,'strategy':strategy,
     'entry':entry,'sl':sl,'tp':tp,'volume':volume,
-    'opened_at':opened_at,'protection_active':protection_active,
+    'opened_at':opened_at,'protection_pct':adopted_protection,
+    'trailing_gap_pct':adopted_gap,'protection_active':protection_active,
    })
 
   if errors:
@@ -1081,6 +1094,8 @@ class Engine:
     side=sig.side.value,strategy=sig.strategy,regime=reg.value,
     confidence=float(sig.confidence),reason=sig.reason,
     risk_cash=actual_risk,risk_pct=actual_risk_pct,rr_actual=actual_rr,
+    protection_pct=t.protection_pct,trailing_gap_pct=t.trailing_gap_pct,
+    signal_bar=signal_bar,
    )
    asyncio.create_task(self._send_trade_chart(t,actual_risk,actual_risk_pct))
 
