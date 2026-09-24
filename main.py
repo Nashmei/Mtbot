@@ -1,11 +1,15 @@
 import asyncio
 from pathlib import Path
+
 from telegram.error import BadRequest, RetryAfter
-from core.config import settings
-from core.mt5_gateway import MT5Gateway
-from core.engine import Engine
-from storage.db import DB
+
+from api.events import EventHub
 from bot.telegram_app import TelegramUI
+from core.config import settings
+from core.engine import Engine
+from core.mt5_gateway import MT5Gateway
+from storage.db import DB
+
 
 async def main():
  db=DB(settings.db_path)
@@ -14,7 +18,7 @@ async def main():
  gw=MT5Gateway()
 
  # استرجاع حساب MT5 المحفوظ إن وجد
- import json, os
+ import json
  cred_file=Path.home()/'.mt5bot_credentials.json'
  if cred_file.exists():
   try:
@@ -24,19 +28,45 @@ async def main():
   except Exception as ex:
    print('MT5: saved login error:',ex)
  else:
-  print('Telegram: starting - MT5 login available from Telegram')
+  print('MT5: no saved account; login is available from an enabled control surface')
 
+ event_hub=EventHub()
  app_holder={}
  trade_messages={}
  blocked_until={'until':0.0}
 
  async def notify(text,photo_path=None,caption=None,trade_ticket=None,trade_update=False,pin=False,trade_result=None,trade_result_reason=None):
   import time
+
+  # T4Bot events are independent of Telegram availability/flood limits.
+  await event_hub.broadcast(
+   'engine_notification',
+   {
+    'text':text,
+    'trade_ticket':trade_ticket,
+    'trade_update':bool(trade_update),
+    'trade_result':trade_result,
+    'trade_result_reason':trade_result_reason,
+   }
+  )
+
   app=app_holder.get('app')
-  if not app:return
+  if not app:
+   if photo_path:
+    try:
+     Path(photo_path).unlink(missing_ok=True)
+    except Exception:
+     pass
+   return
+
   chat_id=settings.telegram_allowed_user_id
   now=time.monotonic()
   if now < blocked_until['until']:
+   if photo_path:
+    try:
+     Path(photo_path).unlink(missing_ok=True)
+    except Exception:
+     pass
    return
 
   try:
@@ -110,26 +140,62 @@ async def main():
      pass
 
  e=Engine(gw,db,notify)
- # Existing saved account: migrate the old global Telegram preferences once
- # into this account's profile. Newly linked accounts do not inherit them.
+ # Existing saved account: migrate the old global preferences once into this
+ # account's profile. Newly linked accounts do not inherit another account.
  await e.load_settings(migrate_legacy=bool(gw.account()))
 
- ui=TelegramUI(e,db)
+ api_server=None
+ api_task=None
+ if settings.control_api_enabled:
+  if not settings.control_api_token:
+   raise RuntimeError('CONTROL_API_ENABLED=true requires CONTROL_API_TOKEN')
+  from api.control_api import ControlAPI
+  import uvicorn
 
- app=ui.app()
- app_holder['app']=app
+  control_api=ControlAPI(e,db,gw,event_hub,settings.control_api_token)
+  api_config=uvicorn.Config(
+   control_api.app,
+   host=settings.control_api_host,
+   port=settings.control_api_port,
+   loop='asyncio',
+   access_log=False,
+   log_level='info',
+  )
+  api_server=uvicorn.Server(api_config)
+  api_task=asyncio.create_task(api_server.serve())
+  await asyncio.sleep(.25)
+  if api_task.done():
+   await api_task
+  print(f'T4Bot API: listening on {settings.control_api_host}:{settings.control_api_port}')
 
- await app.initialize()
- await app.start()
- await app.updater.start_polling(drop_pending_updates=True)
+ telegram_app=None
+ if settings.telegram_enabled:
+  if not settings.telegram_bot_token or settings.telegram_allowed_user_id is None:
+   print('Telegram: disabled at runtime because token/user id is missing')
+  else:
+   ui=TelegramUI(e,db)
+   telegram_app=ui.app()
+   app_holder['app']=telegram_app
+   await telegram_app.initialize()
+   await telegram_app.start()
+   await telegram_app.updater.start_polling(drop_pending_updates=True)
+   print('Telegram: polling started')
+ else:
+  print('Telegram: disabled by TELEGRAM_ENABLED=false')
 
  try:
   while True:
    await asyncio.sleep(3600)
  finally:
-  await app.updater.stop()
-  await app.stop()
-  await app.shutdown()
+  if telegram_app:
+   await telegram_app.updater.stop()
+   await telegram_app.stop()
+   await telegram_app.shutdown()
+  if api_server:
+   api_server.should_exit=True
+  if api_task:
+   await api_task
+
 
 if __name__=='__main__':
  asyncio.run(main())
