@@ -931,6 +931,14 @@ class Engine:
     confidence=float(sig.confidence),reason=sig.reason,
     risk_cash=actual_risk,risk_pct=actual_risk_pct,rr_actual=actual_rr,
    )
+   await self.notify(
+    f'✅ تم فتح صفقة {symbol}',
+    trade_ticket=pos.ticket,
+    event_type='trade_opened',
+    symbol=symbol,
+    side=sig.side.value,
+    t4bot_only=True,
+   )
    asyncio.create_task(self._send_trade_chart(t,actual_risk,actual_risk_pct))
 
  async def _handle_invalid_initial_r(self,symbol,pos,fill,actual_sl):
@@ -1204,10 +1212,28 @@ class Engine:
     )
     await self._refresh_strategy_performance(force=True)
     caption=await self._trade_caption(t,pnl=pnl,closed=True)
+    await self.notify(
+     caption,
+     trade_ticket=t.ticket,
+     trade_result=pnl,
+     trade_result_reason=result_reason,
+     event_type='trade_closed',
+     symbol=t.symbol,
+     side=t.side.value,
+     t4bot_only=True,
+    )
     await self.notify(caption,trade_ticket=t.ticket,trade_update=True,trade_result=pnl,trade_result_reason=result_reason)
    else:
     await self.db.log('POSITION_CLOSED',t.symbol,reason='history_not_found')
     caption=await self._trade_caption(t,pnl=None,closed=True)
+    await self.notify(
+     caption,
+     trade_ticket=t.ticket,
+     event_type='trade_closed',
+     symbol=t.symbol,
+     side=t.side.value,
+     t4bot_only=True,
+    )
     await self.notify(caption,trade_ticket=t.ticket,trade_update=True)
 
    self.last_close_by_symbol[t.symbol]=time.time()
@@ -1246,6 +1272,14 @@ class Engine:
      'PROTECTION_ACTIVATED',t.symbol,
      ticket=t.ticket,sl=level45,price=price,
      target_progress=target_progress,target_progress_pct=target_progress*100.0
+    )
+    await self.notify(
+     f'🛡 تم تفعيل حماية الربح — {t.symbol}',
+     trade_ticket=t.ticket,
+     event_type='profit_protection',
+     symbol=t.symbol,
+     side=t.side.value,
+     t4bot_only=True,
     )
 
    else:
