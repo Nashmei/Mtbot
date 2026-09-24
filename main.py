@@ -39,6 +39,7 @@ async def main():
   import time
 
   # T4Bot events are independent of Telegram availability/flood limits.
+  media_id=event_hub.store_trade_media(trade_ticket,photo_path) if photo_path and trade_ticket is not None else None
   await event_hub.broadcast(
    'engine_notification',
    {
@@ -47,6 +48,7 @@ async def main():
     'trade_update':bool(trade_update),
     'trade_result':trade_result,
     'trade_result_reason':trade_result_reason,
+    'media_id':media_id,
    }
   )
 
