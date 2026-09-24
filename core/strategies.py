@@ -458,3 +458,107 @@ def diagnose_scalp_squeeze_expansion(ctx):
         'buy_allowed':buy_allowed,'sell_allowed':sell_allowed,'failed':failed,
     })
     return out
+
+
+# ============================================================
+# EXPERIMENTAL INDICATOR STRATEGIES (branch: 5test)
+# ============================================================
+
+def _series_ema(values, period):
+    values=np.asarray(values,dtype=float)
+    if len(values)==0:return np.asarray([],dtype=float)
+    out=np.empty(len(values),dtype=float); out[0]=values[0]
+    k=2.0/(period+1.0)
+    for i in range(1,len(values)):
+        out[i]=k*values[i]+(1.0-k)*out[i-1]
+    return out
+
+def _indicator_sl(ctx, min_atr=.65, max_atr=1.7, range_factor=.30):
+    atrp=ctx['atrp']
+    return max(10.,min(max_atr*atrp,max(min_atr*atrp,ctx['tick_range']*range_factor)))
+
+MACD_STRATEGY={'name':'macd_momentum','fast':12,'slow':26,'signal':9,'score_base':74,'score_cap':.91}
+def macd_momentum(ctx):
+    rates=ctx['rates']
+    if rates is None or len(rates)<45:return None
+    c=np.asarray(rates['close'],float)
+    fast=_series_ema(c,MACD_STRATEGY['fast']); slow=_series_ema(c,MACD_STRATEGY['slow'])
+    macd=fast-slow; sig=_series_ema(macd,MACD_STRATEGY['signal']); hist=macd-sig
+    cross_up=macd[-2]<=sig[-2] and macd[-1]>sig[-1]
+    cross_dn=macd[-2]>=sig[-2] and macd[-1]<sig[-1]
+    side=Side.BUY if cross_up and hist[-1]>0 and ctx['tick_momentum_fast']>0 else (Side.SELL if cross_dn and hist[-1]<0 and ctx['tick_momentum_fast']<0 else None)
+    if side is None or not ctx['strategy_allowed'](MACD_STRATEGY['name'],side):return None
+    if ctx['m15_bias'] not in (0,1 if side==Side.BUY else -1):return None
+    strength=abs(hist[-1])/max(ctx['atrp']*ctx['point'],ctx['point'])
+    score=MACD_STRATEGY['score_base']+min(12,strength*18)+min(5,abs(ctx['tick_momentum_fast'])/max(ctx['atrp'],1)*8)
+    return Signal(side,MACD_STRATEGY['name'],min(MACD_STRATEGY['score_cap'],score/100.),_indicator_sl(ctx),'MACD 12/26/9 cross + histogram + live momentum')
+
+ALLIGATOR_STRATEGY={'name':'alligator_trend','jaw':13,'teeth':8,'lips':5,'score_base':73,'score_cap':.90}
+def alligator_trend(ctx):
+    rates=ctx['rates']
+    if rates is None or len(rates)<35:return None
+    c=np.asarray(rates['close'],float)
+    jaw=_series_ema(c,13)[-1]; teeth=_series_ema(c,8)[-1]; lips=_series_ema(c,5)[-1]
+    gap=(max(jaw,teeth,lips)-min(jaw,teeth,lips))/ctx['point']
+    min_gap=max(2.,ctx['atrp']*.08)
+    buy=lips>teeth>jaw and ctx['live']>lips and ctx['tick_momentum']>0
+    sell=lips<teeth<jaw and ctx['live']<lips and ctx['tick_momentum']<0
+    side=Side.BUY if buy else (Side.SELL if sell else None)
+    if side is None or gap<min_gap or not ctx['strategy_allowed'](ALLIGATOR_STRATEGY['name'],side):return None
+    if not ctx['htf_allows'](side):return None
+    score=ALLIGATOR_STRATEGY['score_base']+min(12,gap/max(ctx['atrp'],1)*20)+min(5,abs(ctx['tick_momentum'])/max(ctx['atrp'],1)*8)
+    return Signal(side,ALLIGATOR_STRATEGY['name'],min(ALLIGATOR_STRATEGY['score_cap'],score/100.),_indicator_sl(ctx,.70,1.8,.32),'Alligator 5/8/13 aligned + HTF trend + momentum')
+
+MOVING_AVERAGE_STRATEGY={'name':'moving_average_trend','fast':20,'slow':50,'score_base':72,'score_cap':.89}
+def moving_average_trend(ctx):
+    rates=ctx['rates']
+    if rates is None or len(rates)<60:return None
+    c=np.asarray(rates['close'],float)
+    f=_series_ema(c,20); s=_series_ema(c,50)
+    cross_up=f[-2]<=s[-2] and f[-1]>s[-1]
+    cross_dn=f[-2]>=s[-2] and f[-1]<s[-1]
+    side=Side.BUY if cross_up and ctx['live']>f[-1] and ctx['tick_momentum_fast']>0 else (Side.SELL if cross_dn and ctx['live']<f[-1] and ctx['tick_momentum_fast']<0 else None)
+    if side is None or not ctx['strategy_allowed'](MOVING_AVERAGE_STRATEGY['name'],side):return None
+    if ctx['h1_bias'] not in (0,1 if side==Side.BUY else -1):return None
+    gap=abs(f[-1]-s[-1])/ctx['point']
+    score=MOVING_AVERAGE_STRATEGY['score_base']+min(12,gap/max(ctx['atrp'],1)*15)+min(5,abs(ctx['tick_momentum_fast'])/max(ctx['atrp'],1)*8)
+    return Signal(side,MOVING_AVERAGE_STRATEGY['name'],min(MOVING_AVERAGE_STRATEGY['score_cap'],score/100.),_indicator_sl(ctx),'EMA 20/50 cross + H1 guard + live confirmation')
+
+RSI_STRATEGY={'name':'rsi_reversal','period':14,'oversold':30.,'overbought':70.,'score_base':73,'score_cap':.90}
+def _rsi(values, period=14):
+    v=np.asarray(values,dtype=float)
+    if len(v)<period+2:return 50.
+    d=np.diff(v); gains=np.maximum(d,0.); losses=np.maximum(-d,0.)
+    ag=float(np.mean(gains[-period:])); al=float(np.mean(losses[-period:]))
+    if al<=1e-12:return 100.
+    return 100.-100./(1.+ag/al)
+
+def rsi_reversal(ctx):
+    rates=ctx['rates']
+    if rates is None or len(rates)<25 or not ctx['range_ok']:return None
+    c=np.asarray(rates['close'],float)
+    prev=_rsi(c[:-1],14); now=_rsi(c,14)
+    buy=prev<=RSI_STRATEGY['oversold'] and now>RSI_STRATEGY['oversold'] and ctx['tick_momentum_fast']>0
+    sell=prev>=RSI_STRATEGY['overbought'] and now<RSI_STRATEGY['overbought'] and ctx['tick_momentum_fast']<0
+    side=Side.BUY if buy else (Side.SELL if sell else None)
+    if side is None or not ctx['strategy_allowed'](RSI_STRATEGY['name'],side):return None
+    extreme=max(0.,RSI_STRATEGY['oversold']-prev) if side==Side.BUY else max(0.,prev-RSI_STRATEGY['overbought'])
+    score=RSI_STRATEGY['score_base']+min(12,extreme*.8)+min(5,abs(ctx['tick_momentum_fast'])/max(ctx['atrp'],1)*8)
+    return Signal(side,RSI_STRATEGY['name'],min(RSI_STRATEGY['score_cap'],score/100.),_indicator_sl(ctx,.65,1.5,.28),'RSI 14 exits extreme + live reversal confirmation')
+
+BOLLINGER_STRATEGY={'name':'bollinger_reversion','period':20,'stddev':2.0,'score_base':74,'score_cap':.91}
+def bollinger_reversion(ctx):
+    rates=ctx['rates']
+    if rates is None or len(rates)<25 or not ctx['range_ok']:return None
+    c=np.asarray(rates['close'],float); window=c[-20:]
+    mean=float(np.mean(window)); std=max(float(np.std(window)),ctx['point'])
+    upper=mean+2.*std; lower=mean-2.*std
+    prev_window=c[-21:-1]; pm=float(np.mean(prev_window)); ps=max(float(np.std(prev_window)),ctx['point'])
+    prev_upper=pm+2.*ps; prev_lower=pm-2.*ps
+    buy=c[-2]<=prev_lower and c[-1]>lower and ctx['tick_momentum_fast']>0
+    sell=c[-2]>=prev_upper and c[-1]<upper and ctx['tick_momentum_fast']<0
+    side=Side.BUY if buy else (Side.SELL if sell else None)
+    if side is None or not ctx['strategy_allowed'](BOLLINGER_STRATEGY['name'],side):return None
+    excursion=(prev_lower-c[-2])/std if side==Side.BUY else (c[-2]-prev_upper)/std
+    score=BOLLINGER_STRATEGY['score_base']+min(12,max(0.,excursion)*10)+min(5,abs(ctx['tick_momentum_fast'])/max(ctx['atrp'],1)*8)
+    return Signal(side,BOLLINGER_STRATEGY['name'],min(BOLLINGER_STRATEGY['score_cap'],score/100.),_indicator_sl(ctx,.65,1.55,.28),'Bollinger 20/2 re-entry + range guard + live reversal')
