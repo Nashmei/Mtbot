@@ -20,6 +20,8 @@ for name, value in {
     "COPY_TICKS_ALL": -1,
     "TRADE_RETCODE_DONE": 10009,
     "TRADE_RETCODE_DONE_PARTIAL": 10010,
+    "POSITION_TYPE_BUY": 0,
+    "POSITION_TYPE_SELL": 1,
 }.items():
     setattr(fake_mt5, name, value)
 sys.modules["MetaTrader5"] = fake_mt5
@@ -333,7 +335,12 @@ class MarketSafetyTests(unittest.TestCase):
         asyncio.run(check())
 
 
-    def test_start_rejects_existing_untracked_bot_position(self):
+    def test_start_adopts_existing_manual_position_with_sl_tp(self):
+        position = types.SimpleNamespace(
+            magic=0, ticket=77, symbol="EURUSD", type=fake_mt5.POSITION_TYPE_BUY,
+            price_open=1.1000, sl=1.0950, tp=1.1150, volume=0.10,
+            time=time.time()-7200,
+        )
         class Gateway:
             def account(self):
                 return types.SimpleNamespace(
@@ -347,7 +354,50 @@ class MarketSafetyTests(unittest.TestCase):
                     "trade_expert": True,
                 }
             def positions(self):
-                return (types.SimpleNamespace(magic=4009, ticket=77),)
+                return (position,)
+        messages = []
+        async def notify(message, **kwargs):
+            messages.append(message)
+        async def idle_loop():
+            await asyncio.sleep(60)
+        async def check():
+            engine = Engine(Gateway(), FakeDB(), notify)
+            engine.loop = idle_loop
+            before = time.time()
+            started = await engine.start()
+            self.assertTrue(started)
+            self.assertTrue(engine.running)
+            self.assertEqual(engine.mode, "RUNNING")
+            self.assertIn(77, engine.trades)
+            trade = engine.trades[77]
+            self.assertEqual(trade.strategy, "manual_adopted")
+            self.assertGreaterEqual(trade.opened_at, before)
+            self.assertTrue(any(event == "POSITION_ADOPTED" for event, _ in engine.db.events))
+            engine.running = False
+            engine.mode = "STOPPED"
+            engine.loop_task.cancel()
+        asyncio.run(check())
+
+    def test_start_rejects_existing_position_without_sl_or_tp(self):
+        position = types.SimpleNamespace(
+            magic=0, ticket=78, symbol="EURUSD", type=fake_mt5.POSITION_TYPE_BUY,
+            price_open=1.1000, sl=0.0, tp=1.1150, volume=0.10,
+            time=time.time()-60,
+        )
+        class Gateway:
+            def account(self):
+                return types.SimpleNamespace(
+                    trade_mode=0, equity=1000, currency="USD"
+                )
+            def algo_status(self):
+                return {
+                    "connected": True,
+                    "trade_allowed": True,
+                    "account_trade_allowed": True,
+                    "trade_expert": True,
+                }
+            def positions(self):
+                return (position,)
         messages = []
         async def notify(message, **kwargs):
             messages.append(message)
@@ -356,36 +406,54 @@ class MarketSafetyTests(unittest.TestCase):
             started = await engine.start()
             self.assertFalse(started)
             self.assertFalse(engine.running)
-            self.assertTrue(any("غير متتبعة" in m for m in messages))
+            self.assertEqual(engine.mode, "STOPPED")
+            self.assertTrue(any("SL/TP" in m for m in messages))
         asyncio.run(check())
 
-    def test_stop_partial_close_keeps_trade_tracked(self):
-        position = types.SimpleNamespace(ticket=42, symbol="EURUSD", volume=0.10)
-        remaining = types.SimpleNamespace(ticket=42, symbol="EURUSD", volume=0.05)
+    def test_stop_enters_draining_without_closing_position(self):
         class Gateway:
             def __init__(self):
-                self.lookups = 0
-            def position_by_ticket(self, ticket):
-                self.lookups += 1
-                return position if self.lookups == 1 else remaining
+                self.close_calls = 0
             def close(self, pos):
-                return types.SimpleNamespace(
-                    retcode=fake_mt5.TRADE_RETCODE_DONE_PARTIAL,
-                    comment="partial",
-                )
+                self.close_calls += 1
+                raise AssertionError("stop must not close positions")
         messages = []
         async def notify(message, **kwargs):
             messages.append(message)
         async def check():
-            engine = Engine(Gateway(), FakeDB(), notify)
-            trade = types.SimpleNamespace(ticket=42, symbol="EURUSD")
-            engine.trades[42] = trade
+            gw = Gateway()
+            engine = Engine(gw, FakeDB(), notify)
+            engine.trades[42] = types.SimpleNamespace(ticket=42, symbol="EURUSD")
             engine.running = True
-            await engine.stop()
-            self.assertFalse(engine.running)
+            engine.mode = "RUNNING"
+            state = await engine.stop()
+            self.assertEqual(state, "DRAINING")
+            self.assertTrue(engine.running)
+            self.assertEqual(engine.mode, "DRAINING")
             self.assertIn(42, engine.trades)
-            self.assertTrue(any(event == "STOP_EXIT_PARTIAL" for event, _ in engine.db.events))
-            self.assertTrue(any("إغلاق جزئي" in m for m in messages))
+            self.assertEqual(gw.close_calls, 0)
+            self.assertTrue(any(event == "BOT_DRAINING" for event, _ in engine.db.events))
+            self.assertTrue(any("إدارة" in m or "مراقبة" in m for m in messages))
+        asyncio.run(check())
+
+    def test_session_profit_target_switches_to_draining(self):
+        messages = []
+        async def notify(message, **kwargs):
+            messages.append(message)
+        async def check():
+            engine = Engine(None, FakeDB(), notify)
+            engine.running = True
+            engine.mode = "RUNNING"
+            engine.session_profit_target = 100.0
+            engine.trades[1] = types.SimpleNamespace(ticket=1)
+            engine.trades[2] = types.SimpleNamespace(ticket=2)
+            await engine._register_session_pnl(40.0, closing_ticket=1)
+            self.assertEqual(engine.mode, "RUNNING")
+            await engine._register_session_pnl(65.0, closing_ticket=1)
+            self.assertEqual(engine.mode, "DRAINING")
+            self.assertAlmostEqual(engine.session_realized_profit, 105.0)
+            self.assertTrue(engine.session_target_notified)
+            self.assertTrue(any("هدف الجلسة" in m for m in messages))
         asyncio.run(check())
 
     def test_daily_equity_limit_blocks_exact_threshold(self):
@@ -520,7 +588,8 @@ class MarketSafetyTests(unittest.TestCase):
         engine = types.SimpleNamespace(
             risk_pct=2.0, rr=1.5, min_confidence=75.0, protection_pct=40.0,
             max_trade_minutes=45.0, max_positions=5, max_consecutive_losses=3,
-            daily_loss_limit_pct=2.0, loss_limit_notified=True, daily_loss_notified=True,
+            daily_loss_limit_pct=2.0, session_profit_target=0.0,
+            loss_limit_notified=True, daily_loss_notified=True,
         )
         async def check():
             ui = TelegramUI(engine, db)
@@ -533,6 +602,7 @@ class MarketSafetyTests(unittest.TestCase):
                 ("maxpos", "4", "max_positions", 4),
                 ("maxloss", "0", "max_consecutive_losses", 0),
                 ("dailyloss", "0", "daily_loss_limit_pct", 0.0),
+                ("sessionprofit", "125", "session_profit_target", 125.0),
             )
             for key, raw, db_key, expected in cases:
                 await ui._apply_setting(key, raw)
@@ -545,6 +615,7 @@ class MarketSafetyTests(unittest.TestCase):
             self.assertEqual(engine.max_positions, 4)
             self.assertEqual(engine.max_consecutive_losses, 0)
             self.assertEqual(engine.daily_loss_limit_pct, 0.0)
+            self.assertEqual(engine.session_profit_target, 125.0)
             self.assertFalse(engine.loss_limit_notified)
             self.assertFalse(engine.daily_loss_notified)
         asyncio.run(check())
