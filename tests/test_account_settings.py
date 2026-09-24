@@ -33,18 +33,22 @@ class AccountSettingsTests(unittest.TestCase):
             asyncio.run(engine.load_settings(login=111,migrate_legacy=False))
             engine.rr=2.0
             engine.risk_pct=1.25
+            engine.session_profit_target=125.0
             asyncio.run(engine.save_setting('rr',engine.rr))
             asyncio.run(engine.save_setting('risk_pct',engine.risk_pct))
+            asyncio.run(engine.save_setting('session_profit_target',engine.session_profit_target))
 
             gw.login=222
             asyncio.run(engine.load_settings(login=222,migrate_legacy=False))
             self.assertEqual(engine.rr,3.0)
             self.assertEqual(engine.risk_pct,0.25)
+            self.assertEqual(engine.session_profit_target,0.0)
 
             gw.login=111
             asyncio.run(engine.load_settings(login=111,migrate_legacy=False))
             self.assertEqual(engine.rr,2.0)
             self.assertEqual(engine.risk_pct,1.25)
+            self.assertEqual(engine.session_profit_target,125.0)
         finally:
             try:
                 os.unlink(path)
