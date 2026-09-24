@@ -279,6 +279,245 @@ cd "$HOME/.wine/drive_c/mt5bot" && git fetch origin main && git reset --hard ori
 
 هذا لا ينبغي أن يحذف `.env` غير المتتبع، لكن تحقق دائماً من الأسرار وقاعدة البيانات قبل أي تنظيف يدوي. لا تستخدم أوامر حذف واسعة داخل مجلد المشروع.
 
+
+## خريطة الملفات والمسارات
+
+هذه هي الخريطة الحالية للمشروع على GitHub وعلى السيرفر. أي تعديل جديد يجب أن يبدأ من الملف المسؤول فعلياً عن الوظيفة، وليس من واجهة T4Bot أو Telegram وحدها.
+
+| الوظيفة | ملف المشروع | المسار على السيرفر |
+|---|---|---|
+| نقطة تشغيل البوت | `main.py` | `/home/ubuntu/.wine/drive_c/mt5bot/main.py` |
+| إعدادات البيئة | `core/config.py` + `.env` | `/home/ubuntu/.wine/drive_c/mt5bot/core/config.py` + `/home/ubuntu/.wine/drive_c/mt5bot/.env` |
+| محرك التداول | `core/engine.py` | `/home/ubuntu/.wine/drive_c/mt5bot/core/engine.py` |
+| التحليل | `core/analyzer.py` | `/home/ubuntu/.wine/drive_c/mt5bot/core/analyzer.py` |
+| الاستراتيجيات | `core/strategies.py` | `/home/ubuntu/.wine/drive_c/mt5bot/core/strategies.py` |
+| ترتيب الاستراتيجيات | `core/strategy_ranker.py` | `/home/ubuntu/.wine/drive_c/mt5bot/core/strategy_ranker.py` |
+| إدارة المخاطر | `core/risk.py` | `/home/ubuntu/.wine/drive_c/mt5bot/core/risk.py` |
+| نماذج Signal/TradeState | `core/models.py` | `/home/ubuntu/.wine/drive_c/mt5bot/core/models.py` |
+| الاتصال بـ MT5 | `core/mt5_gateway.py` | `/home/ubuntu/.wine/drive_c/mt5bot/core/mt5_gateway.py` |
+| Telegram | `bot/telegram_app.py` | `/home/ubuntu/.wine/drive_c/mt5bot/bot/telegram_app.py` |
+| T4Bot REST/WebSocket API | `api/control_api.py` | `/home/ubuntu/.wine/drive_c/mt5bot/api/control_api.py` |
+| بث أحداث T4Bot | `api/events.py` | `/home/ubuntu/.wine/drive_c/mt5bot/api/events.py` |
+| طبقة APNs القديمة/الاختيارية | `api/push.py` | `/home/ubuntu/.wine/drive_c/mt5bot/api/push.py` |
+| SQLite | `storage/db.py` | `/home/ubuntu/.wine/drive_c/mt5bot/storage/db.py` |
+| قاعدة البيانات الفعلية | — | `/home/ubuntu/.wine/drive_c/mt5bot/storage/bot.db` |
+| بيانات دخول MT5 المحفوظة | — | `/home/ubuntu/.mt5bot_credentials.json` |
+| الاختبارات | `tests/` | `/home/ubuntu/.wine/drive_c/mt5bot/tests/` |
+| Workflow فحص T4Bot API | `.github/workflows/t4bot-api-checks.yml` | GitHub Actions |
+
+> ملف `~/.mt5bot_credentials.json` قد لا يكون موجوداً إذا لم يتم حفظ حساب على الخادم. لا تضع محتواه أو `.env` في GitHub.
+
+## خريطة السيرفر
+
+المسارات التشغيلية المعتمدة حالياً:
+
+```text
+Project root
+/home/ubuntu/.wine/drive_c/mt5bot
+
+Wine prefix
+/home/ubuntu/.wine
+
+Wine executable
+/opt/wine-staging/bin/wine
+
+Windows Python executable
+/home/ubuntu/.wine/drive_c/users/ubuntu/AppData/Local/Programs/Python/Python311/python.exe
+
+Windows Python path داخل Wine
+C:\users\ubuntu\AppData\Local\Programs\Python\Python311\python.exe
+
+MT5 Terminal
+/home/ubuntu/.wine/drive_c/Program Files/MetaTrader 5/terminal64.exe
+
+SQLite
+/home/ubuntu/.wine/drive_c/mt5bot/storage/bot.db
+
+MT5 credentials
+/home/ubuntu/.mt5bot_credentials.json
+
+systemd service
+/etc/systemd/system/mtbot.service
+
+T4Bot API local endpoint
+http://127.0.0.1:7099
+
+Display / X authority
+DISPLAY=:1
+XAUTHORITY=/home/ubuntu/.Xauthority
+```
+
+المنفذ `7099` يجب أن يبقى مربوطاً محلياً بـ `127.0.0.1`. الوصول من T4Bot يكون عبر HTTPS tunnel/reverse proxy إلى هذا المنفذ، وليس بفتح 7099 مباشرة للإنترنت. رابط Quick Tunnel ليس عنواناً دائماً وقد يتغير عند إعادة تشغيل tunnel.
+
+## طريقة عمل النظام من البداية للنهاية
+
+المسار العام:
+
+```text
+T4Bot / Telegram
+       │
+       ▼
+main.py
+       │
+       ├── Control API / WebSocket ──► api/control_api.py + api/events.py
+       │
+       ├── Telegram UI ──────────────► bot/telegram_app.py
+       │
+       ▼
+core/engine.py
+       │
+       ├──► core/analyzer.py
+       │       ├──► core/strategies.py
+       │       └──► core/strategy_ranker.py
+       │
+       ├──► core/risk.py
+       │
+       ├──► core/mt5_gateway.py
+       │       └──► MetaTrader5 Python API
+       │               └──► terminal64.exe
+       │
+       └──► storage/db.py
+               └──► storage/bot.db
+```
+
+عند التشغيل، `main.py` يفتح SQLite، ينشئ `MT5Gateway`، ويحاول استرجاع حساب MT5 المحفوظ إن وجد. بعد ذلك ينشئ `Engine` ويحمل إعدادات الحساب، ثم يشغل Control API إذا كان `CONTROL_API_ENABLED=true` ويشغل Telegram إذا كان مفعلاً.
+
+T4Bot **ليس محرك تداول مستقلاً**. التطبيق يقرأ الحالة من `/v1/snapshot`، يرسل أوامر التحكم إلى API، ويتلقى التحديثات الحية من `/v1/ws`. القرار والتحليل والمخاطرة والتنفيذ تبقى كلها داخل Mtbot.
+
+مسار الصفقة:
+
+```text
+Engine cycle
+  → قراءة MT5 market data
+  → Analyzer يصنف السوق
+  → تشغيل الاستراتيجيات المرشحة على نفس snapshot
+  → Strategy Ranker يختار المرشح
+  → فلاتر الثقة/السوق/السبريد/التكرار/الارتباط
+  → Risk يحسب الحجم
+  → MT5Gateway: order_check
+  → MT5Gateway: order_send
+  → انتظار ظهور المركز وربطه
+  → تسجيل OPEN في SQLite
+  → متابعة SL/TP والحماية والمدة
+  → عند الإغلاق: قراءة نتيجة MT5 وتسجيلها وتحديث الأداء
+```
+
+مسار أحداث T4Bot الحالي يعتمد WebSocket. Mtbot يبث أحداث الحالة/الصفقات من خلال `EventHub`، والتطبيق يستهلكها فورياً. إشعارات الصفقات على iPhone يجري تحويلها في التطبيق إلى إشعارات iOS محلية/Live Activity؛ لذلك لا ينبغي ربط صحة WebSocket بإرسال Telegram أو flood control الخاص به.
+
+## Control API الخاص بـ T4Bot
+
+الإعداد النموذجي في `.env`:
+
+```dotenv
+CONTROL_API_ENABLED=true
+CONTROL_API_HOST=127.0.0.1
+CONTROL_API_PORT=7099
+CONTROL_API_TOKEN=<long-random-secret>
+TELEGRAM_ENABLED=false
+```
+
+أهم المسارات:
+
+```text
+GET    /v1/health
+GET    /v1/snapshot
+POST   /v1/engine/start
+POST   /v1/engine/stop
+POST   /v1/analysis/run
+GET    /v1/symbols
+PUT    /v1/symbols
+PATCH  /v1/settings
+POST   /v1/account/login
+GET    /v1/trades/history
+GET    /v1/media/{media_id}
+WS     /v1/ws
+```
+
+جميع مسارات التحكم المحمية تستخدم:
+
+```http
+Authorization: Bearer <CONTROL_API_TOKEN>
+```
+
+لا تكتب التوكن داخل README أو GitHub. التطبيق يحفظه في Keychain.
+
+## تشغيل وإدارة السيرفر
+
+فحص الخدمة:
+
+```bash
+systemctl show mtbot.service -p ActiveState -p SubState -p MainPID -p NRestarts -p Result
+```
+
+عرض السجل الحي:
+
+```bash
+journalctl -u mtbot.service -f
+```
+
+إعادة التشغيل:
+
+```bash
+sudo systemctl restart mtbot.service
+```
+
+فحص العمليات المتعلقة بالمشروع دون قتلها:
+
+```bash
+ps -eo pid,ppid,lstart,args | grep -Ei 'python.exe|Python311|mt5bot|terminal64' | grep -v grep
+```
+
+لا تشغّل `main.py` يدوياً والخدمة شغالة في نفس الوقت؛ هذا قد يسبب duplicate Telegram polling وتعارضاً في نفس بيئة MT5.
+
+## Deployment للفروع
+
+الإنتاج/الفرع المستقر:
+
+```bash
+cd /home/ubuntu/.wine/drive_c/mt5bot
+git fetch origin main
+git reset --hard origin/main
+sudo systemctl restart mtbot.service
+```
+
+أثناء تطوير T4Bot API نستخدم فرع الميزة:
+
+```bash
+cd /home/ubuntu/.wine/drive_c/mt5bot
+git fetch origin feature/t4bot-control-api
+git reset --hard origin/feature/t4bot-control-api
+WINEDEBUG=-all /opt/wine-staging/bin/wine \
+  /home/ubuntu/.wine/drive_c/users/ubuntu/AppData/Local/Programs/Python/Python311/python.exe \
+  -m pip install -r requirements.txt
+sudo systemctl restart mtbot.service
+```
+
+بعدها تحقق من commit والخدمة:
+
+```bash
+git rev-parse HEAD
+systemctl show mtbot.service -p ActiveState -p SubState -p MainPID -p NRestarts -p Result
+```
+
+لا تعمل Merge لفرع الميزة لمجرد أنه يعمل على السيرفر؛ الدمج خطوة مستقلة بعد الاختبار والموافقة.
+
+## أسلوب التطوير
+
+القاعدة العملية لهذا المشروع:
+
+```text
+1. افحص النسخة الحالية والملفات ذات العلاقة.
+2. أنشئ/استخدم Feature Branch وPR؛ لا تعدل main مباشرة.
+3. عدل أقل طبقة مسؤولة عن الوظيفة مع الحفاظ على التوافق.
+4. راجع مسار Engine → Risk/Analyzer → MT5 عند أي تعديل تداول.
+5. راجع API + WebSocket + T4Bot عند أي تعديل واجهة تحكم.
+6. اختبر syntax/API contract قبل deployment.
+7. انشر نفس SHA الذي تم اختباره.
+8. افحص systemd وMT5 readiness بعد restart.
+9. لا تعمل Merge إلا بعد موافقة صريحة.
+```
+
+
 ## الأمان
 
 - DEMO فقط في النسخة الحالية.
