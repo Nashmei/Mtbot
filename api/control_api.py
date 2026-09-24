@@ -248,13 +248,17 @@ class ControlAPI:
 
             await self.event_hub.connect(websocket)
             try:
-                await websocket.send_json({
-                    'type': 'snapshot',
-                    'ts': time.time(),
-                    'payload': await self.snapshot(),
-                })
+                # Stream live server state directly to T4Bot. This removes the
+                # old client-side polling delay while keeping MT5 as the source
+                # of truth. EventHub messages still arrive immediately between
+                # snapshots for command/state invalidation.
                 while True:
-                    await websocket.receive_text()
+                    await websocket.send_json({
+                        'type': 'snapshot',
+                        'ts': time.time(),
+                        'payload': await self.snapshot(),
+                    })
+                    await asyncio.sleep(0.25)
             except WebSocketDisconnect:
                 pass
             except Exception:
