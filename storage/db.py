@@ -50,12 +50,13 @@ class DB:
   sql='''WITH opens AS (
    SELECT
     id,ts,symbol,
-    json_extract(details,'$.strategy') AS strategy,
-    LEAD(ts) OVER (PARTITION BY symbol ORDER BY ts) AS next_open_ts
+    CAST(json_extract(details,'$.ticket') AS INTEGER) AS ticket,
+    json_extract(details,'$.strategy') AS strategy
    FROM audit
    WHERE event='OPEN'
      AND ts>=?
      AND json_extract(details,'$.strategy') IS NOT NULL
+     AND json_extract(details,'$.ticket') IS NOT NULL
   ),
   paired AS (
    SELECT
@@ -63,10 +64,9 @@ class DB:
     (
      SELECT c.id
      FROM audit c
-     WHERE c.symbol=o.symbol
+     WHERE c.event IN ('TP','SL','POSITION_CLOSED')
+       AND CAST(json_extract(c.details,'$.ticket') AS INTEGER)=o.ticket
        AND c.ts>o.ts
-       AND c.event IN ('TP','SL','POSITION_CLOSED')
-       AND (o.next_open_ts IS NULL OR c.ts<o.next_open_ts)
      ORDER BY c.ts ASC
      LIMIT 1
     ) AS close_id
