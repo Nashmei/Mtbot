@@ -86,3 +86,26 @@ class DB:
       'window':window,
      }
   return out
+
+
+ async def recent_audit(self,limit=100):
+  limit=max(1,min(int(limit),500))
+  rows=[]
+  async with aiosqlite.connect(self.path) as d:
+   async with d.execute(
+    'SELECT id,ts,event,symbol,details FROM audit ORDER BY id DESC LIMIT ?',
+    (limit,)
+   ) as cur:
+    async for row_id,ts,event,symbol,details in cur:
+     try:
+      parsed=json.loads(details or '{}')
+     except (TypeError,json.JSONDecodeError):
+      parsed={'raw':str(details or '')}
+     rows.append({
+      'id':int(row_id),
+      'ts':float(ts or 0),
+      'event':str(event or ''),
+      'symbol':str(symbol or ''),
+      'details':parsed if isinstance(parsed,dict) else {'value':parsed},
+     })
+  return rows

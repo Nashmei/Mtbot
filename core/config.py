@@ -8,10 +8,19 @@ class Settings(BaseSettings):
     """Bootstrap/runtime settings only.
 
     Trading preferences are account-scoped in storage/bot.db and are changed
-    through Telegram. They intentionally do not come from .env.
+    through an authenticated control surface. They intentionally do not come
+    from .env.
     """
-    telegram_bot_token: str
-    telegram_allowed_user_id: int
+
+    telegram_enabled: bool = True
+    telegram_bot_token: str | None = None
+    telegram_allowed_user_id: int | None = None
+
+    control_api_enabled: bool = False
+    control_api_host: str = '127.0.0.1'
+    control_api_port: int = 7099
+    control_api_token: str | None = None
+
     mt5_terminal_path: str | None = None
     app_mode: str = 'DEMO'
     spread_sample_size: int = 60
