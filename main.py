@@ -37,30 +37,29 @@ async def main():
  trade_messages={}
  blocked_until={'until':0.0}
 
- async def notify(text,photo_path=None,caption=None,trade_ticket=None,trade_update=False,pin=False,trade_result=None,trade_result_reason=None):
+ async def notify(text,photo_path=None,caption=None,trade_ticket=None,trade_update=False,pin=False,trade_result=None,trade_result_reason=None,event_type='engine_notification',symbol=None,side=None,t4bot_only=False):
   import time
 
   # T4Bot events are independent of Telegram availability/flood limits.
   media_id=event_hub.store_trade_media(trade_ticket,photo_path) if photo_path and trade_ticket is not None else None
   await event_hub.broadcast(
-   'engine_notification',
+   event_type,
    {
     'text':text,
     'trade_ticket':trade_ticket,
     'trade_update':bool(trade_update),
     'trade_result':trade_result,
     'trade_result_reason':trade_result_reason,
+    'symbol':symbol,
+    'side':side,
     'media_id':media_id,
    }
   )
-  if push_service.configured:
-   asyncio.create_task(
-    push_service.send_engine_notification(
-     text,
-     trade_result=trade_result,
-     trade_ticket=trade_ticket,
-    )
-   )
+
+  # Trade alerts for T4Bot are realtime data events only. The iOS app turns
+  # these events into local notifications; Mtbot does not send APNs.
+  if t4bot_only:
+   return
 
   app=app_holder.get('app')
   if not app:
