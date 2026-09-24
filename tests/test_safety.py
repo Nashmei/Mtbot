@@ -24,6 +24,13 @@ for name, value in {
     "POSITION_TYPE_SELL": 1,
 }.items():
     setattr(fake_mt5, name, value)
+def _fake_order_calc_profit(order_type, symbol, volume, price_open, price_close):
+    direction = 1 if order_type == getattr(fake_mt5, "ORDER_TYPE_BUY", 0) else -1
+    return direction * (price_close - price_open) * 100000.0 * volume
+
+fake_mt5.ORDER_TYPE_BUY = 0
+fake_mt5.ORDER_TYPE_SELL = 1
+fake_mt5.order_calc_profit = _fake_order_calc_profit
 sys.modules["MetaTrader5"] = fake_mt5
 
 fake_config = types.ModuleType("core.config")
