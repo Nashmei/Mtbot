@@ -8,6 +8,7 @@ from pathlib import Path
 
 import MetaTrader5 as mt5
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 
 from core.config import settings
@@ -35,6 +36,13 @@ class SettingsPatch(BaseModel):
 class SymbolsPayload(BaseModel):
     model_config = ConfigDict(extra='forbid')
     symbols: list[str] = Field(min_length=1, max_length=20)
+
+
+class PushRegistrationPayload(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    token: str = Field(min_length=16, max_length=512)
+    enabled: bool = True
+    preferences: dict[str, bool] = Field(default_factory=dict)
 
 
 class LoginPayload(BaseModel):
@@ -239,6 +247,29 @@ class ControlAPI:
         @app.get('/v1/audit')
         async def audit(limit: int = Query(default=100, ge=1, le=500), _=Depends(auth)):
             return await self.db.recent_audit(limit)
+        @app.get('/v1/trades/history')
+        async def trade_history(limit: int = Query(default=100, ge=1, le=500), _=Depends(auth)):
+            rows = await self.db.closed_trades(limit)
+            for row in rows:
+                row['image_id'] = self.event_hub.media_id_for_ticket(row.get('ticket'))
+            return rows
+
+        @app.get('/v1/media/{media_id}')
+        async def media(media_id: str, _=Depends(auth)):
+            path = self.event_hub.media_path(media_id)
+            if not path:
+                raise HTTPException(status_code=404, detail='الصورة غير موجودة.')
+            return FileResponse(path, media_type='image/png', filename=path.name)
+
+        @app.post('/v1/notifications/register')
+        async def register_notifications(payload: PushRegistrationPayload, _=Depends(auth)):
+            await self.db.upsert_push_device(
+                payload.token,
+                enabled=payload.enabled,
+                preferences=payload.preferences,
+            )
+            return {'ok': True, 'message': 'تم حفظ إعدادات الإشعارات.'}
+
 
         @app.websocket('/v1/ws')
         async def websocket_endpoint(websocket: WebSocket):
@@ -258,7 +289,7 @@ class ControlAPI:
                         'ts': time.time(),
                         'payload': await self.snapshot(),
                     })
-                    await asyncio.sleep(0.1)
+                    await asyncio.sleep(0.05)
             except WebSocketDisconnect:
                 pass
             except Exception:
@@ -416,6 +447,7 @@ class ControlAPI:
             'tp': self._number(getattr(position, 'tp', 0)),
             'profit': self._number(getattr(position, 'profit', 0)),
             'magic': int(getattr(position, 'magic', 0) or 0),
+            'image_id': self.event_hub.media_id_for_ticket(getattr(position, 'ticket', 0)),
         }
 
     def _store_credentials(self, login, server, password):
