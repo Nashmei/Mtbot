@@ -185,155 +185,6 @@ class Engine:
    await self.db.log('STRATEGY_PERFORMANCE_ERROR',error=repr(ex))
 
 
- async def _position_open_metadata(self,ticket):
-  if not hasattr(self.db,'open_trade_metadata'):
-   return None
-  try:
-   return await self.db.open_trade_metadata(ticket)
-  except Exception as ex:
-   await self.db.log('POSITION_METADATA_ERROR',ticket=int(ticket),error=repr(ex))
-   return None
-
- async def _adopt_existing_positions(self,positions):
-  import math
-  now=time.time()
-  adopted={}
-  rows=[]
-  errors=[]
-
-  for p in positions:
-   ticket=int(getattr(p,'ticket',0) or 0)
-   symbol=str(getattr(p,'symbol','') or '')
-   entry=float(getattr(p,'price_open',0) or 0)
-   sl=float(getattr(p,'sl',0) or 0)
-   tp=float(getattr(p,'tp',0) or 0)
-   volume=float(getattr(p,'volume',0) or 0)
-   ptype=getattr(p,'type',None)
-
-   if ptype==getattr(mt5,'POSITION_TYPE_BUY',0):
-    side=Side.BUY
-   elif ptype==getattr(mt5,'POSITION_TYPE_SELL',1):
-    side=Side.SELL
-   else:
-    errors.append(f'{ticket or "?"} {symbol or "?"}: نوع المركز غير مدعوم')
-    continue
-
-   values=(entry,sl,tp,volume)
-   if (not ticket or not symbol or any(not math.isfinite(v) for v in values)
-       or entry<=0 or sl<=0 or tp<=0 or volume<=0):
-    errors.append(f'{ticket or "?"} {symbol or "?"}: يجب وجود SL وTP صالحين')
-    continue
-
-   # A protected existing position may already have SL beyond break-even.
-   # Require a valid target direction and keep SL on the safe side of TP,
-   # rather than requiring SL to remain behind the original entry.
-   geometry_ok=(
-    (side==Side.BUY and tp>entry and sl<tp)
-    or
-    (side==Side.SELL and tp<entry and sl>tp)
-   )
-   if not geometry_ok:
-    errors.append(f'{ticket} {symbol}: SL/TP غير صالحين لاتجاه الصفقة')
-    continue
-
-   magic=int(getattr(p,'magic',0) or 0)
-   source='bot' if magic==4009 else 'manual'
-   meta=await self._position_open_metadata(ticket) if source=='bot' else None
-   strategy=str((meta or {}).get('strategy') or ('bot_adopted' if source=='bot' else 'manual_adopted'))
-   regime=str((meta or {}).get('regime') or 'ADOPTED')
-   try:
-    confidence=float((meta or {}).get('confidence',0) or 0)
-   except (TypeError,ValueError):
-    confidence=0.0
-   reason=str((meta or {}).get('reason') or ('استعادة صفقة بوت مفتوحة' if source=='bot' else 'تبني صفقة MT5 يدوية'))
-   opened_at=(
-    float(getattr(p,'time',0) or now)
-    if source=='bot'
-    else now
-   )
-   target_distance=abs(tp-entry)
-   original_sl=float((meta or {}).get('sl',0) or 0) if source=='bot' else 0.0
-   initial_r=abs(entry-original_sl) if original_sl>0 else abs(entry-sl)
-   if initial_r<=0:
-    initial_r=target_distance/max(float(self.rr),0.5)
-   try:
-    adopted_protection=float((meta or {}).get('protection_pct',self.protection_pct) or self.protection_pct)
-   except (TypeError,ValueError):
-    adopted_protection=self.protection_pct
-   try:
-    adopted_gap=float((meta or {}).get('trailing_gap_pct',self.trailing_gap_pct) or self.trailing_gap_pct)
-   except (TypeError,ValueError):
-    adopted_gap=self.trailing_gap_pct
-   if not 5<=adopted_protection<=90:
-    adopted_protection=self.protection_pct
-   if not 0<adopted_gap<=50:
-    adopted_gap=self.trailing_gap_pct
-   trigger=adopted_protection/100.0
-   protection_level=(
-    entry+(target_distance*trigger)
-    if side==Side.BUY
-    else entry-(target_distance*trigger)
-   )
-   protection_active=(
-    sl>=protection_level
-    if side==Side.BUY
-    else sl<=protection_level
-   )
-
-   # Rebuild display/risk metadata so adopted positions receive the same
-   # Telegram trade panel lifecycle as newly opened positions.
-   try:
-    risk_cash=float((meta or {}).get('risk_cash',0) or 0)
-   except (TypeError,ValueError):
-    risk_cash=0.0
-   try:
-    risk_pct=float((meta or {}).get('risk_pct',0) or 0)
-   except (TypeError,ValueError):
-    risk_pct=0.0
-   try:
-    rr_actual=float((meta or {}).get('rr_actual',self.rr) or self.rr)
-   except (TypeError,ValueError):
-    rr_actual=self.rr
-   if source=='manual' or risk_cash<=0:
-    order_type=(
-     getattr(mt5,'ORDER_TYPE_BUY',0)
-     if side==Side.BUY
-     else getattr(mt5,'ORDER_TYPE_SELL',1)
-    )
-    risk_sl=original_sl if original_sl>0 else sl
-    estimated=mt5.order_calc_profit(order_type,symbol,volume,entry,risk_sl)
-    if estimated is not None:
-     risk_cash=max(0.0,-float(estimated))
-    account=self.gw.account()
-    equity=float(getattr(account,'equity',0) or 0) if account else 0.0
-    risk_pct=(risk_cash/equity*100.0) if equity>0 else 0.0
-    reward=mt5.order_calc_profit(order_type,symbol,volume,entry,tp)
-    if risk_cash>0 and reward is not None and float(reward)>0:
-     rr_actual=float(reward)/risk_cash
-
-   t=TradeState(
-    ticket=ticket,symbol=symbol,side=side,entry=entry,sl=sl,tp=tp,
-    initial_r=initial_r,opened_at=opened_at,
-    strategy=strategy,regime=regime,confidence=confidence,reason=reason,
-    volume=volume,protection_pct=adopted_protection,
-    trailing_gap_pct=adopted_gap,
-    protection_45_active=protection_active,trailing=protection_active,
-    best_favorable_price=entry,last_progress_at=now,
-    signal_bar=int((meta or {}).get('signal_bar',0) or 0),
-   )
-   adopted[ticket]=t
-   rows.append({
-    'ticket':ticket,'symbol':symbol,'source':source,'strategy':strategy,
-    'entry':entry,'sl':sl,'tp':tp,'volume':volume,
-    'opened_at':opened_at,'protection_pct':adopted_protection,
-    'trailing_gap_pct':adopted_gap,'protection_active':protection_active,
-    'risk_cash':risk_cash,'risk_pct':risk_pct,'rr_actual':rr_actual,
-   })
-
-  if errors:
-   return {},errors,[]
-  return adopted,[],rows
-
  async def _register_session_pnl(self,pnl,closing_ticket=None):
   import math
   try:
@@ -424,10 +275,6 @@ class Engine:
 
  async def start(self):
   import math
-  if self.mode=='RUNNING' and self.running:
-   await self.notify('ℹ️ البوت يعمل بالفعل.')
-   return True
-
   if not (math.isfinite(self.risk_pct) and 0<self.risk_pct<=50
           and math.isfinite(self.rr) and .5<=self.rr<=10
           and 1<=self.max_positions<=10
@@ -443,6 +290,9 @@ class Engine:
    await self.notify('🔒 يلزم اتصال بحساب MT5 تجريبي قبل التشغيل.')
    return False
 
+  if not await self._daily_entry_allowed(account):
+   return False
+
   permissions=self.gw.algo_status()
   if not all(permissions.get(key) for key in ('connected','trade_allowed','account_trade_allowed','trade_expert')):
    await self.notify('⚠️ اتصال MT5 أو صلاحية Algo Trading غير جاهزة. افحص الجاهزية أولاً.')
@@ -453,52 +303,25 @@ class Engine:
    await self.notify('⚠️ تعذر قراءة مراكز MT5؛ لن يبدأ المحرك.')
    return False
 
-  # Preserve the existing daily-limit start behavior when there is nothing
-  # to manage. Existing protected positions are still allowed to start so
-  # the engine can supervise them even while new entries are blocked.
-  if not positions and not await self._daily_entry_allowed(account):
+  old=[p for p in positions if getattr(p,'magic',0)==4009 and p.ticket not in self.trades]
+  if old:
+   await self.notify('⚠️ توجد صفقة قديمة للبوت غير متتبعة. أغلقها يدويًا قبل التشغيل.')
    return False
+
+  if self.mode=='RUNNING' and self.running:
+   await self.notify('ℹ️ البوت يعمل بالفعل.')
+   return True
 
   if not self.symbols:
    await self.notify('⚠️ اختر زوجاً واحداً على الأقل قبل التشغيل.')
    return False
 
-  adopted,errors,adoption_rows=await self._adopt_existing_positions(positions)
-  if errors:
-   details='\n'.join(f'• {x}' for x in errors[:8])
-   extra=f'\n• وغيرها {len(errors)-8}' if len(errors)>8 else ''
-   await self.db.log('START_REJECT_INVALID_EXISTING_POSITION',errors=errors)
-   await self.notify(
-    '❌ تعذر تشغيل البوت\n'
-    'يوجد مركز مفتوح بدون SL/TP صالحين أو بإعدادات غير صالحة:\n'
-    f'{details}{extra}\n'
-    'أضف وقف الخسارة والهدف الصحيحين ثم أعد التشغيل.'
-   )
-   return False
-
-  old_meta=dict(self.trade_alert_meta)
-  self.trades=adopted
-  self.trade_alert_meta={}
-  for row in adoption_rows:
-   ticket=row['ticket']
-   rebuilt={
-    'risk_cash':float(row.get('risk_cash',0) or 0),
-    'risk_pct':float(row.get('risk_pct',0) or 0),
-    'rr_actual':float(row.get('rr_actual',self.rr) or self.rr),
-   }
-   self.trade_alert_meta[ticket]=old_meta.get(ticket,rebuilt)
-  self.trade=None
   self.mode='RUNNING'
   self.running=True
   self.last_analysis_by_symbol={}
   self.session_realized_profit=0.0
   self.session_started_at=time.time()
   self.session_target_notified=False
-
-  for row in adoption_rows:
-   details=dict(row)
-   symbol=details.pop('symbol')
-   await self.db.log('POSITION_ADOPTED',symbol,**details)
 
   await self.db.log(
    'BOT_STARTED',
@@ -509,7 +332,6 @@ class Engine:
    max_consecutive_losses=self.max_consecutive_losses,
    daily_loss_limit_pct=self.daily_loss_limit_pct,
    session_profit_target=self.session_profit_target,
-   adopted_positions=len(adopted),
   )
 
   target=(
@@ -520,21 +342,11 @@ class Engine:
   await self.notify(
    f'▶️ تم تشغيل البوت\n'
    f'💱 مراقبة: {", ".join(self.symbols)}\n'
-   f'📂 مراكز موجودة تم تبنيها: {len(adopted)}\n'
    f'📂 حد المراكز: {self.max_positions}\n'
    f'⚠️ المخاطرة: {self.risk_pct:g}%\n'
    f'🛡 الحماية: {self.protection_pct:g}%\n'
    f'🎯 هدف الجلسة: {target}'
   )
-
-  # Give adopted positions the same pinned/live Telegram panel lifecycle.
-  for ticket,t in adopted.items():
-   alert=self.trade_alert_meta.get(ticket,{})
-   asyncio.create_task(self._send_trade_chart(
-    t,
-    float(alert.get('risk_cash',0) or 0),
-    float(alert.get('risk_pct',0) or 0),
-   ))
 
   if self.loop_task is None or self.loop_task.done():
    self.loop_task=asyncio.create_task(self.loop())
