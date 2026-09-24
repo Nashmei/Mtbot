@@ -317,3 +317,31 @@ Telegram UI
 ---
 
 **الوضع الحالي للمشروع: DEMO / safety-first. اختبر كل تغيير على حساب تجريبي أولاً.**
+
+
+## T4Bot Control API
+
+A private native-iOS control surface is being added without moving trading
+logic out of Mtbot. The API is opt-in and disabled by default.
+
+Runtime variables:
+
+```dotenv
+CONTROL_API_ENABLED=true
+CONTROL_API_HOST=127.0.0.1
+CONTROL_API_PORT=7099
+CONTROL_API_TOKEN=<long-random-secret>
+```
+
+Keep `CONTROL_API_HOST=127.0.0.1` and expose it through an HTTPS reverse
+proxy or private tunnel. Do not publish port 7099 directly to the Internet.
+
+The API is versioned under `/v1` and uses Bearer authentication. T4Bot reads
+state through `/v1/snapshot`, controls the existing Engine through explicit
+endpoints, and uses WebSocket events only as refresh hints. The server remains
+authoritative for DEMO enforcement, settings validation, strategies, risk,
+orders and MT5 credentials.
+
+Telegram can continue running in parallel. Setting
+`TELEGRAM_ENABLED=false` disables Telegram while leaving the T4Bot API and
+Mtbot engine process available.
