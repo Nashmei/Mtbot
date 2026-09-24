@@ -1,54 +1,51 @@
 import asyncio
-import json
 import shutil
 import time
 from pathlib import Path
 
 
 class EventHub:
-    """In-process WebSocket fan-out plus small persistent trade-media cache."""
+    """Single-writer WebSocket fan-out plus a small trade-media cache."""
 
-    def __init__(self, media_dir=None):
-        self._clients = set()
+    def __init__(self, media_dir=None, queue_size=128):
+        self._clients = {}
         self._lock = asyncio.Lock()
+        self._queue_size = max(8, int(queue_size))
         self.media_dir = Path(media_dir or "storage/t4bot_media")
         self.media_dir.mkdir(parents=True, exist_ok=True)
         self._trade_media = {}
 
     async def connect(self, websocket):
         await websocket.accept()
+        queue = asyncio.Queue(maxsize=self._queue_size)
         async with self._lock:
-            self._clients.add(websocket)
+            self._clients[websocket] = queue
+        return queue
 
     async def disconnect(self, websocket):
         async with self._lock:
-            self._clients.discard(websocket)
+            self._clients.pop(websocket, None)
 
     async def broadcast(self, event_type, payload=None):
-        message = json.dumps(
-            {
-                'type': str(event_type),
-                'ts': time.time(),
-                'payload': payload or {},
-            },
-            ensure_ascii=False,
-            default=str,
-        )
+        message = {
+            "type": str(event_type),
+            "ts": time.time(),
+            "payload": payload or {},
+        }
 
         async with self._lock:
-            clients = tuple(self._clients)
+            queues = tuple(self._clients.values())
 
-        stale = []
-        for websocket in clients:
+        for queue in queues:
+            if queue.full():
+                try:
+                    queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
             try:
-                await websocket.send_text(message)
-            except Exception:
-                stale.append(websocket)
-
-        if stale:
-            async with self._lock:
-                for websocket in stale:
-                    self._clients.discard(websocket)
+                queue.put_nowait(message)
+            except asyncio.QueueFull:
+                pass
 
     def store_trade_media(self, ticket, source_path):
         try:
@@ -68,6 +65,7 @@ class EventHub:
             ticket = int(media_id)
         except (TypeError, ValueError):
             return None
+
         path = self._trade_media.get(ticket) or (self.media_dir / f"{ticket}.png")
         return path if path.is_file() else None
 
@@ -76,5 +74,6 @@ class EventHub:
             ticket = int(ticket)
         except (TypeError, ValueError):
             return None
+
         path = self.media_path(ticket)
         return str(ticket) if path else None
