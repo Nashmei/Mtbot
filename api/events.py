@@ -1,14 +1,19 @@
 import asyncio
 import json
+import shutil
 import time
+from pathlib import Path
 
 
 class EventHub:
-    """Small in-process WebSocket fan-out used as an invalidation/event channel."""
+    """In-process WebSocket fan-out plus small persistent trade-media cache."""
 
-    def __init__(self):
+    def __init__(self, media_dir=None):
         self._clients = set()
         self._lock = asyncio.Lock()
+        self.media_dir = Path(media_dir or "storage/t4bot_media")
+        self.media_dir.mkdir(parents=True, exist_ok=True)
+        self._trade_media = {}
 
     async def connect(self, websocket):
         await websocket.accept()
@@ -44,3 +49,32 @@ class EventHub:
             async with self._lock:
                 for websocket in stale:
                     self._clients.discard(websocket)
+
+    def store_trade_media(self, ticket, source_path):
+        try:
+            ticket = int(ticket)
+            source = Path(source_path)
+            if ticket <= 0 or not source.is_file():
+                return None
+            target = self.media_dir / f"{ticket}.png"
+            shutil.copyfile(source, target)
+            self._trade_media[ticket] = target
+            return str(ticket)
+        except Exception:
+            return None
+
+    def media_path(self, media_id):
+        try:
+            ticket = int(media_id)
+        except (TypeError, ValueError):
+            return None
+        path = self._trade_media.get(ticket) or (self.media_dir / f"{ticket}.png")
+        return path if path.is_file() else None
+
+    def media_id_for_ticket(self, ticket):
+        try:
+            ticket = int(ticket)
+        except (TypeError, ValueError):
+            return None
+        path = self.media_path(ticket)
+        return str(ticket) if path else None
