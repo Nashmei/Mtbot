@@ -14,6 +14,8 @@ class Engine:
   self.db=db
   self.notify=notify
   self.running=False
+  self.mode='STOPPED'
+  self.loop_task=None
 
   # إعدادات قابلة للتحكم من Telegram
   self.symbols=['EURUSD']
@@ -30,6 +32,10 @@ class Engine:
   self.max_positions=1
   self.max_consecutive_losses=3
   self.daily_loss_limit_pct=2.0
+  self.session_profit_target=0.0
+  self.session_realized_profit=0.0
+  self.session_started_at=0.0
+  self.session_target_notified=False
   self.consecutive_losses=0
   self.loss_limit_notified=False
   self.daily_loss_notified=False
@@ -94,6 +100,7 @@ class Engine:
     'max_positions':('max_positions',int),
     'max_consecutive_losses':('max_consecutive_losses',int),
     'daily_loss_limit_pct':('daily_loss_limit_pct',float),
+    'session_profit_target':('session_profit_target',float),
     'consecutive_losses':('consecutive_losses',int),
    }
    for key,(attr,cast) in legacy.items():
@@ -114,7 +121,7 @@ class Engine:
    'protection_pct':45.0,'trailing_gap_pct':5.0,
    'max_trade_minutes':10.0,'max_positions':1,
    'max_consecutive_losses':3,'daily_loss_limit_pct':2.0,
-   'consecutive_losses':0,
+   'session_profit_target':0.0,'consecutive_losses':0,
   }
   attrs={
    'rr':'rr','risk_pct':'risk_pct','min_confidence':'min_confidence',
@@ -122,6 +129,7 @@ class Engine:
    'max_trade_minutes':'max_trade_minutes','max_positions':'max_positions',
    'max_consecutive_losses':'max_consecutive_losses',
    'daily_loss_limit_pct':'daily_loss_limit_pct',
+   'session_profit_target':'session_profit_target',
    'consecutive_losses':'consecutive_losses',
   }
   int_keys={'max_positions','max_consecutive_losses','consecutive_losses'}
@@ -177,13 +185,174 @@ class Engine:
    await self.db.log('STRATEGY_PERFORMANCE_ERROR',error=repr(ex))
 
 
+ async def _position_open_metadata(self,ticket):
+  if not hasattr(self.db,'open_trade_metadata'):
+   return None
+  try:
+   return await self.db.open_trade_metadata(ticket)
+  except Exception as ex:
+   await self.db.log('POSITION_METADATA_ERROR',ticket=int(ticket),error=repr(ex))
+   return None
+
+ async def _adopt_existing_positions(self,positions):
+  import math
+  now=time.time()
+  adopted={}
+  rows=[]
+  errors=[]
+
+  for p in positions:
+   ticket=int(getattr(p,'ticket',0) or 0)
+   symbol=str(getattr(p,'symbol','') or '')
+   entry=float(getattr(p,'price_open',0) or 0)
+   sl=float(getattr(p,'sl',0) or 0)
+   tp=float(getattr(p,'tp',0) or 0)
+   volume=float(getattr(p,'volume',0) or 0)
+   ptype=getattr(p,'type',None)
+
+   if ptype==getattr(mt5,'POSITION_TYPE_BUY',0):
+    side=Side.BUY
+   elif ptype==getattr(mt5,'POSITION_TYPE_SELL',1):
+    side=Side.SELL
+   else:
+    errors.append(f'{ticket or "?"} {symbol or "?"}: نوع المركز غير مدعوم')
+    continue
+
+   values=(entry,sl,tp,volume)
+   if (not ticket or not symbol or any(not math.isfinite(v) for v in values)
+       or entry<=0 or sl<=0 or tp<=0 or volume<=0):
+    errors.append(f'{ticket or "?"} {symbol or "?"}: يجب وجود SL وTP صالحين')
+    continue
+
+   geometry_ok=(
+    (side==Side.BUY and sl<entry<tp)
+    or
+    (side==Side.SELL and tp<entry<sl)
+   )
+   if not geometry_ok:
+    errors.append(f'{ticket} {symbol}: SL/TP غير صالحين لاتجاه الصفقة')
+    continue
+
+   magic=int(getattr(p,'magic',0) or 0)
+   source='bot' if magic==4009 else 'manual'
+   meta=await self._position_open_metadata(ticket) if source=='bot' else None
+   strategy=str((meta or {}).get('strategy') or ('bot_adopted' if source=='bot' else 'manual_adopted'))
+   regime=str((meta or {}).get('regime') or 'ADOPTED')
+   try:
+    confidence=float((meta or {}).get('confidence',0) or 0)
+   except (TypeError,ValueError):
+    confidence=0.0
+   reason=str((meta or {}).get('reason') or ('استعادة صفقة بوت مفتوحة' if source=='bot' else 'تبني صفقة MT5 يدوية'))
+   opened_at=(
+    float(getattr(p,'time',0) or now)
+    if source=='bot'
+    else now
+   )
+   initial_r=abs(entry-sl)
+   target_distance=abs(tp-entry)
+   trigger=self.protection_pct/100.0
+   protection_level=(
+    entry+(target_distance*trigger)
+    if side==Side.BUY
+    else entry-(target_distance*trigger)
+   )
+   protection_active=(
+    sl>=protection_level
+    if side==Side.BUY
+    else sl<=protection_level
+   )
+
+   t=TradeState(
+    ticket=ticket,symbol=symbol,side=side,entry=entry,sl=sl,tp=tp,
+    initial_r=initial_r,opened_at=opened_at,
+    strategy=strategy,regime=regime,confidence=confidence,reason=reason,
+    volume=volume,protection_pct=self.protection_pct,
+    trailing_gap_pct=self.trailing_gap_pct,
+    protection_45_active=protection_active,trailing=protection_active,
+    best_favorable_price=entry,last_progress_at=now,
+    signal_bar=int((meta or {}).get('signal_bar',0) or 0),
+   )
+   adopted[ticket]=t
+   rows.append({
+    'ticket':ticket,'symbol':symbol,'source':source,'strategy':strategy,
+    'entry':entry,'sl':sl,'tp':tp,'volume':volume,
+    'opened_at':opened_at,'protection_active':protection_active,
+   })
+
+  if errors:
+   return {},errors,[]
+  return adopted,[],rows
+
+ async def _register_session_pnl(self,pnl,closing_ticket=None):
+  import math
+  try:
+   value=float(pnl)
+  except (TypeError,ValueError):
+   return
+  if not math.isfinite(value):
+   return
+
+  self.session_realized_profit+=value
+  await self.db.log(
+   'SESSION_REALIZED_PNL',
+   ticket=closing_ticket,pnl=value,
+   session_realized_profit=self.session_realized_profit,
+   session_profit_target=self.session_profit_target,
+  )
+
+  if (self.mode=='RUNNING' and self.session_profit_target>0
+      and self.session_realized_profit>=self.session_profit_target):
+   self.mode='DRAINING'
+   if not self.session_target_notified:
+    self.session_target_notified=True
+    remaining=max(0,len(self.trades)-(1 if closing_ticket in self.trades else 0))
+    await self.db.log(
+     'SESSION_PROFIT_TARGET_REACHED',
+     target=self.session_profit_target,
+     realized=self.session_realized_profit,
+     open_positions=remaining,
+    )
+    await self.notify(
+     f'🎯 تم تحقيق هدف الجلسة الحالية\n'
+     f'💰 الربح المحقق: +$' f'{self.session_realized_profit:.2f}\n'
+     f'🎯 الهدف: +$' f'{self.session_profit_target:.2f}\n'
+     f'⛔ تم إيقاف التحليل والدخول الجديد\n'
+     f'📂 المراكز المتبقية: {remaining}\n'
+     f'🛡 تستمر إدارة المراكز المفتوحة حتى انتهائها.'
+    )
+
+ async def _finish_stop(self,reason='DRAIN_COMPLETE',notify=True):
+  self.running=False
+  self.mode='STOPPED'
+  await self.db.log(
+   'BOT_STOPPED',
+   reason=reason,
+   session_realized_profit=self.session_realized_profit,
+   session_profit_target=self.session_profit_target,
+  )
+  if notify:
+   await self.notify(
+    f'⏹ تم إيقاف البوت بالكامل\n'
+    f'💰 ربح الجلسة المحقق: $' f'{self.session_realized_profit:+.2f}'
+   )
+
  async def status(self):
   a=self.gw.account()
   if not a:
    return 'MT5 غير متصل'
 
   symbols=', '.join(self.symbols) if self.symbols else 'لا يوجد'
-  state='🟢 يعمل' if self.running else '⚪ متوقف'
+  states={
+   'RUNNING':'🟢 يعمل',
+   'DRAINING':'🟡 مراقبة الصفقات فقط',
+   'STOPPED':'⚪ متوقف',
+  }
+  state=states.get(self.mode,'⚪ متوقف')
+  target=(
+   '$'+f'{self.session_profit_target:g}'
+   if self.session_profit_target>0
+   else '0 (معطل)'
+  )
 
   return (
    f'{state} | 🔒 تجريبي\n'
@@ -196,48 +365,75 @@ class Engine:
    f'❌ الخسائر المتتالية: {self.consecutive_losses} / {self.max_consecutive_losses}\n'
    f'📉 حد Equity اليومي: {self.daily_loss_limit_pct:g}%'
    f'{" (معطل)" if self.daily_loss_limit_pct<=0 else ""}\n'
+   f'🎯 هدف ربح الجلسة: {target}\n'
+   f'💰 ربح الجلسة المحقق: $' f'{self.session_realized_profit:+.2f}\n'
    f'⚖️ العائد/المخاطرة: 1:{self.rr:g}\n'
-   f'💰 Equity: {a.equity:.2f} {a.currency}'
+   f'💵 Equity: {a.equity:.2f} {a.currency}'
   )
 
  async def start(self):
   import math
+  if self.mode=='RUNNING' and self.running:
+   await self.notify('ℹ️ البوت يعمل بالفعل.')
+   return True
+
   if not (math.isfinite(self.risk_pct) and 0<self.risk_pct<=50
           and math.isfinite(self.rr) and .5<=self.rr<=10
           and 1<=self.max_positions<=10
           and math.isfinite(self.daily_loss_limit_pct)
-          and 0<=self.daily_loss_limit_pct<=100):
-   await self.notify('⚠️ إعدادات المخاطرة أو العائد أو حد المراكز غير صالحة.')
+          and 0<=self.daily_loss_limit_pct<=100
+          and math.isfinite(self.session_profit_target)
+          and 0<=self.session_profit_target<=1000000000):
+   await self.notify('⚠️ إعدادات المخاطرة أو العائد أو الحدود غير صالحة.')
    return False
+
   account=self.gw.account()
   if not account or account.trade_mode!=mt5.ACCOUNT_TRADE_MODE_DEMO:
    await self.notify('🔒 يلزم اتصال بحساب MT5 تجريبي قبل التشغيل.')
    return False
-  if not await self._daily_entry_allowed(account):
-   return False
+
   permissions=self.gw.algo_status()
   if not all(permissions.get(key) for key in ('connected','trade_allowed','account_trade_allowed','trade_expert')):
    await self.notify('⚠️ اتصال MT5 أو صلاحية Algo Trading غير جاهزة. افحص الجاهزية أولاً.')
    return False
+
   positions=self.gw.positions()
   if positions is None:
    await self.notify('⚠️ تعذر قراءة مراكز MT5؛ لن يبدأ المحرك.')
    return False
-  old=[p for p in positions if getattr(p,'magic',0)==4009 and p.ticket not in self.trades]
-  if old:
-   await self.notify('⚠️ توجد صفقة قديمة للبوت غير متتبعة. أغلقها يدويًا قبل التشغيل.')
-   return False
-
-  if self.running:
-   await self.notify('ℹ️ البوت يعمل بالفعل.')
-   return True
 
   if not self.symbols:
    await self.notify('⚠️ اختر زوجاً واحداً على الأقل قبل التشغيل.')
    return False
 
+  adopted,errors,adoption_rows=await self._adopt_existing_positions(positions)
+  if errors:
+   details='\n'.join(f'• {x}' for x in errors[:8])
+   extra=f'\n• وغيرها {len(errors)-8}' if len(errors)>8 else ''
+   await self.db.log('START_REJECT_INVALID_EXISTING_POSITION',errors=errors)
+   await self.notify(
+    '❌ تعذر تشغيل البوت\n'
+    'يوجد مركز مفتوح بدون SL/TP صالحين أو بإعدادات غير صالحة:\n'
+    f'{details}{extra}\n'
+    'أضف وقف الخسارة والهدف الصحيحين ثم أعد التشغيل.'
+   )
+   return False
+
+  old_meta=dict(self.trade_alert_meta)
+  self.trades=adopted
+  self.trade_alert_meta={ticket:old_meta[ticket] for ticket in adopted if ticket in old_meta}
+  self.trade=None
+  self.mode='RUNNING'
   self.running=True
   self.last_analysis_by_symbol={}
+  self.session_realized_profit=0.0
+  self.session_started_at=time.time()
+  self.session_target_notified=False
+
+  for row in adoption_rows:
+   details=dict(row)
+   symbol=details.pop('symbol')
+   await self.db.log('POSITION_ADOPTED',symbol,**details)
 
   await self.db.log(
    'BOT_STARTED',
@@ -246,117 +442,54 @@ class Engine:
    protection_pct=self.protection_pct,
    max_positions=self.max_positions,
    max_consecutive_losses=self.max_consecutive_losses,
-   daily_loss_limit_pct=self.daily_loss_limit_pct
+   daily_loss_limit_pct=self.daily_loss_limit_pct,
+   session_profit_target=self.session_profit_target,
+   adopted_positions=len(adopted),
   )
 
+  target=(
+   '+$'+f'{self.session_profit_target:.2f}'
+   if self.session_profit_target>0
+   else 'معطل'
+  )
   await self.notify(
    f'▶️ تم تشغيل البوت\n'
    f'💱 مراقبة: {", ".join(self.symbols)}\n'
+   f'📂 مراكز موجودة تم تبنيها: {len(adopted)}\n'
    f'📂 حد المراكز: {self.max_positions}\n'
    f'⚠️ المخاطرة: {self.risk_pct:g}%\n'
-   f'🛡 الحماية: {self.protection_pct:g}%'
+   f'🛡 الحماية: {self.protection_pct:g}%\n'
+   f'🎯 هدف الجلسة: {target}'
   )
 
-  self.loop_task=asyncio.create_task(self.loop())
+  if self.loop_task is None or self.loop_task.done():
+   self.loop_task=asyncio.create_task(self.loop())
   return True
 
  async def stop(self):
-  # منع أي دخول جديد فوراً
-  self.running=False
+  if self.mode=='STOPPED' and not self.running:
+   await self.notify('ℹ️ البوت متوقف بالفعل.')
+   return 'STOPPED'
 
-  # دعم مؤقت للصفقة القديمة أثناء مرحلة التحويل
-  managed=list(self.trades.values())
-  if self.trade and self.trade.ticket not in self.trades:
-   managed.append(self.trade)
-
-  failed=0
-  closed=0
-
-  for t in managed:
-   pos=self.gw.position_by_ticket(t.ticket)
-
-   if not pos:
-    self.trades.pop(t.ticket,None)
-    if self.trade and self.trade.ticket==t.ticket:
-     self.trade=None
-    continue
-
-   res=self.gw.close(pos)
-
-   if res and res.retcode in (
-    mt5.TRADE_RETCODE_DONE,
-    mt5.TRADE_RETCODE_DONE_PARTIAL
-   ):
-    remaining=self.gw.position_by_ticket(t.ticket)
-    if remaining:
-     failed+=1
-     await self.db.log('STOP_EXIT_PARTIAL',t.symbol,ticket=t.ticket,remaining_volume=remaining.volume)
-     await self.notify(
-      f'⚠️ إغلاق جزئي للمركز {t.ticket} ({t.symbol}). '
-      f'المتبقي {remaining.volume:g} لوت؛ افحصه في MT5.'
-     )
-     continue
-    closed+=1
-    await asyncio.sleep(.3)
-
-    exit_price=float(getattr(res,'price',0) or 0)
-    pnl=None
-
-    deals=self.gw.history_deals_by_position(t.ticket)
-    for d in deals:
-     if getattr(d,'entry',None) in (
-      getattr(mt5,'DEAL_ENTRY_OUT',1),
-      getattr(mt5,'DEAL_ENTRY_OUT_BY',3)
-     ):
-      exit_price=float(getattr(d,'price',exit_price) or exit_price)
-      pnl=(float(getattr(d,'profit',0) or 0)
-           +float(getattr(d,'swap',0) or 0)
-           +float(getattr(d,'commission',0) or 0))
-
-    await self.db.log(
-     'STOP_EXIT',t.symbol,
-     ticket=t.ticket,exit_price=exit_price,pnl=pnl
-    )
-
-    pnl_text=f'{pnl:.2f}' if pnl is not None else 'بانتظار سجل MT5'
-    await self.notify(
-     f'⏹ إغلاق بسبب إيقاف البوت — {t.symbol}\n'
-     f'🎫 المركز: {t.ticket}\n'
-     f'🚪 سعر الخروج: {exit_price}\n'
-     f'💰 الربح/الخسارة: {pnl_text}'
-    )
-
-    self.trades.pop(t.ticket,None)
-    if self.trade and self.trade.ticket==t.ticket:
-     self.trade=None
-
-   else:
-    failed+=1
-    await self.db.log(
-     'STOP_EXIT_FAILED',t.symbol,
-     ticket=t.ticket,result=str(res)
-    )
-    await self.notify(
-     f'⚠️ فشل إغلاق المركز — {t.symbol}\n'
-     f'🎫 المركز: {t.ticket}\n'
-     f'📡 MT5: {getattr(res,"comment","لا توجد استجابة")}\n'
-     f'⚠️ تحقق منه يدوياً في MT5.'
-    )
-
+  self.mode='DRAINING'
+  self.running=True
   await self.db.log(
-   'BOT_STOPPED',
-   closed_positions=closed,
-   failed_positions=failed
+   'BOT_DRAINING',
+   reason='MANUAL_STOP',
+   open_positions=len(self.trades),
+   session_realized_profit=self.session_realized_profit,
   )
 
-  if failed:
-   await self.notify(
-    f'⏹ تم إيقاف فتح الصفقات الجديدة.\n'
-    f'✅ أُغلق: {closed}\n'
-    f'⚠️ تعذر إغلاق: {failed}'
-   )
-  else:
-   await self.notify(f'⏹ تم إيقاف البوت | المراكز المغلقة: {closed}')
+  if not self.trades:
+   await self._finish_stop(reason='MANUAL_STOP_NO_POSITIONS')
+   return 'STOPPED'
+
+  await self.notify(
+   f'⏸ تم إيقاف التحليل والدخول الجديد\n'
+   f'📂 تتم إدارة {len(self.trades)} صفقة مفتوحة حتى انتهائها\n'
+   f'🛡 الحماية والتتبع وSL/TP ومدة الصفقة مستمرة.'
+  )
+  return 'DRAINING'
 
  async def loop(self):
   while self.running:
@@ -371,6 +504,7 @@ class Engine:
      await self.db.log('ENGINE_CYCLE',duration_seconds=round(self.last_cycle_seconds,3),scan_count=self.scan_count)
    except Exception as e:
     self.running=False
+    self.mode='STOPPED'
     try: await self.db.log('ENGINE_ERROR',self.symbol,error=repr(e),traceback=traceback.format_exc())
     finally: await self.notify('🚨 توقف المحرك بسبب خطأ. افحص سجل ENGINE_ERROR ومراكز MT5 قبل إعادة التشغيل.')
     return
@@ -405,16 +539,18 @@ class Engine:
  async def step(self):
   account=self.gw.account()
   if not account or account.trade_mode!=mt5.ACCOUNT_TRADE_MODE_DEMO:
-   self.running=False; await self.notify('🔒 الحساب التجريبي فقط.'); return
+   self.running=False; self.mode='STOPPED'; await self.notify('🔒 الحساب التجريبي فقط.'); return
 
   positions=self.gw.positions()
   if positions is None:
    self.running=False
-   await self.notify('⚠️ تعذر التحقق من مراكز MT5؛ أُوقف الدخول حتى استعادة الاتصال.')
+   self.mode='STOPPED'
+   await self.notify('⚠️ تعذر التحقق من مراكز MT5؛ أُوقف المحرك حتى استعادة الاتصال.')
    return
   unknown=[p for p in positions if getattr(p,'magic',0)==4009 and p.ticket not in self.trades]
   if unknown:
    self.running=False
+   self.mode='STOPPED'
    await self.db.log('UNMANAGED_POSITION',tickets=[p.ticket for p in unknown])
    await self.notify('🚨 يوجد مركز للبوت غير متتبع. أُوقف المحرك؛ افحص المراكز في MT5.')
    return
@@ -423,6 +559,14 @@ class Engine:
   for t in list(self.trades.values()):
    info=self.gw.info(t.symbol); tick=self.gw.tick(t.symbol)
    if info and tick: await self.manage(t,tick,info)
+
+  # وضع DRAINING يمنع أي تحليل أو دخول جديد، ويستمر فقط حتى آخر مركز.
+  if self.mode=='DRAINING':
+   if not self.trades:
+    await self._finish_stop(reason='DRAIN_COMPLETE')
+   return
+  if self.mode!='RUNNING':
+   return
 
   await self._refresh_strategy_performance()
 
@@ -847,6 +991,7 @@ class Engine:
 
    if not pos:
     self.running=False
+    self.mode='STOPPED'
     await self.db.log(
      'POSITION_LINK_FAILED',symbol,result=str(res),
      order=getattr(res,'order',None),deal=getattr(res,'deal',None),
@@ -954,6 +1099,7 @@ class Engine:
   )
   if not close_ok or remaining is not None:
    self.running=False
+   self.mode='STOPPED'
    await self.notify(
     f'🚨 {symbol}: المركز {pos.ticket} لديه R ابتدائية غير صالحة '
     'ولم يُغلق بالكامل؛ تم إيقاف المحرك لمنع مركز غير متتبع.'
@@ -1203,6 +1349,7 @@ class Engine:
      exit_price=exit_price,pnl=pnl,reason=reason
     )
     await self._refresh_strategy_performance(force=True)
+    await self._register_session_pnl(pnl,closing_ticket=t.ticket)
     caption=await self._trade_caption(t,pnl=pnl,closed=True)
     await self.notify(caption,trade_ticket=t.ticket,trade_update=True,trade_result=pnl,trade_result_reason=result_reason)
    else:
