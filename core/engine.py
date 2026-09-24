@@ -421,6 +421,12 @@ class Engine:
    await self.notify('⚠️ تعذر قراءة مراكز MT5؛ لن يبدأ المحرك.')
    return False
 
+  # Preserve the existing daily-limit start behavior when there is nothing
+  # to manage. Existing protected positions are still allowed to start so
+  # the engine can supervise them even while new entries are blocked.
+  if not positions and not await self._daily_entry_allowed(account):
+   return False
+
   if not self.symbols:
    await self.notify('⚠️ اختر زوجاً واحداً على الأقل قبل التشغيل.')
    return False
@@ -1370,7 +1376,25 @@ class Engine:
      exit_price=exit_price,pnl=pnl,reason=reason
     )
     await self._refresh_strategy_performance(force=True)
-    await self._register_session_pnl(pnl,closing_ticket=t.ticket)
+
+    # Session target counts only realized exits that happened after this
+    # Start press. This matters for adopted positions that may have older
+    # partial closing deals in their MT5 history.
+    session_exit_deals=[]
+    for d in exit_deals:
+     deal_ts=float(getattr(d,'time_msc',0) or 0)/1000.0
+     if deal_ts<=0:
+      deal_ts=float(getattr(d,'time',0) or 0)
+     if deal_ts>=self.session_started_at:
+      session_exit_deals.append(d)
+    session_pnl=sum(
+     float(getattr(d,'profit',0) or 0)
+     +float(getattr(d,'swap',0) or 0)
+     +float(getattr(d,'commission',0) or 0)
+     +float(getattr(d,'fee',0) or 0)
+     for d in session_exit_deals
+    )
+    await self._register_session_pnl(session_pnl,closing_ticket=t.ticket)
     caption=await self._trade_caption(t,pnl=pnl,closed=True)
     await self.notify(caption,trade_ticket=t.ticket,trade_update=True,trade_result=pnl,trade_result_reason=result_reason)
    else:
