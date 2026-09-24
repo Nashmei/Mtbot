@@ -502,7 +502,7 @@ class Engine:
     await self._log_reject('SPREAD_REJECT',symbol,spread=sp,average=avg,limit=lim)
     return
    m5=self.gw.rates_m5(symbol,200)
-   m1=self.gw.rates_m1(symbol,200)
+   m1=self.gw.rates_m1(symbol,300)
    reg,sig,meta=self.an.analyze(
     ticks,info.point,m5,symbol=symbol,
     rates_m15=self.gw.rates_m15(symbol,200),
@@ -540,6 +540,15 @@ class Engine:
     )
    if not sig:
     await self._log_reject('NO_SIGNAL',symbol,regime=reg.value)
+    return
+   # Temporary experiment isolation: keep MACD enabled elsewhere, but do not
+   # allow it to open XAUUSD positions while protection management is measured.
+   if symbol.upper()=='XAUUSD' and sig.strategy=='macd_momentum':
+    await self._log_reject(
+     'STRATEGY_SYMBOL_REJECT',symbol,
+     reason='EXPERIMENT_MACD_XAUUSD_SUSPENDED',
+     strategy=sig.strategy,side=sig.side.value,
+    )
     return
    confidence_score=float(sig.confidence)*100.0
    # Telegram confidence setting is a real hard entry filter.
@@ -1222,21 +1231,39 @@ class Engine:
   caption=await self._trade_caption(t,current_price=float(price))
   await self.notify(caption,trade_ticket=t.ticket,trade_update=True)
 
-  # حماية الربح: تبدأ فقط بعد تحقيق 45% من المسافة إلى TP.
+  # حماية الربح: نسبة التفعيل تبقى من إعداد Telegram.
   target_distance=abs(t.tp-t.entry)
   target_progress=(favorable/target_distance) if target_distance>0 else 0.0
   now=time.time()
 
-  # عند تحقيق 45%: انقل SL إلى مستوى الحماية وابدأ تتبع أفضل سعر فقط.
+  # عند التفعيل نعطي نقطة الدخول مساحة ضجيج ديناميكية مبنية على
+  # وسيط السبريد الحديث (أو السبريد الحالي عند عدم توفر عينة).
   trigger=t.protection_pct/100.0
   if target_progress>=trigger and not t.protection_45_active:
-   level45=t.entry+(target_distance*trigger) if t.side==Side.BUY else t.entry-(target_distance*trigger)
+   spread_points=max(0.0,(float(tick.ask)-float(tick.bid))/float(info.point))
+   spread_history=list(self.risk.spreads.get(str(t.symbol),()) or ())
+   if spread_history:
+    ordered=sorted(float(x) for x in spread_history)
+    mid=len(ordered)//2
+    spread_reference=(
+     ordered[mid] if len(ordered)%2
+     else (ordered[mid-1]+ordered[mid])/2.0
+    )
+   else:
+    spread_reference=spread_points
+   buffer_points=max(3.0,spread_reference*1.5)
+   protected_sl=(
+    t.entry-buffer_points*info.point
+    if t.side==Side.BUY
+    else t.entry+buffer_points*info.point
+   )
+   protected_sl=round(protected_sl,int(info.digits))
    min_dist=max(int(getattr(info,'trade_stops_level',0) or 0),int(getattr(info,'trade_freeze_level',0) or 0))*info.point
-   valid=(level45 <= tick.bid-min_dist) if t.side==Side.BUY else (level45 >= tick.ask+min_dist)
-   res=self.gw.modify(pos.ticket,t.symbol,level45,t.tp) if valid else None
+   valid=(protected_sl <= tick.bid-min_dist) if t.side==Side.BUY else (protected_sl >= tick.ask+min_dist)
+   res=self.gw.modify(pos.ticket,t.symbol,protected_sl,t.tp) if valid else None
 
    if res and res.retcode==mt5.TRADE_RETCODE_DONE:
-    t.sl=level45
+    t.sl=protected_sl
     t.protection_45_active=True
     t.trailing=True
     t.best_favorable_price=price
@@ -1244,7 +1271,11 @@ class Engine:
 
     await self.db.log(
      'PROTECTION_ACTIVATED',t.symbol,
-     ticket=t.ticket,sl=level45,price=price,
+     ticket=t.ticket,sl=protected_sl,price=price,
+     protection_pct=t.protection_pct,
+     buffer_points=buffer_points,
+     spread_reference_points=spread_reference,
+     current_spread_points=spread_points,
      target_progress=target_progress,target_progress_pct=target_progress*100.0
     )
 
@@ -1254,7 +1285,11 @@ class Engine:
      retcode=getattr(res,'retcode',None),
      comment=getattr(res,'comment',None),
      last_error=repr(mt5.last_error()),
-     requested_sl=level45,current_sl=t.sl,tp=t.tp,
+     requested_sl=protected_sl,current_sl=t.sl,tp=t.tp,
+     protection_pct=t.protection_pct,
+     buffer_points=buffer_points,
+     spread_reference_points=spread_reference,
+     current_spread_points=spread_points,
      bid=float(tick.bid),ask=float(tick.ask),
      stops_level=int(getattr(info,'trade_stops_level',0) or 0),
      freeze_level=int(getattr(info,'trade_freeze_level',0) or 0),
@@ -1281,12 +1316,9 @@ class Engine:
      else t.best_favorable_price+gap
     )
 
-    # لا يرجع SL خلف مستوى تفعيل الحماية.
-    protection_level=(
-     t.entry+(target_distance*(t.protection_pct/100.0))
-     if t.side==Side.BUY
-     else t.entry-(target_distance*(t.protection_pct/100.0))
-    )
+    # لا يرجع SL خلف مستوى الحماية الذي تم تفعيله فعلياً.
+    # هذا يحافظ على BE buffer الديناميكي بدلاً من القفز إلى مستوى trigger.
+    protection_level=t.sl
 
     if t.side==Side.BUY:
      cand=max(cand,protection_level)
