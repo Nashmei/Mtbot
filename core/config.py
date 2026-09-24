@@ -21,6 +21,13 @@ class Settings(BaseSettings):
     control_api_port: int = 7099
     control_api_token: str | None = None
 
+    apns_enabled: bool = False
+    apns_key_id: str | None = None
+    apns_team_id: str | None = None
+    apns_auth_key_path: str | None = None
+    apns_bundle_id: str = 'com.nashmei.t4bot'
+    apns_environment: str = 'production'
+
     mt5_terminal_path: str | None = None
     app_mode: str = 'DEMO'
     spread_sample_size: int = 60
