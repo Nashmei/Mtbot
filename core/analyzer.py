@@ -7,6 +7,7 @@ from .strategies import (
  m5_reversal_candidate, scalp_m5_reversal, scalp_reversion,
  scalp_sweep_reversal, scalp_squeeze_expansion,
  diagnose_scalp_sweep_reversal, diagnose_scalp_squeeze_expansion,
+ macd_momentum, alligator_trend, moving_average_trend, rsi_reversal, bollinger_reversion,
 )
 
 # MT5Gateway.rates() starts at position 1, so -1 is the latest fully closed M5 bar.
@@ -111,7 +112,8 @@ class Analyzer:
   def strategy_allowed(name,side=None):
    if name in ('scalp_m5_reversal','scalp_reversion') and clear_trend:return False
    if name=='ema_cross_scalp' and clear_range:return False
-   if name=='scalp_trend' and clear_range:return False
+   if name in ('scalp_trend','macd_momentum','alligator_trend','moving_average_trend') and clear_range:return False
+   if name in ('rsi_reversal','bollinger_reversion') and clear_trend:return False
    return True
 
   reg=(Regime.TREND if market_mode=='trend' else Regime.RANGE if market_mode=='range' else Regime.VOLATILE if market_mode=='expansion' else Regime.RANGE)
@@ -143,6 +145,11 @@ class Analyzer:
   reversion_candidate=scalp_reversion(ctx)
   sweep_candidate=scalp_sweep_reversal(ctx)
   squeeze_candidate=scalp_squeeze_expansion(ctx)
+  macd_candidate=macd_momentum(ctx)
+  alligator_candidate=alligator_trend(ctx)
+  moving_average_candidate=moving_average_trend(ctx)
+  rsi_candidate=rsi_reversal(ctx)
+  bollinger_candidate=bollinger_reversion(ctx)
 
   opportunity_diagnostics=[
    diagnose_scalp_sweep_reversal(ctx),
@@ -167,6 +174,11 @@ class Analyzer:
   add_candidate(reversion_candidate,Regime.RANGE,'scalp_reversion',6)
   add_candidate(sweep_candidate,Regime.BREAKOUT,'scalp_sweep_reversal',7)
   add_candidate(squeeze_candidate,Regime.VOLATILE,'scalp_squeeze_expansion',8)
+  add_candidate(macd_candidate,Regime.TREND,'macd_momentum',9)
+  add_candidate(alligator_candidate,Regime.TREND,'alligator_trend',10)
+  add_candidate(moving_average_candidate,Regime.TREND,'moving_average_trend',11)
+  add_candidate(rsi_candidate,Regime.RANGE,'rsi_reversal',12)
+  add_candidate(bollinger_candidate,Regime.RANGE,'bollinger_reversion',13)
 
   selection_rows=[]
   if strategy_performance is None:
