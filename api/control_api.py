@@ -14,7 +14,7 @@ from core.config import settings
 
 
 class SettingsPatch(BaseModel):
-    model_config = ConfigDict(extra='forbid')
+    model_config = ConfigDict(extra='forbid', allow_inf_nan=False)
 
     risk_pct: float | None = Field(default=None, ge=0.25, le=50)
     rr: float | None = Field(default=None, ge=0.5, le=10)
@@ -119,51 +119,53 @@ class ControlAPI:
             if self.engine.running:
                 raise HTTPException(status_code=409, detail='أوقف المحرك قبل تغيير حساب MT5.')
 
+            server = payload.server.strip()
+            if not server:
+                raise HTTPException(status_code=422, detail='Server مطلوب.')
+
             password = payload.password.get_secret_value()
             ok, err, account = await asyncio.to_thread(
                 self.gateway.login,
                 int(payload.login),
                 password,
-                payload.server.strip(),
+                server,
             )
-            password = None
 
             if not ok or not account:
+                password = None
                 await self.db.log(
                     'MT5_LOGIN_FAILED',
                     login=int(payload.login),
-                    server=payload.server.strip(),
+                    server=server,
                     error=str(err),
                     source='t4bot',
                 )
                 raise HTTPException(status_code=400, detail=f'فشل تسجيل الدخول إلى MT5: {err}')
 
             if getattr(account, 'trade_mode', None) != mt5.ACCOUNT_TRADE_MODE_DEMO:
+                password = None
                 mt5.shutdown()
                 await self.db.log(
                     'MT5_LOGIN_REJECTED',
                     login=int(payload.login),
-                    server=payload.server.strip(),
+                    server=server,
                     reason='NON_DEMO',
                     source='t4bot',
                 )
                 raise HTTPException(status_code=403, detail='T4Bot يسمح بحسابات MT5 التجريبية فقط.')
 
-            self._store_credentials(
-                int(payload.login),
-                payload.server.strip(),
-                payload.password.get_secret_value(),
-            )
+            self._store_credentials(int(payload.login), server, password)
+            password = None
             await self.engine.load_settings(login=int(payload.login), migrate_legacy=False)
             await self.db.log(
                 'MT5_LOGIN_SUCCESS',
                 login=int(payload.login),
-                server=payload.server.strip(),
+                server=server,
                 source='t4bot',
             )
             await self.event_hub.broadcast(
                 'account_changed',
-                {'login': int(payload.login), 'server': payload.server.strip()},
+                {'login': int(payload.login), 'server': server},
             )
             return {
                 'ok': True,
