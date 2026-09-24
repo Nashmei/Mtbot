@@ -224,10 +224,13 @@ class Engine:
     errors.append(f'{ticket or "?"} {symbol or "?"}: يجب وجود SL وTP صالحين')
     continue
 
+   # A protected existing position may already have SL beyond break-even.
+   # Require a valid target direction and keep SL on the safe side of TP,
+   # rather than requiring SL to remain behind the original entry.
    geometry_ok=(
-    (side==Side.BUY and sl<entry<tp)
+    (side==Side.BUY and tp>entry and sl<tp)
     or
-    (side==Side.SELL and tp<entry<sl)
+    (side==Side.SELL and tp<entry and sl>tp)
    )
    if not geometry_ok:
     errors.append(f'{ticket} {symbol}: SL/TP غير صالحين لاتجاه الصفقة')
@@ -248,8 +251,11 @@ class Engine:
     if source=='bot'
     else now
    )
-   initial_r=abs(entry-sl)
    target_distance=abs(tp-entry)
+   original_sl=float((meta or {}).get('sl',0) or 0) if source=='bot' else 0.0
+   initial_r=abs(entry-original_sl) if original_sl>0 else abs(entry-sl)
+   if initial_r<=0:
+    initial_r=target_distance/max(float(self.rr),0.5)
    trigger=self.protection_pct/100.0
    protection_level=(
     entry+(target_distance*trigger)
