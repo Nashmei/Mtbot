@@ -378,6 +378,56 @@ class MarketSafetyTests(unittest.TestCase):
             engine.loop_task.cancel()
         asyncio.run(check())
 
+    def test_start_adopts_protected_bot_position_and_restores_metadata(self):
+        position = types.SimpleNamespace(
+            magic=4009, ticket=79, symbol="EURUSD", type=fake_mt5.POSITION_TYPE_BUY,
+            price_open=1.1000, sl=1.1080, tp=1.1150, volume=0.10,
+            time=time.time()-300,
+        )
+        class DB(FakeDB):
+            async def open_trade_metadata(self, ticket):
+                self.assert_ticket = ticket
+                return {
+                    'strategy':'scalp_trend','regime':'TREND','confidence':0.82,
+                    'reason':'restored','sl':1.0950,'protection_pct':45.0,
+                    'trailing_gap_pct':5.0,'signal_bar':12345,
+                }
+        class Gateway:
+            def account(self):
+                return types.SimpleNamespace(
+                    trade_mode=0, equity=1000, currency="USD"
+                )
+            def algo_status(self):
+                return {
+                    "connected": True,
+                    "trade_allowed": True,
+                    "account_trade_allowed": True,
+                    "trade_expert": True,
+                }
+            def positions(self):
+                return (position,)
+        messages = []
+        async def notify(message, **kwargs):
+            messages.append(message)
+        async def idle_loop():
+            await asyncio.sleep(60)
+        async def check():
+            db=DB()
+            engine=Engine(Gateway(), db, notify)
+            engine.loop=idle_loop
+            started=await engine.start()
+            self.assertTrue(started)
+            trade=engine.trades[79]
+            self.assertEqual(trade.strategy,'scalp_trend')
+            self.assertEqual(trade.signal_bar,12345)
+            self.assertAlmostEqual(trade.initial_r,0.005)
+            self.assertTrue(trade.protection_45_active)
+            self.assertLess(trade.opened_at,time.time()-200)
+            engine.running=False
+            engine.mode='STOPPED'
+            engine.loop_task.cancel()
+        asyncio.run(check())
+
     def test_start_rejects_existing_position_without_sl_or_tp(self):
         position = types.SimpleNamespace(
             magic=0, ticket=78, symbol="EURUSD", type=fake_mt5.POSITION_TYPE_BUY,
