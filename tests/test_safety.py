@@ -342,12 +342,7 @@ class MarketSafetyTests(unittest.TestCase):
         asyncio.run(check())
 
 
-    def test_start_adopts_existing_manual_position_with_sl_tp(self):
-        position = types.SimpleNamespace(
-            magic=0, ticket=77, symbol="EURUSD", type=fake_mt5.POSITION_TYPE_BUY,
-            price_open=1.1000, sl=1.0950, tp=1.1150, volume=0.10,
-            time=time.time()-7200,
-        )
+    def test_start_rejects_existing_untracked_bot_position(self):
         class Gateway:
             def account(self):
                 return types.SimpleNamespace(
@@ -361,100 +356,7 @@ class MarketSafetyTests(unittest.TestCase):
                     "trade_expert": True,
                 }
             def positions(self):
-                return (position,)
-        messages = []
-        async def notify(message, **kwargs):
-            messages.append(message)
-        async def idle_loop():
-            await asyncio.sleep(60)
-        async def check():
-            engine = Engine(Gateway(), FakeDB(), notify)
-            engine.loop = idle_loop
-            before = time.time()
-            started = await engine.start()
-            self.assertTrue(started)
-            self.assertTrue(engine.running)
-            self.assertEqual(engine.mode, "RUNNING")
-            self.assertIn(77, engine.trades)
-            trade = engine.trades[77]
-            self.assertEqual(trade.strategy, "manual_adopted")
-            self.assertGreaterEqual(trade.opened_at, before)
-            self.assertTrue(any(event == "POSITION_ADOPTED" for event, _ in engine.db.events))
-            engine.running = False
-            engine.mode = "STOPPED"
-            engine.loop_task.cancel()
-        asyncio.run(check())
-
-    def test_start_adopts_protected_bot_position_and_restores_metadata(self):
-        position = types.SimpleNamespace(
-            magic=4009, ticket=79, symbol="EURUSD", type=fake_mt5.POSITION_TYPE_BUY,
-            price_open=1.1000, sl=1.1080, tp=1.1150, volume=0.10,
-            time=time.time()-300,
-        )
-        class DB(FakeDB):
-            async def open_trade_metadata(self, ticket):
-                self.assert_ticket = ticket
-                return {
-                    'strategy':'scalp_trend','regime':'TREND','confidence':0.82,
-                    'reason':'restored','sl':1.0950,'protection_pct':45.0,
-                    'trailing_gap_pct':5.0,'signal_bar':12345,
-                }
-        class Gateway:
-            def account(self):
-                return types.SimpleNamespace(
-                    trade_mode=0, equity=1000, currency="USD"
-                )
-            def algo_status(self):
-                return {
-                    "connected": True,
-                    "trade_allowed": True,
-                    "account_trade_allowed": True,
-                    "trade_expert": True,
-                }
-            def positions(self):
-                return (position,)
-        messages = []
-        async def notify(message, **kwargs):
-            messages.append(message)
-        async def idle_loop():
-            await asyncio.sleep(60)
-        async def check():
-            db=DB()
-            engine=Engine(Gateway(), db, notify)
-            engine.loop=idle_loop
-            started=await engine.start()
-            self.assertTrue(started)
-            trade=engine.trades[79]
-            self.assertEqual(trade.strategy,'scalp_trend')
-            self.assertEqual(trade.signal_bar,12345)
-            self.assertAlmostEqual(trade.initial_r,0.005)
-            self.assertTrue(trade.protection_45_active)
-            self.assertLess(trade.opened_at,time.time()-200)
-            engine.running=False
-            engine.mode='STOPPED'
-            engine.loop_task.cancel()
-        asyncio.run(check())
-
-    def test_start_rejects_existing_position_without_sl_or_tp(self):
-        position = types.SimpleNamespace(
-            magic=0, ticket=78, symbol="EURUSD", type=fake_mt5.POSITION_TYPE_BUY,
-            price_open=1.1000, sl=0.0, tp=1.1150, volume=0.10,
-            time=time.time()-60,
-        )
-        class Gateway:
-            def account(self):
-                return types.SimpleNamespace(
-                    trade_mode=0, equity=1000, currency="USD"
-                )
-            def algo_status(self):
-                return {
-                    "connected": True,
-                    "trade_allowed": True,
-                    "account_trade_allowed": True,
-                    "trade_expert": True,
-                }
-            def positions(self):
-                return (position,)
+                return (types.SimpleNamespace(magic=4009, ticket=77),)
         messages = []
         async def notify(message, **kwargs):
             messages.append(message)
@@ -464,7 +366,7 @@ class MarketSafetyTests(unittest.TestCase):
             self.assertFalse(started)
             self.assertFalse(engine.running)
             self.assertEqual(engine.mode, "STOPPED")
-            self.assertTrue(any("SL/TP" in m for m in messages))
+            self.assertTrue(any("غير متتبعة" in m for m in messages))
         asyncio.run(check())
 
     def test_stop_enters_draining_without_closing_position(self):
