@@ -16,6 +16,25 @@ class DB:
    async with d.execute('SELECT value FROM settings WHERE key=?',(k,)) as c:
     r=await c.fetchone(); return r[0] if r else default
 
+ async def open_trade_metadata(self,ticket):
+  async with aiosqlite.connect(self.path) as d:
+   async with d.execute(
+    """SELECT ts,details FROM audit
+       WHERE event='OPEN'
+         AND CAST(json_extract(details,'$.ticket') AS INTEGER)=?
+       ORDER BY id DESC LIMIT 1""",
+    (int(ticket),)
+   ) as cur:
+    row=await cur.fetchone()
+  if not row:
+   return None
+  try:
+   details=json.loads(row[1] or '{}')
+  except Exception:
+   details={}
+  details['_ts']=float(row[0] or 0)
+  return details
+
  async def reset_strategy_performance(self,at_ts=None):
   reset_ts=float(time.time() if at_ts is None else at_ts)
   await self.set('strategy_performance_reset_ts',reset_ts)
