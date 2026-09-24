@@ -164,7 +164,7 @@ async def main():
   from api.control_api import ControlAPI
   import uvicorn
 
-  control_api=ControlAPI(e,db,gw,event_hub,settings.control_api_token)
+  control_api=ControlAPI(e,db,gw,event_hub,settings.control_api_token,push_service=push_service)
   api_config=uvicorn.Config(
    control_api.app,
    host=settings.control_api_host,
