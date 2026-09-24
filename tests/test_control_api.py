@@ -1,7 +1,16 @@
+import sys
+import types
 import unittest
 from types import SimpleNamespace
 
 from pydantic import ValidationError
+
+fake_mt5 = types.ModuleType("MetaTrader5")
+fake_mt5.ACCOUNT_TRADE_MODE_DEMO = 0
+fake_mt5.POSITION_TYPE_BUY = 0
+fake_mt5.POSITION_TYPE_SELL = 1
+fake_mt5.shutdown = lambda: None
+sys.modules["MetaTrader5"] = fake_mt5
 
 from api.control_api import ControlAPI, SettingsPatch
 
