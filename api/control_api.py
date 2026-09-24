@@ -258,7 +258,7 @@ class ControlAPI:
                         'ts': time.time(),
                         'payload': await self.snapshot(),
                     })
-                    await asyncio.sleep(0.25)
+                    await asyncio.sleep(0.1)
             except WebSocketDisconnect:
                 pass
             except Exception:
