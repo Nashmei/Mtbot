@@ -524,8 +524,10 @@ class Engine:
     native_snapshot['account_context']={
      'balance':float(getattr(account,'balance',0) or 0),
      'equity':float(getattr(account,'equity',0) or 0),
+     'used_margin':float(getattr(account,'margin',0) or 0),
      'free_margin':float(getattr(account,'margin_free',0) or 0),
      'margin_level_pct':float(getattr(account,'margin_level',0) or 0),
+     'leverage':int(getattr(account,'leverage',0) or 0),
      'currency':str(getattr(account,'currency','') or ''),
      'open_bot_positions':len(self.trades),
     }
@@ -714,40 +716,52 @@ class Engine:
     await self._log_reject('SPREAD_REJECT',symbol,reason='ENTRY_SPREAD')
     return
 
-   # مسافة SL: الاستراتيجية + الحد الأدنى الذي يفرضه الوسيط
+   # AI-native mode owns SL/TP/protection/trailing/duration. The engine only
+   # validates the plan against live broker constraints; Telegram risk remains immutable.
    broker_stop_points=max(
     float(getattr(info,'trade_stops_level',0) or 0),
     float(getattr(info,'trade_freeze_level',0) or 0)
    )
-   sl_points=max(
-    float(sig.sl_points),
-    float(settings.min_sl_points),
-    broker_stop_points+2.0
-   )
-
    price=tick.ask if sig.side==Side.BUY else tick.bid
    typ=mt5.ORDER_TYPE_BUY if sig.side==Side.BUY else mt5.ORDER_TYPE_SELL
-
-   # MT5 يتحقق من الوقف مقابل جهة الإغلاق:
-   # BUY يغلق على Bid و SELL يغلق على Ask.
-   # نضيف السبريد + هامش نقطتين حتى لا يكون الوقف داخل السعر الحالي.
-   spread_points=max(0.0,(float(tick.ask)-float(tick.bid))/float(info.point))
-   valid_distance_points=max(
-    sl_points,
-    broker_stop_points+2.0,
-    spread_points+2.0
-   )
-   d=valid_distance_points*info.point
-
-   if sig.side==Side.BUY:
-    sl=float(tick.bid)-d
-    tp=price+abs(price-sl)*self.rr
+   if self.ai_native_only:
+    sl=float(ai_decision.get('sl_price',0) or 0)
+    tp=float(ai_decision.get('tp_price',0) or 0)
+    protection_pct=float(ai_decision.get('protection_pct',0) or 0)
+    trailing_gap_pct=float(ai_decision.get('trailing_gap_pct',0) or 0)
+    expected_duration=float(ai_decision.get('expected_duration_minutes',0) or 0)
+    min_distance=(broker_stop_points+2.0)*float(info.point)
+    correct_side=(
+     (sig.side==Side.BUY and sl < float(tick.bid)-min_distance and tp > price+min_distance)
+     or
+     (sig.side==Side.SELL and sl > float(tick.ask)+min_distance and tp < price-min_distance)
+    )
+    if not correct_side:
+     await self._log_reject(
+      'AI_PLAN_REJECT',symbol,reason='INVALID_AI_SL_TP',
+      side=sig.side.value,entry=price,sl=sl,tp=tp,
+      broker_stop_points=broker_stop_points,
+     )
+     return
+    if not (15.0<=protection_pct<=80.0 and 2.0<=trailing_gap_pct<=25.0 and 2.0<=expected_duration<=10.0):
+     await self._log_reject('AI_PLAN_REJECT',symbol,reason='INVALID_AI_MANAGEMENT')
+     return
+    sl=round(sl,int(info.digits));tp=round(tp,int(info.digits))
    else:
-    sl=float(tick.ask)+d
-    tp=price-abs(sl-price)*self.rr
-
-   sl=round(sl,int(info.digits))
-   tp=round(tp,int(info.digits))
+    sl_points=max(float(sig.sl_points),float(settings.min_sl_points),broker_stop_points+2.0)
+    spread_points=max(0.0,(float(tick.ask)-float(tick.bid))/float(info.point))
+    valid_distance_points=max(sl_points,broker_stop_points+2.0,spread_points+2.0)
+    d=valid_distance_points*info.point
+    if sig.side==Side.BUY:
+     sl=float(tick.bid)-d
+     tp=price+abs(price-sl)*self.rr
+    else:
+     sl=float(tick.ask)+d
+     tp=price-abs(sl-price)*self.rr
+    sl=round(sl,int(info.digits));tp=round(tp,int(info.digits))
+    protection_pct=float(self.protection_pct)
+    trailing_gap_pct=float(self.trailing_gap_pct)
+    expected_duration=float(self.max_trade_minutes)
 
    # المخاطرة النقدية المستهدفة من Equity
    risk_cash=float(account.equity)*(self.risk_pct/100.0)
@@ -932,7 +946,8 @@ class Engine:
     pos.ticket,symbol,sig.side,fill,actual_sl,actual_tp,initial_r,time.time(),
     strategy=sig.strategy,regime=reg.value,confidence=sig.confidence,
     reason=sig.reason,volume=float(pos.volume or vol),signal_bar=signal_bar,
-    protection_pct=self.protection_pct,trailing_gap_pct=self.trailing_gap_pct
+    protection_pct=protection_pct,trailing_gap_pct=trailing_gap_pct,
+    expected_duration_minutes=expected_duration
    )
 
    sl=actual_sl
@@ -998,6 +1013,8 @@ class Engine:
     side=sig.side.value,strategy=sig.strategy,regime=reg.value,
     confidence=float(sig.confidence),reason=sig.reason,
     risk_cash=actual_risk,risk_pct=actual_risk_pct,rr_actual=actual_rr,
+    ai_protection_pct=protection_pct,ai_trailing_gap_pct=trailing_gap_pct,
+    ai_expected_duration_minutes=expected_duration,
    )
    asyncio.create_task(self._send_trade_chart(t,actual_risk,actual_risk_pct))
 
@@ -1068,7 +1085,8 @@ class Engine:
    f'🛑 الوقف: {t.sl:.{digits}f}\n'
    f'💰 الهدف: {t.tp:.{digits}f}\n'
    f'{live_line}\n'
-   f'🛡 الحماية: {t.protection_pct:g}% | ⚖️ R:R 1:{rr_actual:.2f}'
+   f'🛡 الحماية: {t.protection_pct:g}% | ⚖️ R:R 1:{rr_actual:.2f}\n'
+   f'⏱ مدة AI: {t.expected_duration_minutes:g} دقيقة'
   )
 
  async def _send_trade_chart(self,t,actual_risk,actual_risk_pct):
@@ -1212,15 +1230,16 @@ class Engine:
 
  async def manage(self,t,tick,info):
   price=tick.bid if t.side==Side.BUY else tick.ask
-  # حد مدة الصفقة قابل للتحكم من Telegram.
+  # In AI-native mode the AI-selected duration is the hard time horizon.
   age=time.time()-t.opened_at
-  max_age=max(60.0,float(self.max_trade_minutes)*60.0)
+  trade_minutes=(t.expected_duration_minutes if self.ai_native_only else self.max_trade_minutes)
+  max_age=max(60.0,float(trade_minutes)*60.0)
   if age>=max_age:
    pos=self.gw.position_by_ticket(t.ticket)
    if pos:
     res=self.gw.close(pos)
     if res and res.retcode in (mt5.TRADE_RETCODE_DONE,mt5.TRADE_RETCODE_DONE_PARTIAL):
-     await self.db.log('MAX_DURATION_EXIT',t.symbol,ticket=t.ticket,age_seconds=age,max_trade_minutes=self.max_trade_minutes)
+     await self.db.log('MAX_DURATION_EXIT',t.symbol,ticket=t.ticket,age_seconds=age,max_trade_minutes=trade_minutes)
      return
     await self.db.log('MAX_DURATION_EXIT_FAILED',t.symbol,ticket=t.ticket,result=str(res))
 
