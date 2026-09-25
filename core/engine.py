@@ -681,57 +681,31 @@ class Engine:
    vol=vmin+max(0,steps)*vstep
    vol=min(vol,vmax)
 
-   # تقييد الحجم حسب المارجن المتاح
-   margin_1lot=mt5.order_calc_margin(typ,symbol,1.0,price)
-   if margin_1lot is not None and margin_1lot>0:
-    margin_capacity=(float(account.margin_free)*0.80)/float(margin_1lot)
-    if margin_capacity < vmin:
-     notice_key=('margin_min',symbol)
-     if notice_key not in self.execution_notice_once:
-      self.execution_notice_once.add(notice_key)
-      await self.notify(
-       f'⛔ لم تنفذ {symbol}\n'
-       f'المارجن لا يسمح حتى بأقل لوت {vmin:g}'
-      )
-     await self._log_reject('MARGIN_REJECT',symbol,reason='BELOW_MIN_VOLUME',min_lot=vmin)
-     return
-    msteps=math.floor((margin_capacity-vmin)/vstep+1e-9)
-    margin_vol=vmin+max(0,msteps)*vstep
-    vol=min(vol,margin_vol,vmax)
+   # The Telegram risk setting is the per-trade target. Never silently reduce
+   # the risk-sized volume because of margin constraints.
+   margin_required=mt5.order_calc_margin(typ,symbol,vol,price)
+   free_margin=float(getattr(account,'margin_free',0) or 0)
+   if margin_required is None or float(margin_required) > free_margin*0.95:
+    await self._log_reject(
+     'MARGIN_REJECT',symbol,reason='PLANNED_RISK_VOLUME_UNAVAILABLE',
+     planned_volume=vol,margin_required=margin_required,free_margin=free_margin,
+     risk_cash=risk_cash,risk_pct=self.risk_pct,
+    )
+    return
 
-    # Aggregate account margin safety: after the new order, projected
-    # Margin Level must remain >= 200%. Reduce volume first; reject only
-    # when even the broker minimum lot cannot satisfy the floor.
-    min_margin_level_pct=200.0
-    current_margin=float(getattr(account,'margin',0) or 0)
-    equity=float(getattr(account,'equity',0) or 0)
-    max_total_margin=(equity*100.0/min_margin_level_pct) if equity>0 else 0.0
-    remaining_margin=max_total_margin-current_margin
-    level_capacity=remaining_margin/float(margin_1lot)
-    if level_capacity < vmin:
-     projected_min_margin=current_margin+float(margin_1lot)*vmin
-     projected_min_level=(equity/projected_min_margin*100.0) if projected_min_margin>0 else 0.0
-     await self._log_reject(
-      'MARGIN_LEVEL_REJECT',symbol,reason='BELOW_200_PERCENT',
-      min_margin_level_pct=min_margin_level_pct,
-      projected_margin_level_pct=projected_min_level,
-      current_margin=current_margin,equity=equity,min_lot=vmin,
-     )
-     return
-    lsteps=math.floor((level_capacity-vmin)/vstep+1e-9)
-    level_vol=vmin+max(0,lsteps)*vstep
-    if level_vol < vol:
-     original_vol=vol
-     vol=max(vmin,min(vol,level_vol))
-     projected_margin=current_margin+float(margin_1lot)*vol
-     projected_level=(equity/projected_margin*100.0) if projected_margin>0 else 0.0
-     await self._log_reject(
-      'MARGIN_LEVEL_VOLUME_REDUCED',symbol,
-      requested_volume=original_vol,accepted_volume=vol,
-      min_margin_level_pct=min_margin_level_pct,
-      projected_margin_level_pct=projected_level,
-     )
-
+   # Preserve the existing 200% projected margin-level safety floor, but reject
+   # the trade rather than changing its requested risk.
+   current_margin=float(getattr(account,'margin',0) or 0)
+   equity=float(getattr(account,'equity',0) or 0)
+   projected_margin=current_margin+float(margin_required)
+   projected_level=(equity/projected_margin*100.0) if projected_margin>0 else float('inf')
+   if projected_level < 200.0:
+    await self._log_reject(
+     'MARGIN_REJECT',symbol,reason='PLANNED_VOLUME_BELOW_200_PERCENT_MARGIN_LEVEL',
+     planned_volume=vol,margin_required=margin_required,free_margin=free_margin,
+     projected_margin_level_pct=projected_level,risk_cash=risk_cash,risk_pct=self.risk_pct,
+    )
+    return
    # تثبيت الحجم على خطوة الوسيط وإعادة التحقق النهائي
    steps=math.floor((vol-vmin)/vstep+1e-9)
    vol=vmin+max(0,steps)*vstep
@@ -781,41 +755,15 @@ class Engine:
     )
     return
 
-   # MT5 may require more margin than order_calc_margin() estimated. For
-   # TRADE_RETCODE_NO_MONEY, walk volume down by the broker step until the
-   # order check accepts it. This can only reduce risk; it never increases it.
+   # Never rescue insufficient margin by shrinking volume: configured risk is the target.
    no_money=getattr(mt5,'TRADE_RETCODE_NO_MONEY',10019)
    if chk.retcode==no_money:
-    requested_vol=vol
-    while chk and chk.retcode==no_money and vol-vstep>=vmin-1e-9:
-     vol=round(vol-vstep,8)
-     req['volume']=vol
-     chk=self.gw.order_check(req)
-    actual_risk=loss_1lot*vol
-    actual_risk_pct=(actual_risk/float(account.equity)*100.0) if account.equity else 0.0
-    if not chk or chk.retcode!=0:
-     code=getattr(chk,'retcode',no_money) if chk else no_money
-     comment=getattr(chk,'comment','No money') if chk else 'No money'
-     await self._log_reject(
-      'ORDER_CHECK_REJECT',symbol,reason='NO_MONEY',retcode=code,
-      requested_volume=requested_vol,final_volume=vol,
-      risk_pct=actual_risk_pct,
-     )
-     notice_key=('order_check_no_money',symbol,signal_key)
-     if notice_key not in self.execution_notice_once:
-      self.execution_notice_once.add(notice_key)
-      await self.notify(
-       f'❌ رفض فحص الصفقة — {symbol}\n'
-       f'الكود: {code}\n'
-       f'السبب: {comment}\n'
-       f'اللوت بعد خفض المارجن: {vol:g} | المخاطرة: {actual_risk_pct:.2f}%'
-      )
-     return
-    if vol < requested_vol:
-     await self._log_reject(
-      'MARGIN_VOLUME_REDUCED',symbol,requested_volume=requested_vol,
-      accepted_volume=vol,risk_pct=actual_risk_pct,
-     )
+    await self._log_reject(
+     'MARGIN_REJECT',symbol,reason='ORDER_CHECK_NO_MONEY',
+     planned_volume=vol,risk_cash=risk_cash,risk_pct=self.risk_pct,
+     retcode=chk.retcode,comment=getattr(chk,'comment','No money'),
+    )
+    return
 
    if chk.retcode!=0:
     await self._log_reject(
@@ -920,6 +868,18 @@ class Engine:
      planned_entry=price,actual_entry=fill,actual_sl=actual_sl,
      volume=vol,actual_rr=actual_rr,
     )
+
+   # Broker-confirmed risk must remain within +/-5% of the Telegram target.
+   if abs(risk_drift_pct)>5.0:
+    await self.db.log(
+     'POST_FILL_RISK_DRIFT_REJECT',symbol,
+     ticket=pos.ticket,planned_risk_cash=risk_cash,actual_risk_cash=actual_risk,
+     drift_cash=risk_drift_cash,drift_pct=risk_drift_pct,
+     planned_entry=price,actual_entry=fill,actual_sl=actual_sl,
+     volume=vol,risk_pct=self.risk_pct,
+    )
+    await self._handle_invalid_initial_r(symbol,pos,fill,actual_sl)
+    return
 
    self.trades[pos.ticket]=t
    self.trade_alert_meta[pos.ticket]={
