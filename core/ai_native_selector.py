@@ -1,4 +1,4 @@
-import asyncio,json,os,time,urllib.request
+import asyncio,json,os,time,urllib.error,urllib.request
 from .models import Signal,Side,Regime
 from .strategy_library import PLAYBOOKS,CATALOG
 
@@ -16,6 +16,14 @@ class AINativeSelector:
   self.model=os.getenv("MTBOT_AI_NATIVE_MODEL",MODEL).strip() or MODEL
   self.timeout=float(os.getenv("MTBOT_AI_NATIVE_TIMEOUT","10"))
   self.min_conf=int(os.getenv("MTBOT_AI_NATIVE_MIN_CONF","75"))
+  self.min_interval=float(os.getenv("MTBOT_AI_NATIVE_MIN_INTERVAL","30"))
+  self.global_interval=float(os.getenv("MTBOT_AI_NATIVE_GLOBAL_INTERVAL","3"))
+  self.max_backoff=float(os.getenv("MTBOT_AI_NATIVE_MAX_BACKOFF","120"))
+  self._last_symbol_call={}
+  self._cache={}
+  self._global_lock=asyncio.Lock()
+  self._last_global_call=0.0
+  self._backoff_until=0.0
 
  @staticmethod
  def _bars(r,n):
@@ -69,16 +77,65 @@ class AINativeSelector:
   with urllib.request.urlopen(req,timeout=self.timeout) as r:raw=json.loads(r.read().decode())
   return self._parse(raw["choices"][0]["message"].get("content") or ""),int((time.monotonic()-start)*1000),raw.get("usage",{})
 
+ @staticmethod
+ def _snapshot_key(snap):
+  # One decision per symbol/bar state. Live bid/ask/tick micro-noise is deliberately
+  # excluded so the scanner cannot hammer the provider on every polling cycle.
+  def last_bar(tf):
+   rows=snap.get(tf) or []
+   return int(rows[-1].get("t",0)) if rows else 0
+  return (last_bar("m1"),last_bar("m5"),last_bar("m15"),last_bar("h1"))
+
+ def _no_trade(self,code,reason,**extra):
+  out={"decision":"NO_TRADE","confidence":100,"reason_code":code,"reason":reason}
+  out.update(extra);return out
+
  async def decide(self,symbol,snap):
-  if not self.key:return {"decision":"NO_TRADE","confidence":100,"reason_code":"AI_UNAVAILABLE","reason":"NVIDIA_API_KEY missing"}
-  try:
-   o,lat,u=await asyncio.wait_for(asyncio.to_thread(self._sync,snap),timeout=self.timeout+1)
-   o.update({"model":self.model,"latency_ms":lat})
-   if o["decision"]=="SIGNAL" and o["confidence"]<self.min_conf:o.update({"decision":"NO_TRADE","reason_code":"AI_LOW_CONFIDENCE","reason":"AI-native confidence below threshold"})
-   await self.db.log("AI_NATIVE_DECISION",symbol,**o,usage=u);return o
-  except Exception as ex:
-   await self.db.log("AI_NATIVE_ERROR",symbol,error=repr(ex))
-   return {"decision":"NO_TRADE","confidence":100,"reason_code":"AI_ERROR","reason":str(ex)[:160]}
+  if not self.key:
+   out=self._no_trade("AI_UNAVAILABLE","NVIDIA_API_KEY missing")
+   await self.db.log("AI_NATIVE_UNAVAILABLE",symbol,**out)
+   return out
+
+  now=time.monotonic();key=self._snapshot_key(snap);cached=self._cache.get(symbol)
+  if cached and cached[0]==key:
+   out=dict(cached[1]);out["cached"]=True
+   return out
+  since=now-self._last_symbol_call.get(symbol,0.0)
+  if since<self.min_interval:
+   return self._no_trade("AI_RATE_LIMIT_LOCAL","Per-symbol AI cooldown",retry_after_seconds=round(self.min_interval-since,1))
+  if now<self._backoff_until:
+   return self._no_trade("AI_PROVIDER_BACKOFF","Provider backoff active",retry_after_seconds=round(self._backoff_until-now,1))
+
+  async with self._global_lock:
+   now=time.monotonic()
+   if now<self._backoff_until:
+    return self._no_trade("AI_PROVIDER_BACKOFF","Provider backoff active",retry_after_seconds=round(self._backoff_until-now,1))
+   wait=self.global_interval-(now-self._last_global_call)
+   if wait>0:await asyncio.sleep(wait)
+   self._last_global_call=time.monotonic()
+   self._last_symbol_call[symbol]=self._last_global_call
+   try:
+    o,lat,u=await asyncio.wait_for(asyncio.to_thread(self._sync,snap),timeout=self.timeout+1)
+    o.update({"model":self.model,"latency_ms":lat,"cached":False})
+    if o["decision"]=="SIGNAL" and o["confidence"]<self.min_conf:
+     o.update({"decision":"NO_TRADE","reason_code":"AI_LOW_CONFIDENCE","reason":"AI-native confidence below threshold"})
+    self._cache[symbol]=(key,dict(o))
+    await self.db.log("AI_NATIVE_DECISION",symbol,**o,usage=u)
+    return o
+   except urllib.error.HTTPError as ex:
+    if ex.code==429:
+     raw=ex.headers.get("Retry-After","") if ex.headers else ""
+     try:delay=float(raw)
+     except Exception:delay=min(self.max_backoff,max(15.0,self.min_interval*2))
+     delay=max(5.0,min(self.max_backoff,delay))
+     self._backoff_until=time.monotonic()+delay
+     await self.db.log("AI_NATIVE_429",symbol,retry_after_seconds=delay)
+     return self._no_trade("AI_PROVIDER_429","Provider rate limit",retry_after_seconds=delay)
+    await self.db.log("AI_NATIVE_ERROR",symbol,error=repr(ex))
+    return self._no_trade("AI_HTTP_ERROR",str(ex)[:160])
+   except Exception as ex:
+    await self.db.log("AI_NATIVE_ERROR",symbol,error=repr(ex))
+    return self._no_trade("AI_ERROR",str(ex)[:160])
 
  def to_signal(self,o,snap):
   if o.get("decision")!="SIGNAL":return None,Regime.NO_TRADE
