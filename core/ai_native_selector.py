@@ -6,7 +6,7 @@ URL="https://integrate.api.nvidia.com/v1/chat/completions"
 MODEL="google/diffusiongemma-26b-a4b-it"
 SYSTEM="""You are the sole signal generator for an experimental MT5 scalping bot. Legacy strategy signals are disabled.
 Use only the supplied closed bars, live tick summary, and the supplied 50-playbook catalog.
-Return ONLY JSON with: decision SIGNAL or NO_TRADE; side BUY, SELL or NONE; strategy_id; confidence integer 0..100; regime TREND,RANGE,BREAKOUT,VOLATILE,MIXED,UNKNOWN; sl_atr_multiple 0.55..2.0; research_required boolean; research_query; reason_code; reason.
+This is strict short-horizon scalping: a SIGNAL must be a setup you expect to complete within 2 to 6 minutes from entry. Use ticks and M1/M5 as the primary timing evidence; use M15/H1 only as higher-timeframe context. If the setup likely needs less than 2 minutes, more than 6 minutes, or duration cannot be estimated reliably, return NO_TRADE.\nReturn ONLY JSON with: decision SIGNAL or NO_TRADE; side BUY, SELL or NONE; strategy_id; confidence integer 0..100; regime TREND,RANGE,BREAKOUT,VOLATILE,MIXED,UNKNOWN; sl_atr_multiple 0.55..2.0; expected_duration_minutes number 2..6 for SIGNAL; research_required boolean; research_query; reason_code; reason.
 For SIGNAL choose only a strategy_id present in the catalog. Be conservative and choose NO_TRADE when evidence conflicts or is unclear.
 Never choose volume, monetary risk, TP, leverage, or execute a trade."""
 
@@ -70,8 +70,10 @@ class AINativeSelector:
    if s not in ("BUY","SELL") or sid not in CATALOG or sid=="no_trade_unclear":raise ValueError("invalid bounded selection")
    mult=float(o.get("sl_atr_multiple",1.0))
    if not .55<=mult<=2.0:raise ValueError("invalid stop multiple")
-  else:s="NONE";sid="none";mult=0.0
-  return {"decision":d,"side":s,"strategy_id":sid,"confidence":c,"regime":reg,"sl_atr_multiple":mult,
+   duration=float(o.get("expected_duration_minutes",0))
+   if not 2.0<=duration<=6.0:raise ValueError("invalid expected duration")
+  else:s="NONE";sid="none";mult=0.0;duration=0.0
+  return {"decision":d,"side":s,"strategy_id":sid,"confidence":c,"regime":reg,"sl_atr_multiple":mult,"expected_duration_minutes":duration,
    "research_required":bool(o.get("research_required",False)),"research_query":str(o.get("research_query",""))[:160],
    "reason_code":str(o.get("reason_code","AI_NATIVE"))[:80],"reason":str(o.get("reason",""))[:160]}
 
