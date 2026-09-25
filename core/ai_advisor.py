@@ -1,7 +1,7 @@
 import asyncio, hashlib, json, os, time, urllib.request
 
 BASE_URL="https://integrate.api.nvidia.com/v1/chat/completions"
-FAST_MODEL="nvidia/nemotron-3-nano-30b-a3b"
+FAST_MODEL="nvidia/nemotron-3.5-lightning-30b-a3b"
 DEEP_MODEL="nvidia/nemotron-3-super-120b-a12b"
 
 SYSTEM="""You are the primary entry-quality judge for a very short-term MT5 scalping bot.
@@ -22,8 +22,8 @@ class AIAdvisor:
   self.api_key=os.getenv("NVIDIA_API_KEY","").strip()
   self.fast_model=os.getenv("MTBOT_AI_FAST_MODEL",FAST_MODEL).strip() or FAST_MODEL
   self.deep_model=os.getenv("MTBOT_AI_DEEP_MODEL",DEEP_MODEL).strip() or DEEP_MODEL
-  self.fast_timeout=float(os.getenv("MTBOT_AI_FAST_TIMEOUT","4.0"))
-  self.deep_timeout=float(os.getenv("MTBOT_AI_DEEP_TIMEOUT","6.0"))
+  self.fast_timeout=float(os.getenv("MTBOT_AI_FAST_TIMEOUT","8.0"))
+  self.deep_timeout=float(os.getenv("MTBOT_AI_DEEP_TIMEOUT","10.0"))
   self.fast_accept=int(os.getenv("MTBOT_AI_FAST_ACCEPT_CONF","75"))
   self.deep_accept=int(os.getenv("MTBOT_AI_DEEP_ACCEPT_CONF","65"))
 
