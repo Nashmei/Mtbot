@@ -6,6 +6,7 @@ from .analyzer import Analyzer
 from .risk import Risk
 from .ai_advisor import AIAdvisor
 from .ai_native_selector import AINativeSelector
+from .web_research import WebResearch
 
 def _signal_key(strategy,side_value,signal_bar):
  return (strategy,side_value,signal_bar)
@@ -52,6 +53,7 @@ class Engine:
   self.ai=AIAdvisor(db)
   # AI branch experiment: legacy strategy signal generation is bypassed.
   self.ai_native=AINativeSelector(db)
+  self.web_research=WebResearch(db)
   self.ai_native_only=True
   self.reject_log_at={}
   self.reject_log_interval=60.0
@@ -519,14 +521,29 @@ class Engine:
     )
     native_decision=await self.ai_native.decide(symbol,native_snapshot)
     if native_decision.get('research_required'):
-     # Web/news research hook is explicit and fail-closed until a trusted
-     # runtime research provider is configured.
-     await self._log_reject(
-      'AI_RESEARCH_REQUIRED',symbol,
-      reason=native_decision.get('reason_code','RESEARCH_REQUIRED'),
-      query=native_decision.get('research_query',''),
+     research=await self.web_research.search(
+      symbol,native_decision.get('research_query','')
      )
-     return
+     if not research.get('ok'):
+      await self._log_reject(
+       'AI_RESEARCH_REJECT',symbol,reason='WEB_RESEARCH_FAILED'
+      )
+      return
+     if research.get('high_impact_recent'):
+      await self._log_reject(
+       'AI_NEWS_GUARD_REJECT',symbol,reason='RECENT_HIGH_IMPACT_NEWS',
+       articles=research.get('articles',[]),
+      )
+      return
+     # Re-ask the AI once with fresh trusted-source research attached.
+     native_snapshot=dict(native_snapshot)
+     native_snapshot['news']=research
+     native_decision=await self.ai_native.decide(symbol,native_snapshot)
+     if native_decision.get('research_required'):
+      await self._log_reject(
+       'AI_RESEARCH_REJECT',symbol,reason='REPEATED_RESEARCH_REQUEST'
+      )
+      return
     sig,reg=self.ai_native.to_signal(native_decision,native_snapshot)
     meta={
      'decision':'ai_native',
