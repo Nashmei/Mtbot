@@ -2,6 +2,7 @@ from telegram import Update,InlineKeyboardButton,InlineKeyboardMarkup
 from telegram.ext import Application,CommandHandler,CallbackQueryHandler,MessageHandler,ContextTypes,filters
 from telegram.error import BadRequest,RetryAfter
 from core.config import settings
+from bot import v2_views
 class TelegramUI:
  def __init__(self,engine,db): self.e=engine;self.db=db;self.login_state={};self.input_state={};self.message_ids=set();self.menu_message_id=None;self.menu_chat_id=None;self.menu_expiry_task=None
  def allowed(self,u): return bool(u and u.id==settings.telegram_allowed_user_id)
@@ -41,6 +42,21 @@ class TelegramUI:
    if not math.isfinite(v) or not 0<=v<=100: raise ValueError()
    self.e.daily_loss_limit_pct=v; self.e.daily_loss_notified=False
    db_key='daily_loss_limit_pct'; msg=f'✅ حد Equity اليومي: {v:g}%'+(' (معطل)' if v==0 else '')
+  elif key in ('ai_rr','ai_sl','ai_tp','ai_protection','ai_trailing','ai_duration'):
+   v=float(value)
+   if not math.isfinite(v) or v<0: raise ValueError()
+   specs={
+    'ai_rr':('ai_rr_override','ai_rr_override',0.5,5.0,'R:R'),
+    'ai_sl':('ai_sl_points_override','ai_sl_points_override',1.0,100000.0,'SL points'),
+    'ai_tp':('ai_tp_points_override','ai_tp_points_override',1.0,100000.0,'TP points'),
+    'ai_protection':('ai_protection_override','ai_protection_override',15.0,80.0,'Protection %'),
+    'ai_trailing':('ai_trailing_override','ai_trailing_override',2.0,25.0,'Trailing %'),
+    'ai_duration':('ai_duration_override','ai_duration_override',2.0,10.0,'Duration min'),
+   }
+   attr,db_key,lo,hi,label=specs[key]
+   if v!=0 and not lo<=v<=hi: raise ValueError()
+   setattr(self.e,attr,v)
+   msg=f'✅ {label}: '+('AI' if v==0 else f'{v:g}')
   else:
    raise ValueError()
   if hasattr(self.e,'save_setting'):
@@ -62,7 +78,7 @@ class TelegramUI:
    except (asyncio.CancelledError,BadRequest): pass
    except Exception: pass
   self.menu_expiry_task=asyncio.create_task(expire())
- async def _edit(self,q,text,reply_markup=None,arm=True):
+ async def _edit(self,q,text,reply_markup=None,arm=False):
   try:
    await q.edit_message_text(text,reply_markup=reply_markup)
   except BadRequest as ex:
@@ -90,20 +106,39 @@ class TelegramUI:
   if self.menu_message_id and self.menu_chat_id==chat_id:
    try:
     await bot.edit_message_text(chat_id=chat_id,message_id=self.menu_message_id,text=text,reply_markup=reply_markup)
-    self._arm_menu_expiry(bot,chat_id,self.menu_message_id);return
+    return
    except Exception: pass
   m=await bot.send_message(chat_id=chat_id,text=text,reply_markup=reply_markup)
-  self.menu_chat_id=chat_id;self.menu_message_id=m.message_id;self._arm_menu_expiry(bot,chat_id,m.message_id)
+  self.menu_chat_id=chat_id;self.menu_message_id=m.message_id
  def kb(self):
-  return InlineKeyboardMarkup([[InlineKeyboardButton('📊 لوحة التحكم',callback_data='dashboard')],[InlineKeyboardButton('🤖 التداول',callback_data='trade_menu'),InlineKeyboardButton('🔎 التحليل',callback_data='analysis_menu')],[InlineKeyboardButton('⚙️ الإعدادات',callback_data='settings_menu'),InlineKeyboardButton('👤 الحساب',callback_data='account_menu')]])
+  return InlineKeyboardMarkup([
+   [InlineKeyboardButton('♻️ تحديث',callback_data='dashboard')],
+   [InlineKeyboardButton('📊 التداول',callback_data='trade_menu'),InlineKeyboardButton('🧠 AI',callback_data='ai_center')],
+   [InlineKeyboardButton('📈 الأداء',callback_data='performance'),InlineKeyboardButton('💼 الصفقات',callback_data='positions')],
+   [InlineKeyboardButton('💱 الأسواق',callback_data='analysis_menu'),InlineKeyboardButton('⚙️ الإعدادات',callback_data='settings_menu')],
+   [InlineKeyboardButton('🩺 صحة النظام',callback_data='health'),InlineKeyboardButton('👤 الحساب',callback_data='account_menu')]
+  ])
  def trade_kb(self): return InlineKeyboardMarkup([[InlineKeyboardButton('▶️ تشغيل المحرك',callback_data='start'),InlineKeyboardButton('⏹ إيقاف',callback_data='stop')],[InlineKeyboardButton('📊 الحالة',callback_data='status'),InlineKeyboardButton('↩️ الرئيسية',callback_data='dashboard')]])
- def analysis_kb(self): return InlineKeyboardMarkup([[InlineKeyboardButton('🔎 تحليل الآن',callback_data='analyze')],[InlineKeyboardButton('💱 الأزواج',callback_data='symbols'),InlineKeyboardButton('🔥 الأنشط',callback_data='active')],[InlineKeyboardButton('↩️ الرئيسية',callback_data='dashboard')]])
- def settings_kb(self): return InlineKeyboardMarkup([[InlineKeyboardButton('⚠️ المخاطرة',callback_data='risk'),InlineKeyboardButton('⚖️ R:R',callback_data='rr')],[InlineKeyboardButton('🎯 الثقة',callback_data='confidence'),InlineKeyboardButton('🛡 الحماية',callback_data='protection')],[InlineKeyboardButton('⏱ مدة الصفقة',callback_data='maxduration'),InlineKeyboardButton('📂 حد المراكز',callback_data='maxpos')],[InlineKeyboardButton('❌ حد الخسائر',callback_data='maxloss'),InlineKeyboardButton('📉 حد Equity اليومي',callback_data='dailyloss')],[InlineKeyboardButton('↩️ الرئيسية',callback_data='dashboard')]])
+ def analysis_kb(self): return InlineKeyboardMarkup([[InlineKeyboardButton('🧠 آخر تحليل AI',callback_data='ai_center')],[InlineKeyboardButton('💱 الأزواج',callback_data='symbols'),InlineKeyboardButton('🔥 الأنشط',callback_data='active')],[InlineKeyboardButton('↩️ الرئيسية',callback_data='dashboard')]])
+ def settings_kb(self): return InlineKeyboardMarkup([
+  [InlineKeyboardButton('⚠️ المخاطرة',callback_data='risk'),InlineKeyboardButton('🎯 الثقة',callback_data='confidence')],
+  [InlineKeyboardButton('🧠 تحكم الصفقة AI/يدوي',callback_data='ai_controls')],
+  [InlineKeyboardButton('📂 حد المراكز',callback_data='maxpos'),InlineKeyboardButton('❌ حد الخسائر',callback_data='maxloss')],
+  [InlineKeyboardButton('📉 حد Equity اليومي',callback_data='dailyloss')],
+  [InlineKeyboardButton('↩️ الرئيسية',callback_data='dashboard')]
+ ])
+ def ai_controls_kb(self): return InlineKeyboardMarkup([
+  [InlineKeyboardButton('⚖️ R:R',callback_data='ai_rr'),InlineKeyboardButton('🛑 SL points',callback_data='ai_sl')],
+  [InlineKeyboardButton('🎯 TP points',callback_data='ai_tp'),InlineKeyboardButton('🛡 Protection',callback_data='ai_protection')],
+  [InlineKeyboardButton('📐 Trailing',callback_data='ai_trailing'),InlineKeyboardButton('⏱ Duration',callback_data='ai_duration')],
+  [InlineKeyboardButton('♻️ الكل AI = 0',callback_data='ai_reset')],
+  [InlineKeyboardButton('↩️ الإعدادات',callback_data='settings_menu')]
+ ])
  def account_kb(self): return InlineKeyboardMarkup([[InlineKeyboardButton('🔐 ربط MT5',callback_data='mt5login'),InlineKeyboardButton('📈 الإحصائيات',callback_data='accountstats')],[InlineKeyboardButton('🧪 فحص الجاهزية',callback_data='readiness')],[InlineKeyboardButton('↩️ الرئيسية',callback_data='dashboard')]])
  async def start(self,u,c):
   if not self.allowed(u.effective_user) or u.effective_chat.id!=settings.telegram_allowed_user_id:return
   a=self.e.gw.account(); state=f'MT5: ✅ {a.login} / {a.server}' if a else 'MT5: ❌ غير مسجل الدخول\nاستخدم 🔐 حساب MT5'
-  await self._menu(c.bot,u.effective_chat.id,state+'\n\n'+await self.e.status(),self.kb())
+  await self._menu(c.bot,u.effective_chat.id,await v2_views.dashboard(self.e,self.db),self.kb())
  async def cb(self,u,c):
   q=u.callback_query
   if not self.allowed(q.from_user) or u.effective_chat.id!=settings.telegram_allowed_user_id:return
@@ -113,21 +148,38 @@ class TelegramUI:
   self.menu_chat_id=q.message.chat_id
   self.menu_message_id=q.message.message_id
   x=q.data
-  if x=='dashboard': return await self._edit(q,'🤖 MT5 BOT • لوحة التحكم\n━━━━━━━━━━━━━━\nاختر القسم:',self.kb())
+  if x=='ai_center':
+   return await self._edit(q,await v2_views.ai_center(self.e,self.db),InlineKeyboardMarkup([[InlineKeyboardButton('⚙️ تحكم AI/يدوي',callback_data='ai_controls')],[InlineKeyboardButton('↩️ الرئيسية',callback_data='dashboard')]]))
+  if x=='performance':
+   return await self._edit(q,await v2_views.performance(self.db),InlineKeyboardMarkup([[InlineKeyboardButton('🕐 آخر 24 ساعة',callback_data='performance24')],[InlineKeyboardButton('↩️ الرئيسية',callback_data='dashboard')]]))
+  if x=='performance24':
+   return await self._edit(q,await v2_views.performance(self.db,24),InlineKeyboardMarkup([[InlineKeyboardButton('📚 السجل الحالي',callback_data='performance')],[InlineKeyboardButton('↩️ الرئيسية',callback_data='dashboard')]]))
+  if x=='positions':
+   return await self._edit(q,await v2_views.positions(self.e),InlineKeyboardMarkup([[InlineKeyboardButton('♻️ تحديث',callback_data='positions')],[InlineKeyboardButton('↩️ الرئيسية',callback_data='dashboard')]]))
+  if x=='health':
+   return await self._edit(q,await v2_views.health(self.e,self.db),InlineKeyboardMarkup([[InlineKeyboardButton('♻️ تحديث',callback_data='health')],[InlineKeyboardButton('↩️ الرئيسية',callback_data='dashboard')]]))
+  if x=='ai_controls':
+   def z(v,suffix=''): return '🤖 AI' if float(v or 0)==0 else f'{v:g}{suffix}'
+   msg=('🧠 تحكم الصفقة AI / يدوي\n━━━━━━━━━━━━━━\n0 = AI يدير القيمة تلقائياً\n\n'
+        f'⚖️ R:R: {z(self.e.ai_rr_override)}\n🛑 SL: {z(self.e.ai_sl_points_override," pt")}\n'
+        f'🎯 TP: {z(self.e.ai_tp_points_override," pt")}\n🛡 Protection: {z(self.e.ai_protection_override,"%")}\n'
+        f'📐 Trailing: {z(self.e.ai_trailing_override,"%")}\n⏱ Duration: {z(self.e.ai_duration_override," min")}\n\n'
+        'الأولوية: TP اليدوي يتقدم على R:R اليدوي.')
+   return await self._edit(q,msg,self.ai_controls_kb())
+  if x=='ai_reset':
+   for attr,key in [('ai_rr_override','ai_rr_override'),('ai_sl_points_override','ai_sl_points_override'),('ai_tp_points_override','ai_tp_points_override'),('ai_protection_override','ai_protection_override'),('ai_trailing_override','ai_trailing_override'),('ai_duration_override','ai_duration_override')]:
+    setattr(self.e,attr,0.0);await self.e.save_setting(key,0.0)
+   return await self._edit(q,'✅ تم إرجاع R:R / SL / TP / Protection / Trailing / Duration إلى تحكم AI.',self.ai_controls_kb())
+  if x=='dashboard': return await self._edit(q,await v2_views.dashboard(self.e,self.db),self.kb())
   if x=='trade_menu': return await self._edit(q,'🤖 التداول وإدارة المحرك',self.trade_kb())
   if x=='analysis_menu': return await self._edit(q,'🔎 التحليل والأسواق',self.analysis_kb())
   if x=='settings_menu':
    daily=f'{self.e.daily_loss_limit_pct:g}%'+(' (معطل)' if self.e.daily_loss_limit_pct<=0 else '')
    losses=str(self.e.max_consecutive_losses)+(' (معطل)' if self.e.max_consecutive_losses==0 else '')
-   msg=(f'⚙️ إعدادات الاستراتيجية والمخاطر\n━━━━━━━━━━━━━━\n'
-        f'⚠️ المخاطرة: {self.e.risk_pct:g}%\n'
-        f'⚖️ R:R: 1:{self.e.rr:g}\n'
-        f'🎯 الثقة: {self.e.min_confidence:g}%\n'
-        f'🛡 الحماية: {self.e.protection_pct:g}%\n'
-        f'⏱ مدة الصفقة: {self.e.max_trade_minutes:g} دقيقة\n'
-        f'📂 حد المراكز: {self.e.max_positions}\n'
-        f'❌ حد الخسائر: {losses}\n'
-        f'📉 حد Equity اليومي: {daily}')
+   msg=(f'⚙️ الإعدادات\n━━━━━━━━━━━━━━\n'
+        f'⚠️ المخاطرة الثابتة: {self.e.risk_pct:g}%\n🎯 حد الثقة: {self.e.min_confidence:g}%\n'
+        f'📂 حد المراكز: {self.e.max_positions}\n❌ حد الخسائر: {losses}\n📉 حد Equity اليومي: {daily}\n\n'
+        '🧠 R:R / SL / TP / Protection / Trailing / Duration\nيمكن ترك كل قيمة 0 ليحددها AI أو وضع قيمة يدوية.')
    return await self._edit(q,msg,self.settings_kb())
   if x=='account_menu': return await self._edit(q,'👤 حساب MT5 والإحصائيات',self.account_kb())
   if x=='mt5login':
@@ -270,6 +322,11 @@ class TelegramUI:
    await self._edit(q,msg,reply_markup=(self.account_kb() if x in ('mt5login','readiness','accountstats') else self.trade_kb() if x in ('start','stop','status') else self.analysis_kb() if x=='analyze' else self.settings_kb()))
    return
    
+  elif x in ('ai_rr','ai_sl','ai_tp','ai_protection','ai_trailing','ai_duration'):
+   keymap={'ai_rr':'ai_rr','ai_sl':'ai_sl','ai_tp':'ai_tp','ai_protection':'ai_protection','ai_trailing':'ai_trailing','ai_duration':'ai_duration'}
+   self.input_state[q.from_user.id]=keymap[x]
+   labels={'ai_rr':'R:R (0=AI، يدوي 0.5-5)','ai_sl':'SL points (0=AI)','ai_tp':'TP points (0=AI)','ai_protection':'Protection % (0=AI، يدوي 15-80)','ai_trailing':'Trailing % (0=AI، يدوي 2-25)','ai_duration':'Duration minutes (0=AI، يدوي 2-10)'}
+   msg='🧠 '+labels[x]+'\nأرسل الرقم فقط.'
   elif x=='risk':
    self.input_state[q.from_user.id]='risk'
    msg='⚠️ أرسل نسبة المخاطرة فقط\nمثال: 15\nالمسموح: 0.25 إلى 50'
@@ -312,7 +369,7 @@ class TelegramUI:
   if key:
    try:
     import math
-    if key in ('risk','confidence','protection','maxduration','rr','maxpos','maxloss','dailyloss'):
+    if key in ('risk','confidence','protection','maxduration','rr','maxpos','maxloss','dailyloss','ai_rr','ai_sl','ai_tp','ai_protection','ai_trailing','ai_duration'):
      msg=await self._apply_setting(key,value)
     elif key=='symbol':
      self.e.symbol=value.upper(); self.e.symbols=[self.e.symbol]; import json; await self.e.save_setting('symbols',json.dumps(self.e.symbols)); msg=f'✅ الرمز: {self.e.symbol}'
