@@ -1,17 +1,21 @@
-"""Bounded AI scalping playbook catalog. Legacy executable strategies are not used in AI-native mode."""
+"""AI-native catalog containing only short-horizon scalping playbooks.
+
+Every selectable playbook must fit a 2-10 minute holding thesis.
+Higher-timeframe context may confirm a setup, but no entry depends on swing holding.
+"""
 
 PLAYBOOKS=[
- ("trend_pullback_ema","TREND"),
- ("trend_pullback_vwap","TREND"),
+ ("trend_ema_pullback","TREND"),
+ ("trend_vwap_pullback","TREND"),
+ ("trend_micro_pullback","TREND"),
  ("trend_break_retest","TREND"),
  ("trend_momentum_resume","TREND"),
  ("trend_micro_channel","TREND"),
- ("trend_htf_alignment","TREND"),
- ("trend_ema_stack","TREND"),
+ ("trend_ema_stack_resume","TREND"),
  ("trend_impulse_pullback","TREND"),
  ("trend_higher_low","TREND"),
  ("trend_lower_high","TREND"),
- ("breakout_range","BREAKOUT"),
+ ("breakout_micro_range","BREAKOUT"),
  ("breakout_retest","BREAKOUT"),
  ("breakout_compression","BREAKOUT"),
  ("breakout_session_highlow","BREAKOUT"),
@@ -36,20 +40,20 @@ PLAYBOOKS=[
  ("liquidity_reclaim","VOLATILE"),
  ("stop_run_reversal","VOLATILE"),
  ("volatility_expansion","VOLATILE"),
- ("volatility_contraction","MIXED"),
+ ("volatility_compression_break","BREAKOUT"),
  ("impulse_fade","VOLATILE"),
  ("impulse_follow","VOLATILE"),
- ("news_post_spike_reclaim","VOLATILE"),
- ("news_post_spike_follow","VOLATILE"),
+ ("micro_spike_reclaim","VOLATILE"),
+ ("micro_spike_follow","VOLATILE"),
  ("gold_trend_pullback","TREND"),
  ("gold_break_retest","BREAKOUT"),
  ("gold_liquidity_sweep","VOLATILE"),
  ("gold_range_reversion","RANGE"),
  ("gold_impulse_follow","VOLATILE"),
- ("fx_london_breakout","BREAKOUT"),
- ("fx_ny_momentum","TREND"),
+ ("fx_london_open_breakout","BREAKOUT"),
+ ("fx_ny_open_momentum","TREND"),
  ("fx_overlap_expansion","VOLATILE"),
- ("fx_htf_pullback","TREND"),
+ ("fx_session_retest","BREAKOUT"),
  ("no_trade_unclear","UNKNOWN"),
 ]
 CATALOG={x[0]:{"id":x[0],"regime":x[1]} for x in PLAYBOOKS}
