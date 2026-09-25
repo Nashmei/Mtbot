@@ -170,6 +170,7 @@ class TelegramUI:
    for attr,key in [('ai_rr_override','ai_rr_override'),('ai_sl_points_override','ai_sl_points_override'),('ai_tp_points_override','ai_tp_points_override'),('ai_protection_override','ai_protection_override'),('ai_trailing_override','ai_trailing_override'),('ai_duration_override','ai_duration_override')]:
     setattr(self.e,attr,0.0);await self.e.save_setting(key,0.0)
    return await self._edit(q,'✅ تم إرجاع R:R / SL / TP / Protection / Trailing / Duration إلى تحكم AI.',self.ai_controls_kb())
+  if x=='analyze': return await self._edit(q,await v2_views.ai_center(self.e,self.db),self.analysis_kb())
   if x=='dashboard': return await self._edit(q,await v2_views.dashboard(self.e,self.db),self.kb())
   if x=='trade_menu': return await self._edit(q,'🤖 التداول وإدارة المحرك',self.trade_kb())
   if x=='analysis_menu': return await self._edit(q,'🔎 التحليل والأسواق',self.analysis_kb())
@@ -215,7 +216,7 @@ class TelegramUI:
          f'🔒 المارجن المستخدم: ${a.margin:.2f}\n'
          f'💳 المارجن الحر: ${a.margin_free:.2f}\n'
          f'⚠️ المخاطرة المحددة: {self.e.risk_pct:g}%\n'
-         f'🎯 R:R: 1:{self.e.rr:g}\n'
+         f'🧠 R:R override: {self.e.ai_rr_override:g} (0=AI)\n'
          f'❌ خسائر متتالية: {self.e.consecutive_losses}/{self.e.max_consecutive_losses}')
   elif x=='analyze':
    await self._edit(q,'⏳ جاري تحميل بيانات السوق وتحليل الأزواج.',self.analysis_kb(),arm=False)
