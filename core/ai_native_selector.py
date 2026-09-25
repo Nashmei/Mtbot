@@ -105,8 +105,12 @@ class AINativeSelector:
 
   now=time.monotonic();key=self._snapshot_key(snap);cached=self._cache.get(symbol)
   if cached and cached[0]==key:
-   out=dict(cached[1]);out["cached"]=True
-   return out
+   # Cache NO_TRADE only. A SIGNAL is single-use: replaying it on every scan can
+   # repeatedly hit execution/margin gates even though the scalp entry is stale.
+   if cached[1].get("decision")!="SIGNAL":
+    out=dict(cached[1]);out["cached"]=True
+    return out
+   return self._no_trade("AI_SIGNAL_ALREADY_CONSUMED","Cached scalp signal already consumed; wait for a fresh market snapshot")
   since=now-self._last_symbol_call.get(symbol,0.0)
   if since<self.min_interval:
    return self._no_trade("AI_RATE_LIMIT_LOCAL","Per-symbol AI cooldown",retry_after_seconds=round(self.min_interval-since,1))
