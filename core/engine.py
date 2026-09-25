@@ -509,7 +509,7 @@ class Engine:
    # Use the history tick stream as the authoritative freshness clock and keep
    # symbol_info_tick() only for the live bid/ask used by spread/execution.
    ticks=self.gw.ticks(symbol)
-   if ticks is None or len(ticks)<80:
+   if ticks is None or len(ticks)<40:
     await self._log_reject('SCAN_REJECT',symbol,reason='INSUFFICIENT_TICKS')
     return
    latest=float(ticks['time_msc'][-1])/1000.0 if 'time_msc' in ticks.dtype.names else float(ticks['time'][-1])
@@ -719,8 +719,8 @@ class Engine:
     return
    # Re-check freshness from copy_ticks_range(), whose timestamps are Unix UTC
    # on this Wine/MT5 setup. Do not compare the terminal-local live quote time.
-   entry_ticks=self.gw.ticks(symbol,80)
-   if entry_ticks is None or len(entry_ticks)<80:
+   entry_ticks=self.gw.ticks(symbol,80,minimum=40)
+   if entry_ticks is None or len(entry_ticks)<40:
     await self._log_reject('SCAN_REJECT',symbol,reason='INSUFFICIENT_ENTRY_TICKS')
     return
    entry_latest=(float(entry_ticks['time_msc'][-1])/1000.0
