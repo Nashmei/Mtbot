@@ -1,7 +1,7 @@
 import asyncio, hashlib, json, os, time, urllib.request
 
 BASE_URL="https://integrate.api.nvidia.com/v1/chat/completions"
-FAST_MODEL="nvidia/nemotron-3.5-lightning-30b-a3b"
+FAST_MODEL="nvidia/nemotron-3-nano-30b-a3b"
 DEEP_MODEL="nvidia/nemotron-3-super-120b-a12b"
 
 SYSTEM="""You are the primary entry-quality judge for a very short-term MT5 scalping bot.
@@ -22,8 +22,8 @@ class AIAdvisor:
   self.api_key=os.getenv("NVIDIA_API_KEY","").strip()
   self.fast_model=os.getenv("MTBOT_AI_FAST_MODEL",FAST_MODEL).strip() or FAST_MODEL
   self.deep_model=os.getenv("MTBOT_AI_DEEP_MODEL",DEEP_MODEL).strip() or DEEP_MODEL
-  self.fast_timeout=float(os.getenv("MTBOT_AI_FAST_TIMEOUT","3.0"))
-  self.deep_timeout=float(os.getenv("MTBOT_AI_DEEP_TIMEOUT","5.0"))
+  self.fast_timeout=float(os.getenv("MTBOT_AI_FAST_TIMEOUT","4.0"))
+  self.deep_timeout=float(os.getenv("MTBOT_AI_DEEP_TIMEOUT","6.0"))
   self.fast_accept=int(os.getenv("MTBOT_AI_FAST_ACCEPT_CONF","75"))
   self.deep_accept=int(os.getenv("MTBOT_AI_DEEP_ACCEPT_CONF","65"))
 
@@ -56,7 +56,7 @@ class AIAdvisor:
   payload=json.dumps({
    "model":model,
    "messages":[{"role":"system","content":SYSTEM},{"role":"user","content":json.dumps(snapshot,separators=(",",":"))}],
-   "temperature":0.0,"top_p":1.0,"max_tokens":220,"stream":False,
+   "temperature":0.0,"top_p":1.0,"max_tokens":512,"stream":False,
   }).encode()
   req=urllib.request.Request(BASE_URL,data=payload,headers={"Authorization":f"Bearer {self.api_key}","Content-Type":"application/json"})
   started=time.monotonic()
@@ -65,9 +65,17 @@ class AIAdvisor:
   latency_ms=int((time.monotonic()-started)*1000)
   choice=raw["choices"][0]["message"]
   text=(choice.get("content") or "").strip()
+  # Some reasoning models expose chain-of-thought separately; never parse it.
+  # Only the final content is eligible for the trading decision.
   if text.startswith("```"):
    text=text.replace("```json","").replace("```","").strip()
-  obj=json.loads(text)
+  # Tolerate a short preamble by extracting the final JSON object.
+  try:
+   obj=json.loads(text)
+  except json.JSONDecodeError:
+   start=text.rfind("{"); end=text.rfind("}")
+   if start<0 or end<=start: raise
+   obj=json.loads(text[start:end+1])
   decision=str(obj.get("decision","")).upper()
   confidence=max(0,min(100,int(obj.get("confidence",0))))
   if decision not in ("ALLOW","REJECT"):raise ValueError("invalid AI decision")
