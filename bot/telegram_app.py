@@ -228,7 +228,7 @@ class TelegramUI:
      if not i: continue
      import time
      ticks=self.e.gw.ticks(symbol)
-     if ticks is None or len(ticks)<80:
+     if ticks is None or len(ticks)<40:
       lines.append(f'\n💱 {symbol}\n⚠️ بيانات ticks غير كافية.')
       continue
      tick_ts=float(ticks['time_msc'][-1])/1000.0 if 'time_msc' in ticks.dtype.names else float(ticks['time'][-1])
