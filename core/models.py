@@ -34,6 +34,7 @@ class TradeState:
     be_done:bool=False
     lock_done:bool=False
     trailing:bool=False
+    trailing_moved:bool=False
 
     # معلومات اللوحة العربية الحية
     strategy:str=''
