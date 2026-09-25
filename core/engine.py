@@ -1273,8 +1273,16 @@ class Engine:
      event='TP'
      result_reason='TP 🎯'
     elif reason==mt5.DEAL_REASON_SL:
-     event='SL'
-     result_reason='حماية ربح 🛡️' if pnl>0 and t.protection_45_active else 'SL 🛑'
+     # MT5 reports every stop-triggered close as DEAL_REASON_SL, including
+     # stops that were moved by our protection/trailing logic. Keep those
+     # exits separate from a genuine hit of the original stop-loss so audit
+     # statistics do not count protected exits as SL losses.
+     if t.protection_45_active:
+      event='PROTECTED_EXIT'
+      result_reason='خروج بالحماية 🛡️'
+     else:
+      event='SL'
+      result_reason='SL 🛑'
     else:
      event='POSITION_CLOSED'
      result_reason='حماية ربح 🛡️' if pnl>0 and t.protection_45_active else 'إغلاق 🏁'
