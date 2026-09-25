@@ -4,6 +4,7 @@ from .config import settings
 from .models import TradeState,Side
 from .analyzer import Analyzer
 from .risk import Risk
+from .ai_advisor import AIAdvisor
 
 def _signal_key(strategy,side_value,signal_bar):
  return (strategy,side_value,signal_bar)
@@ -47,6 +48,7 @@ class Engine:
   self.last_analysis_key=None
   self.an=Analyzer()
   self.risk=Risk()
+  self.ai=AIAdvisor(db)
   self.reject_log_at={}
   self.reject_log_interval=60.0
   self.trade_alert_meta={}
@@ -554,6 +556,29 @@ class Engine:
    # Telegram confidence setting is a real hard entry filter.
    if confidence_score < self.min_confidence:
     await self._log_reject('CONFIDENCE_REJECT',symbol,strategy=sig.strategy,confidence=confidence_score,min_confidence=self.min_confidence)
+    return
+   # AI branch: NVIDIA is the primary entry-quality gate. Engine safety/risk rules remain final.
+   ai_snapshot=self.ai.snapshot(symbol,sig,reg,tick,info,m1,m5,meta,self.strategy_performance)
+   ai_decision=await self.ai.decide(symbol,ai_snapshot)
+   await self.db.log(
+    'AI_GATE',symbol,
+    strategy=sig.strategy,side=sig.side.value,
+    decision=ai_decision.get('decision'),
+    ai_confidence=ai_decision.get('confidence'),
+    ai_model=ai_decision.get('model'),
+    reason_code=ai_decision.get('reason_code'),
+    reason=ai_decision.get('reason'),
+    latency_ms=ai_decision.get('latency_ms'),
+    prompt_hash=ai_decision.get('prompt_hash'),
+   )
+   if ai_decision.get('decision')!='ALLOW':
+    await self._log_reject(
+     'AI_ENTRY_REJECT',symbol,
+     reason=ai_decision.get('reason_code','AI_REJECT'),
+     strategy=sig.strategy,side=sig.side.value,
+     ai_confidence=ai_decision.get('confidence'),
+     ai_model=ai_decision.get('model'),
+    )
     return
    if symbol in usd_group:
     conflicts=[
