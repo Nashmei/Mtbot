@@ -5,6 +5,7 @@ from .models import TradeState,Side
 from .analyzer import Analyzer
 from .risk import Risk
 from .ai_advisor import AIAdvisor
+from .ai_native_selector import AINativeSelector
 
 def _signal_key(strategy,side_value,signal_bar):
  return (strategy,side_value,signal_bar)
@@ -49,6 +50,9 @@ class Engine:
   self.an=Analyzer()
   self.risk=Risk()
   self.ai=AIAdvisor(db)
+  # AI branch experiment: legacy strategy signal generation is bypassed.
+  self.ai_native=AINativeSelector(db)
+  self.ai_native_only=True
   self.reject_log_at={}
   self.reject_log_interval=60.0
   self.trade_alert_meta={}
@@ -505,14 +509,42 @@ class Engine:
     return
    m5=self.gw.rates_m5(symbol,200)
    m1=self.gw.rates_m1(symbol,300)
-   reg,sig,meta=self.an.analyze(
-    ticks,info.point,m5,symbol=symbol,
-    rates_m15=self.gw.rates_m15(symbol,200),
-    rates_h1=self.gw.rates_h1(symbol,200),
-    rates_m1=m1,
-    strategy_performance=self.strategy_performance,
-    min_confidence=self.min_confidence,
-   )
+   m15=self.gw.rates_m15(symbol,200)
+   h1=self.gw.rates_h1(symbol,200)
+   if self.ai_native_only:
+    # Experimental isolation: old executable strategies/ranker are disabled.
+    # AI creates the bounded signal directly from raw market context.
+    native_snapshot=self.ai_native.snapshot(
+     symbol,tick,info,ticks,m1,m5,m15,h1,self.strategy_performance
+    )
+    native_decision=await self.ai_native.decide(symbol,native_snapshot)
+    if native_decision.get('research_required'):
+     # Web/news research hook is explicit and fail-closed until a trusted
+     # runtime research provider is configured.
+     await self._log_reject(
+      'AI_RESEARCH_REQUIRED',symbol,
+      reason=native_decision.get('reason_code','RESEARCH_REQUIRED'),
+      query=native_decision.get('research_query',''),
+     )
+     return
+    sig,reg=self.ai_native.to_signal(native_decision,native_snapshot)
+    meta={
+     'decision':'ai_native',
+     'strategy_selection':[],
+     'opportunity_candidates':[],
+     'opportunity_diagnostics':[],
+     'market_mode':native_decision.get('regime','UNKNOWN'),
+     'ai_native':native_decision,
+    }
+   else:
+    reg,sig,meta=self.an.analyze(
+     ticks,info.point,m5,symbol=symbol,
+     rates_m15=m15,
+     rates_h1=h1,
+     rates_m1=m1,
+     strategy_performance=self.strategy_performance,
+     min_confidence=self.min_confidence,
+    )
    for diagnostic in meta.get('opportunity_diagnostics',[]) or []:
     await self._log_reject(
      'OPPORTUNITY_DIAGNOSTIC',symbol,
@@ -557,9 +589,12 @@ class Engine:
    if confidence_score < self.min_confidence:
     await self._log_reject('CONFIDENCE_REJECT',symbol,strategy=sig.strategy,confidence=confidence_score,min_confidence=self.min_confidence)
     return
-   # AI branch: NVIDIA is the primary entry-quality gate. Engine safety/risk rules remain final.
-   ai_snapshot=self.ai.snapshot(symbol,sig,reg,tick,info,m1,m5,meta,self.strategy_performance)
-   ai_decision=await self.ai.decide(symbol,ai_snapshot)
+   # In AI-native-only mode the selector above is already the entry decision.
+   # Keep the old advisor gate only for the legacy fallback mode.
+   ai_decision=meta.get('ai_native')
+   if not self.ai_native_only:
+    ai_snapshot=self.ai.snapshot(symbol,sig,reg,tick,info,m1,m5,meta,self.strategy_performance)
+    ai_decision=await self.ai.decide(symbol,ai_snapshot)
    await self.db.log(
     'AI_GATE',symbol,
     strategy=sig.strategy,side=sig.side.value,
@@ -571,7 +606,7 @@ class Engine:
     latency_ms=ai_decision.get('latency_ms'),
     prompt_hash=ai_decision.get('prompt_hash'),
    )
-   if ai_decision.get('decision')!='ALLOW':
+   if (self.ai_native_only and ai_decision.get('decision')!='SIGNAL') or (not self.ai_native_only and ai_decision.get('decision')!='ALLOW'):
     await self._log_reject(
      'AI_ENTRY_REJECT',symbol,
      reason=ai_decision.get('reason_code','AI_REJECT'),
