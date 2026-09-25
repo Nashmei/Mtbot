@@ -261,15 +261,8 @@ class TelegramUI:
                      f"   Side {values['side']} | M15 {bias_name(values['m15_bias'])} | H1 {bias_name(values['h1_bias'])}")
     msg='\n'.join(lines)
   elif x=='symbols':
-   symbols=self.e.gw.available_symbols()
-   names=[z.name for z in symbols]
-   popular=[]
-   keys=('XAUUSD','EURUSD','GBPUSD','USDJPY','USDCHF','USDCAD','AUDUSD','NZDUSD')
-   for key in keys:
-    exact=[n for n in names if n.upper()==key]
-    matches=exact or [n for n in names if key in n.upper()]
-    if matches: popular.append(matches[0])
-   popular=list(dict.fromkeys(popular))[:12]
+   names=self.e.gw.ranked_symbol_names()
+   popular=names[:12]
    rows=[[InlineKeyboardButton('🔥 الأنشط الآن',callback_data='active')]]
    for n in popular:
     info=self.e.gw.info(n); t=self.e.gw.tick(n)
