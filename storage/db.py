@@ -23,66 +23,44 @@ class DB:
   return reset_ts
 
  async def strategy_performance(self,window=50):
+  """Recent realized performance by AI strategy, paired by MT5 ticket."""
   window=max(1,min(int(window),200))
-  try:
-   reset_ts=float(await self.get('strategy_performance_reset_ts',0) or 0)
-  except (TypeError,ValueError):
-   reset_ts=0.0
-  sql='''WITH opens AS (
-   SELECT
-    id,ts,symbol,
-    json_extract(details,'$.strategy') AS strategy,
-    LEAD(ts) OVER (PARTITION BY symbol ORDER BY ts) AS next_open_ts
+  try: reset_ts=float(await self.get('strategy_performance_reset_ts',0) or 0)
+  except (TypeError,ValueError): reset_ts=0.0
+  sql="""WITH opens AS (
+   SELECT ts,
+          CAST(json_extract(details,'$.ticket') AS TEXT) AS ticket,
+          json_extract(details,'$.strategy') AS strategy
    FROM audit
-   WHERE event='OPEN'
-     AND ts>=?
+   WHERE event='OPEN' AND ts>=?
+     AND json_extract(details,'$.ticket') IS NOT NULL
      AND json_extract(details,'$.strategy') IS NOT NULL
   ),
+  closes AS (
+   SELECT id,ts,event,
+          CAST(json_extract(details,'$.ticket') AS TEXT) AS ticket,
+          CAST(COALESCE(json_extract(details,'$.pnl'),0) AS REAL) AS pnl
+   FROM audit
+   WHERE event IN ('TP','SL','PROTECTED_EXIT','TRAILING_EXIT','BREAKEVEN_EXIT','POSITION_CLOSED')
+     AND json_extract(details,'$.ticket') IS NOT NULL
+     AND json_extract(details,'$.pnl') IS NOT NULL
+  ),
   paired AS (
-   SELECT
-    o.strategy,o.ts,
-    (
-     SELECT c.id
-     FROM audit c
-     WHERE c.symbol=o.symbol
-       AND c.ts>o.ts
-       AND c.event IN ('TP','SL','POSITION_CLOSED')
-       AND (o.next_open_ts IS NULL OR c.ts<o.next_open_ts)
-     ORDER BY c.ts ASC
-     LIMIT 1
-    ) AS close_id
-   FROM opens o
+   SELECT o.strategy,o.ts,c.event,c.pnl,
+          ROW_NUMBER() OVER (PARTITION BY o.ticket ORDER BY c.ts ASC,c.id ASC) AS close_rn
+   FROM opens o JOIN closes c ON c.ticket=o.ticket AND c.ts>=o.ts
   ),
   scored AS (
-   SELECT
-    p.strategy,p.ts,
-    CASE
-     WHEN c.event='TP' THEN 3.0
-     WHEN CAST(COALESCE(json_extract(c.details,'$.pnl'),0) AS REAL)>0 THEN 1.0
-     WHEN CAST(COALESCE(json_extract(c.details,'$.pnl'),0) AS REAL)=0 THEN 0.0
-     ELSE -1.0
-    END AS points,
-    ROW_NUMBER() OVER (PARTITION BY p.strategy ORDER BY p.ts DESC) AS rn
-   FROM paired p
-   JOIN audit c ON c.id=p.close_id
-   WHERE p.strategy IS NOT NULL
+   SELECT strategy,ts,
+          CASE WHEN pnl>0 THEN 1.0 WHEN pnl=0 THEN 0.0 ELSE -1.0 END AS points,
+          ROW_NUMBER() OVER (PARTITION BY strategy ORDER BY ts DESC) AS rn
+   FROM paired WHERE close_rn=1
   )
-  SELECT
-   strategy,
-   COUNT(*) AS trades,
-   COALESCE(SUM(points),0) AS points,
-   COALESCE(AVG(points),0) AS avg_points
-  FROM scored
-  WHERE rn<=?
-  GROUP BY strategy'''
+  SELECT strategy,COUNT(*),COALESCE(SUM(points),0),COALESCE(AVG(points),0)
+  FROM scored WHERE rn<=? GROUP BY strategy"""
   out={}
   async with aiosqlite.connect(self.path) as d:
    async with d.execute(sql,(reset_ts,window)) as cur:
     async for strategy,trades,points,avg_points in cur:
-     out[str(strategy)]={
-      'trades':int(trades or 0),
-      'points':float(points or 0),
-      'avg_points':float(avg_points or 0),
-      'window':window,
-     }
+     out[str(strategy)]={'trades':int(trades or 0),'points':float(points or 0),'avg_points':float(avg_points or 0),'window':window}
   return out
