@@ -116,7 +116,7 @@ class MT5Gateway:
             x = mt5.symbol_info(s)
         return x
 
-    def ticks(self, s, n=300, minimum=80):
+    def ticks(self, s, n=300, minimum=40):
         """Return recent ticks for any broker symbol, including quieter FX crosses.
 
         Start with a tiny live window for speed, then widen only when the
@@ -129,7 +129,7 @@ class MT5Gateway:
             return None
         now = datetime.now(timezone.utc)
         best = None
-        for minutes in (1, 5, 15, 30, 60, 180):
+        for minutes in (1, 5, 15, 30, 60, 180, 360):
             rows = mt5.copy_ticks_range(s, now - timedelta(minutes=minutes), now, mt5.COPY_TICKS_ALL)
             if rows is not None and (best is None or len(rows) > len(best)):
                 best = rows
