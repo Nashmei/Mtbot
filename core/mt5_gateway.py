@@ -116,15 +116,26 @@ class MT5Gateway:
             x = mt5.symbol_info(s)
         return x
 
-    def ticks(self, s, n=300):
+    def ticks(self, s, n=300, minimum=80):
+        """Return recent ticks for any broker symbol, including quieter FX crosses.
+
+        Start with a tiny live window for speed, then widen only when the
+        instrument needs more history. This avoids falsely classifying a valid
+        symbol as insufficient merely because it trades less frequently.
+        """
         from datetime import datetime, timezone, timedelta
+        info = self.info(s)
+        if info is None:
+            return None
         now = datetime.now(timezone.utc)
-        # copy_ticks_from returns the FIRST n ticks after its start time,
-        # which can be almost 30 minutes old on an active instrument.
-        rows = mt5.copy_ticks_range(s, now - timedelta(minutes=1), now, mt5.COPY_TICKS_ALL)
-        if rows is None or len(rows) < 80:
-            rows = mt5.copy_ticks_range(s, now - timedelta(minutes=5), now, mt5.COPY_TICKS_ALL)
-        return rows[-n:] if rows is not None else None
+        best = None
+        for minutes in (1, 5, 15, 30, 60, 180):
+            rows = mt5.copy_ticks_range(s, now - timedelta(minutes=minutes), now, mt5.COPY_TICKS_ALL)
+            if rows is not None and (best is None or len(rows) > len(best)):
+                best = rows
+            if rows is not None and len(rows) >= minimum:
+                return rows[-n:]
+        return best[-n:] if best is not None else None
 
     def rates(self, s, timeframe, count=200):
         # شموع مغلقة فقط
@@ -146,7 +157,21 @@ class MT5Gateway:
         return mt5.symbols_get() or ()
 
     def available_symbols(self):
-        return self.symbols()
+        # Broker is the source of truth. Do not hard-code a tradable universe.
+        return tuple(x for x in self.symbols() if getattr(x, 'trade_mode', 0) != mt5.SYMBOL_TRADE_MODE_DISABLED)
+
+    def ranked_symbol_names(self):
+        """Popular markets first, then every other tradable broker symbol."""
+        popular = ('XAUUSD','EURUSD','GBPUSD','USDJPY','AUDUSD','USDCAD','USDCHF','NZDUSD',
+                   'EURJPY','GBPJPY','EURGBP','XAGUSD')
+        names = [x.name for x in self.available_symbols()]
+        def base_rank(name):
+            upper = name.upper()
+            for i, base in enumerate(popular):
+                if base in upper:
+                    return (i, upper)
+            return (len(popular), upper)
+        return sorted(dict.fromkeys(names), key=base_rank)
 
     def positions(self, s=None):
         return mt5.positions_get(symbol=s) if s else mt5.positions_get()
