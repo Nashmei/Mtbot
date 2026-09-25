@@ -6,7 +6,7 @@ URL="https://integrate.api.nvidia.com/v1/chat/completions"
 MODEL="google/diffusiongemma-26b-a4b-it"
 SYSTEM="""You are the sole signal generator for an experimental MT5 scalping bot. Legacy strategy signals are disabled.
 Use only the supplied closed bars, live tick summary, and the supplied 50-playbook catalog.
-This is strict short-horizon scalping: a SIGNAL must be a setup you expect to complete within 2 to 10 minutes from entry. Use ticks and M1/M5 as the primary timing evidence; use M15/H1 only as higher-timeframe context. Account state and Telegram-configured trading settings are supplied as context. The Telegram risk_pct is immutable: never change monetary risk or choose volume. For each SIGNAL you must design the trade itself for the current market and account context: choose exact sl_price and tp_price, protection_pct, trailing_gap_pct, and expected_duration_minutes. R:R is derived from your SL/TP and must be sensible for the setup; do not inherit the Telegram R:R or protection settings. Deterministic broker, margin, risk and execution checks remain authoritative and may reject your plan. If the setup likely needs less than 2 minutes, more than 10 minutes, or duration cannot be estimated reliably, return NO_TRADE.\nReturn ONLY JSON with: decision SIGNAL or NO_TRADE; side BUY, SELL or NONE; strategy_id; confidence integer 0..100; regime TREND,RANGE,BREAKOUT,VOLATILE,MIXED,UNKNOWN; sl_price positive number; tp_price positive number; protection_pct number 15..80; trailing_gap_pct number 2..25; expected_duration_minutes number 2..10 for SIGNAL; research_required boolean; research_query; reason_code; reason.
+This is strict short-horizon scalping: a SIGNAL must be a setup you expect to complete within 2 to 10 minutes from entry. Use ticks and M1/M5 as the primary timing evidence; use M15/H1 only as higher-timeframe context. Account state and Telegram-configured trading settings are supplied as context. The Telegram risk_pct is immutable: never change monetary risk or choose volume. For each SIGNAL you must design the trade itself for the current market and account context: choose exact sl_price and tp_price, protection_pct, trailing_gap_pct, and expected_duration_minutes. R:R is derived from your SL/TP and must be sensible for the setup; do not inherit the Telegram R:R or protection settings. Deterministic broker, margin, risk and execution checks remain authoritative and may reject your plan. If the setup likely needs less than 2 minutes, more than 10 minutes, or duration cannot be estimated reliably, return NO_TRADE.\nReturn ONLY JSON with: decision SIGNAL or NO_TRADE; side BUY, SELL or NONE; strategy_id; confidence integer 0..100; regime TREND,RANGE,BREAKOUT,VOLATILE,MIXED,UNKNOWN; sl_price positive number; tp_price positive number; rr number 0.5..5.0; protection_pct number 15..80; trailing_gap_pct number 2..25; expected_duration_minutes number 2..10 for SIGNAL; research_required boolean; research_query; reason_code; reason.
 For SIGNAL choose only a strategy_id present in the catalog. SL and TP must be on the correct side of the supplied live bid/ask for BUY or SELL and should fit the 2-10 minute scalp thesis. Be conservative and choose NO_TRADE when evidence conflicts or is unclear.
 Never choose volume, monetary risk, risk_pct, leverage, or execute a trade."""
 
@@ -69,14 +69,15 @@ class AINativeSelector:
   if d=="SIGNAL":
    if s not in ("BUY","SELL") or sid not in CATALOG or sid=="no_trade_unclear":raise ValueError("invalid bounded selection")
    sl_price=float(o.get("sl_price",0));tp_price=float(o.get("tp_price",0))
-   protection=float(o.get("protection_pct",0));trailing=float(o.get("trailing_gap_pct",0))
+   rr=float(o.get("rr",0));protection=float(o.get("protection_pct",0));trailing=float(o.get("trailing_gap_pct",0))
    duration=float(o.get("expected_duration_minutes",0))
    if sl_price<=0 or tp_price<=0:raise ValueError("invalid AI SL/TP")
+   if not 0.5<=rr<=5.0:raise ValueError("invalid AI R:R")
    if not 15.0<=protection<=80.0:raise ValueError("invalid protection percent")
    if not 2.0<=trailing<=25.0:raise ValueError("invalid trailing gap percent")
    if not 2.0<=duration<=10.0:raise ValueError("invalid expected duration")
-  else:s="NONE";sid="none";sl_price=0.0;tp_price=0.0;protection=0.0;trailing=0.0;duration=0.0
-  return {"decision":d,"side":s,"strategy_id":sid,"confidence":c,"regime":reg,"sl_price":sl_price,"tp_price":tp_price,"protection_pct":protection,"trailing_gap_pct":trailing,"expected_duration_minutes":duration,
+  else:s="NONE";sid="none";sl_price=0.0;tp_price=0.0;rr=0.0;protection=0.0;trailing=0.0;duration=0.0
+  return {"decision":d,"side":s,"strategy_id":sid,"confidence":c,"regime":reg,"sl_price":sl_price,"tp_price":tp_price,"rr":rr,"protection_pct":protection,"trailing_gap_pct":trailing,"expected_duration_minutes":duration,
    "research_required":bool(o.get("research_required",False)),"research_query":str(o.get("research_query",""))[:160],
    "reason_code":str(o.get("reason_code","AI_NATIVE"))[:80],"reason":str(o.get("reason",""))[:160]}
 
