@@ -45,7 +45,7 @@ class Analyzer:
   return (float(np.mean(dx[-n:])) if dx else 0.),p,m
 
  def analyze(self,ticks,point,rates=None,symbol=None,rates_m15=None,rates_h1=None,rates_m1=None,strategy_performance=None,min_confidence=None):
-  if ticks is None or len(ticks)<80 or point<=0:
+  if ticks is None or len(ticks)<40 or point<=0:
    return Regime.NO_TRADE,None,{'decision':'insufficient_ticks'}
 
   is_gold=str(symbol or '').upper().startswith('XAUUSD')
@@ -53,21 +53,21 @@ class Analyzer:
   mid=(bid+ask)/2.; spreads=(ask-bid)/point
   good=spreads[np.isfinite(spreads)&(spreads>0)]
   spread=float(good[-1]) if len(good) else 0.
-  normal=float(np.median(good[-80:])) if len(good) else 0.
+  normal=float(np.median(good[-min(80,len(good)):])) if len(good) else 0.
   spread_ratio=spread/normal if normal>0 else 1.
   live=float(mid[-1])
   tick_momentum_fast=(live-float(mid[-6]))/point
   tick_momentum=(live-float(mid[-21]))/point
   tick_range=(float(np.max(mid[-40:]))-float(np.min(mid[-40:])))/point
-  micro_fast=self._ema(mid[-30:],6); micro_slow=self._ema(mid[-60:],18)
+  micro_fast=self._ema(mid[-min(30,len(mid)):],6); micro_slow=self._ema(mid[-min(60,len(mid)):],18)
   micro_trend=(micro_fast-micro_slow)/point
 
   if spread>0 and spread_ratio>1.8:
    return Regime.NO_TRADE,None,{'decision':'spread_spike','price':live,'spread_points':round(spread,1),'spread_ratio':round(spread_ratio,2)}
 
   have=rates is not None and len(rates)>=60
-  atrp=max(float(np.std(np.diff(mid[-60:]))/point),1.)
-  adx=dp=dm=0.; context_trend=0.; structure_hi=float(np.max(mid[-60:-3])); structure_lo=float(np.min(mid[-60:-3]))
+  atrp=max(float(np.std(np.diff(mid[-min(60,len(mid)):]))/point),1.)
+  adx=dp=dm=0.; context_trend=0.; base=mid[-min(60,len(mid)):-3]; structure_hi=float(np.max(base)); structure_lo=float(np.min(base))
   if have:
    h=np.asarray(rates['high'],float); l=np.asarray(rates['low'],float); c=np.asarray(rates['close'],float)
    atr=self._atr(h,l,c); atrp=max(atr/point,1.)
