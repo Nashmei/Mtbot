@@ -211,8 +211,9 @@ class Engine:
    f'💱 الأزواج: {symbols}\n'
    f'📂 المراكز: {len(self.trades)} / {self.max_positions}\n'
    f'⚠️ المخاطرة: {self.risk_pct:g}% لكل صفقة\n'
-   f'🛡 الحماية: {self.protection_pct:g}%\n'
-   f'⏱ حد الصفقة: {self.max_trade_minutes:g} دقيقة\n'
+   f'🧠 إدارة الصفقة: AI مع overrides اختيارية (0=AI)\n'
+   f'⚖️ RR override: {self.ai_rr_override:g} | SL/TP: {self.ai_sl_points_override:g}/{self.ai_tp_points_override:g} pt\n'
+   f'🛡 Protection/Trailing: {self.ai_protection_override:g}/{self.ai_trailing_override:g} | ⏱ {self.ai_duration_override:g}m\n'
    f'❌ الخسائر المتتالية: {self.consecutive_losses} / {self.max_consecutive_losses}\n'
    f'📉 حد Equity اليومي: {self.daily_loss_limit_pct:g}%'
    f'{" (معطل)" if self.daily_loss_limit_pct<=0 else ""}\n'
@@ -1052,6 +1053,7 @@ class Engine:
     risk_cash=actual_risk,risk_pct=actual_risk_pct,rr_actual=actual_rr,
     ai_protection_pct=protection_pct,ai_trailing_gap_pct=trailing_gap_pct,
     ai_expected_duration_minutes=expected_duration,
+    management_overrides={'rr':self.ai_rr_override,'sl_points':self.ai_sl_points_override,'tp_points':self.ai_tp_points_override,'protection_pct':self.ai_protection_override,'trailing_gap_pct':self.ai_trailing_override,'duration_minutes':self.ai_duration_override},
    )
    asyncio.create_task(self._send_trade_chart(t,actual_risk,actual_risk_pct))
 
