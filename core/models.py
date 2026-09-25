@@ -43,6 +43,7 @@ class TradeState:
     volume:float=0.0
     protection_pct:float=45.0
     trailing_gap_pct:float=5.0
+    expected_duration_minutes:float=10.0
 
     # نظام الحماية + خمول 60 ثانية
     protection_45_active:bool=False
