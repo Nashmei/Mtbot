@@ -45,18 +45,23 @@ class AINativeSelector:
   return {"symbol":symbol,"bid":float(tick.bid),"ask":float(tick.ask),"spread_points":round((float(tick.ask)-float(tick.bid))/p,2),
    "tick_momentum_5":round((m[-1]-m[-6])/p,2),"tick_momentum_20":round((m[-1]-m[-21])/p,2),
    "tick_range_40":round((max(m[-40:])-min(m[-40:]))/p,2),"atr_m5_points":round(self._atr(m5,p),2),
-   "m1":self._bars(m1,16),"m5":self._bars(m5,16),"m15":self._bars(m15,8),"h1":self._bars(h1,8),
+   "m1":self._bars(m1,10),"m5":self._bars(m5,10),"m15":self._bars(m15,6),"h1":self._bars(h1,4),
    "performance":performance or {},"news":news or {},"playbooks":[{"id":x[0],"regime":x[1]} for x in PLAYBOOKS]}
 
  @staticmethod
  def _parse(text):
   text=(text or "").strip().replace("<<<","").replace(">>>","")
   if text.startswith("json"):text=text[4:].strip()
-  try:o=json.loads(text)
+  try:o=json.loads(text,strict=False)
   except Exception:
    a=text.find("{");b=text.rfind("}")
    if a<0 or b<=a:raise ValueError("invalid AI JSON")
-   o=json.loads(text[a:b+1])
+   candidate=text[a:b+1]
+   try:o=json.loads(candidate,strict=False)
+   except Exception:
+    # Some models occasionally emit literal control characters inside JSON strings.
+    candidate="".join((" " if ord(ch)<32 and ch not in "\\t\\r\\n" else ch) for ch in candidate)
+    o=json.loads(candidate,strict=False)
   d=str(o.get("decision","")).upper();s=str(o.get("side","")).upper();sid=str(o.get("strategy_id",""));reg=str(o.get("regime","")).upper();c=o.get("confidence")
   if isinstance(c,bool) or not isinstance(c,int) or not 0<=c<=100:raise ValueError("invalid confidence")
   if d not in ("SIGNAL","NO_TRADE"):raise ValueError("invalid decision")
