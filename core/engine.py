@@ -1273,11 +1273,17 @@ class Engine:
      event='TP'
      result_reason='TP 🎯'
     elif reason==mt5.DEAL_REASON_SL:
-     # MT5 reports every stop-triggered close as DEAL_REASON_SL, including
-     # stops that were moved by our protection/trailing logic. Keep those
-     # exits separate from a genuine hit of the original stop-loss so audit
-     # statistics do not count protected exits as SL losses.
-     if t.protection_45_active:
+     # MT5 labels every stop-triggered close as SL. Classify it by the
+     # bot state so protected/trailing/breakeven exits stay out of SL stats.
+     be_tolerance=max(float(getattr(info,'point',0) or 0)*5.0,t.initial_r*0.05)
+     near_entry=abs(exit_price-t.entry)<=be_tolerance
+     if t.protection_45_active and t.trailing_moved:
+      event='TRAILING_EXIT'
+      result_reason='خروج بالتتبع 🛡️'
+     elif t.protection_45_active and near_entry:
+      event='BREAKEVEN_EXIT'
+      result_reason='خروج قرب التعادل ⚖️'
+     elif t.protection_45_active:
       event='PROTECTED_EXIT'
       result_reason='خروج بالحماية 🛡️'
      else:
@@ -1421,6 +1427,7 @@ class Engine:
      if res and res.retcode==mt5.TRADE_RETCODE_DONE:
       oldsl=t.sl
       t.sl=cand
+      t.trailing_moved=True
       trailing_progress=(
        ((t.best_favorable_price-t.entry)/target_distance)
        if t.side==Side.BUY
