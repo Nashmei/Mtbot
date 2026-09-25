@@ -27,6 +27,13 @@ class Engine:
   self.protection_pct=45.0
   self.trailing_gap_pct=5.0
   self.max_trade_minutes=10.0
+  # AI-native manual overrides: 0 = AI decides per trade.
+  self.ai_rr_override=0.0
+  self.ai_sl_points_override=0.0
+  self.ai_tp_points_override=0.0
+  self.ai_protection_override=0.0
+  self.ai_trailing_override=0.0
+  self.ai_duration_override=0.0
   self.reentry_cooldown_seconds=120.0
   self.last_close_by_symbol={}
   self.blocked_signal_by_symbol={}
@@ -123,6 +130,8 @@ class Engine:
    'max_trade_minutes':10.0,'max_positions':1,
    'max_consecutive_losses':3,'daily_loss_limit_pct':2.0,
    'consecutive_losses':0,
+   'ai_rr_override':0.0,'ai_sl_points_override':0.0,'ai_tp_points_override':0.0,
+   'ai_protection_override':0.0,'ai_trailing_override':0.0,'ai_duration_override':0.0,
   }
   attrs={
    'rr':'rr','risk_pct':'risk_pct','min_confidence':'min_confidence',
@@ -131,6 +140,9 @@ class Engine:
    'max_consecutive_losses':'max_consecutive_losses',
    'daily_loss_limit_pct':'daily_loss_limit_pct',
    'consecutive_losses':'consecutive_losses',
+   'ai_rr_override':'ai_rr_override','ai_sl_points_override':'ai_sl_points_override',
+   'ai_tp_points_override':'ai_tp_points_override','ai_protection_override':'ai_protection_override',
+   'ai_trailing_override':'ai_trailing_override','ai_duration_override':'ai_duration_override',
   }
   int_keys={'max_positions','max_consecutive_losses','consecutive_losses'}
   for key,default in defaults.items():
@@ -542,6 +554,12 @@ class Engine:
      'max_consecutive_losses':int(self.max_consecutive_losses),
      'consecutive_losses':int(self.consecutive_losses),
      'daily_loss_limit_pct':float(self.daily_loss_limit_pct),
+     'manual_overrides':{
+      'rr':float(self.ai_rr_override),'sl_points':float(self.ai_sl_points_override),
+      'tp_points':float(self.ai_tp_points_override),'protection_pct':float(self.ai_protection_override),
+      'trailing_gap_pct':float(self.ai_trailing_override),'duration_minutes':float(self.ai_duration_override),
+      'rule':'0 means AI decides; positive value is a hard user override',
+     },
     }
     native_decision=await self.ai_native.decide(symbol,native_snapshot)
     if native_decision.get('research_required'):
@@ -730,7 +748,26 @@ class Engine:
     protection_pct=float(ai_decision.get('protection_pct',0) or 0)
     trailing_gap_pct=float(ai_decision.get('trailing_gap_pct',0) or 0)
     expected_duration=float(ai_decision.get('expected_duration_minutes',0) or 0)
-    min_distance=(broker_stop_points+2.0)*float(info.point)
+
+    # Telegram manual controls. Zero keeps that field under AI control.
+    point=float(info.point)
+    if self.ai_sl_points_override>0:
+     dist=self.ai_sl_points_override*point
+     sl=(float(tick.bid)-dist) if sig.side==Side.BUY else (float(tick.ask)+dist)
+    if self.ai_tp_points_override>0:
+     dist=self.ai_tp_points_override*point
+     tp=(price+dist) if sig.side==Side.BUY else (price-dist)
+    elif self.ai_rr_override>0:
+     stop_distance=abs(price-sl)
+     tp=(price+stop_distance*self.ai_rr_override) if sig.side==Side.BUY else (price-stop_distance*self.ai_rr_override)
+    if self.ai_protection_override>0:
+     protection_pct=self.ai_protection_override
+    if self.ai_trailing_override>0:
+     trailing_gap_pct=self.ai_trailing_override
+    if self.ai_duration_override>0:
+     expected_duration=self.ai_duration_override
+
+    min_distance=(broker_stop_points+2.0)*point
     correct_side=(
      (sig.side==Side.BUY and sl < float(tick.bid)-min_distance and tp > price+min_distance)
      or
