@@ -519,6 +519,28 @@ class Engine:
     native_snapshot=self.ai_native.snapshot(
      symbol,tick,info,ticks,m1,m5,m15,h1,self.strategy_performance
     )
+    # Give the AI read-only account state and the exact Telegram-managed settings.
+    # Deterministic risk/margin/execution checks remain authoritative.
+    native_snapshot['account_context']={
+     'balance':float(getattr(account,'balance',0) or 0),
+     'equity':float(getattr(account,'equity',0) or 0),
+     'free_margin':float(getattr(account,'margin_free',0) or 0),
+     'margin_level_pct':float(getattr(account,'margin_level',0) or 0),
+     'currency':str(getattr(account,'currency','') or ''),
+     'open_bot_positions':len(self.trades),
+    }
+    native_snapshot['telegram_settings']={
+     'risk_pct':float(self.risk_pct),
+     'rr':float(self.rr),
+     'min_confidence_pct':float(self.min_confidence),
+     'protection_pct':float(self.protection_pct),
+     'trailing_gap_pct':float(self.trailing_gap_pct),
+     'max_trade_minutes':float(self.max_trade_minutes),
+     'max_positions':int(self.max_positions),
+     'max_consecutive_losses':int(self.max_consecutive_losses),
+     'consecutive_losses':int(self.consecutive_losses),
+     'daily_loss_limit_pct':float(self.daily_loss_limit_pct),
+    }
     native_decision=await self.ai_native.decide(symbol,native_snapshot)
     if native_decision.get('research_required'):
      research=await self.web_research.search(
