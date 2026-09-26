@@ -7,6 +7,8 @@ from pydantic import ValidationError
 
 fake_mt5 = types.ModuleType("MetaTrader5")
 fake_mt5.ACCOUNT_TRADE_MODE_DEMO = 0
+fake_mt5.ACCOUNT_TRADE_MODE_CONTEST = 1
+fake_mt5.ACCOUNT_TRADE_MODE_REAL = 2
 fake_mt5.POSITION_TYPE_BUY = 0
 fake_mt5.POSITION_TYPE_SELL = 1
 fake_mt5.shutdown = lambda: None
@@ -33,6 +35,7 @@ class FakeEngine:
         self.max_consecutive_losses=3
         self.daily_loss_limit_pct=2.0
         self.session_profit_limit=0.0
+        self.real_trading_enabled=False
         self.session_start_balance=0.0
         self.session_profit_hit=False
         self.session_active=False
@@ -133,6 +136,8 @@ class ControlAPITests(unittest.IsolatedAsyncioTestCase):
         api=self.make_api()
         payload=await api.snapshot()
         self.assertTrue(payload['account']['is_demo'])
+        self.assertEqual(payload['account']['account_type'],'demo')
+        self.assertFalse(payload['settings']['real_trading_enabled'])
         self.assertEqual(payload['account']['login'],123456)
         self.assertEqual(payload['settings']['symbols'],['EURUSD'])
         self.assertEqual(payload['engine']['max_positions'],3)
