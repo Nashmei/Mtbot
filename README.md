@@ -1,159 +1,233 @@
-# MT5 Telegram Scalper
+# MT5 AI Scalper — REAL/DEMO branch
 
-بوت تداول آلي لـ MetaTrader 5 يتم التحكم به من Telegram، مكتوب بـ Python ومصمم حالياً للعمل في وضع **DEMO فقط**. المشروع يجمع تحليل السوق متعدد الاستراتيجيات، إدارة المخاطر، تنفيذ ومتابعة الصفقات، واجهة Telegram عربية، وسجل SQLite للتدقيق والإعدادات.
+بوت تداول آلي لـ MetaTrader 5 مكتوب بـ Python. هذا الفرع مشتق من `AI` ومخصص لتطوير مسار **REAL / DEMO**، لكن **الحالة البرمجية الحالية ما زالت DEMO-only**: المحرك وواجهة T4Bot يرفضان الحساب غير التجريبي حتى يتم تنفيذ دعم Real وحواجزه الأمنية واختباره صراحة.
 
-> **تنبيه:** التداول الحقيقي (Live) مقفل في النسخة الحالية. المشروع للاختبار على حساب تجريبي، ولا توجد ضمانات ربح.
+> **تنبيه:** لا تعتبر اسم الفرع دليلاً على تفعيل التداول الحقيقي. في الكود الحالي يبدأ Engine فقط عندما يكون `account.trade_mode == ACCOUNT_TRADE_MODE_DEMO`، وControl API يرفض تسجيل الحساب غير التجريبي.
 
 ## الحالة الحالية
 
-- التطبيق: **DEMO-only**؛ زر Live مقفل.
-- البنية الحالية: **مستخدم Telegram واحد + Terminal MT5 واحد مشترك**.
-- Telegram محمي بـ `TELEGRAM_ALLOWED_USER_ID`.
-- بيانات دخول MT5 التي يدخلها المستخدم من Telegram تحفظ محلياً في `~/.mt5bot_credentials.json` بصلاحية `0600`.
-- الإعدادات التشغيلية تحفظ في SQLite وتستعاد عند إعادة تشغيل البوت.
-- البيئة المستخدمة فعلياً على الخادم: Ubuntu + Wine + Windows Python + MT5.
-- آخر بيئة تم اختبارها: Wine Staging 11.18، Windows Python 3.11.9، حزمة MetaTrader5 5.0.6180.
-- **ملاحظة تشغيلية مهمة (2026-09-23):** بعد تحديث Terminal تلقائياً من build 6204 إلى build 6207 ظهر `(-10005, 'IPC timeout')` بين حزمة Python وMT5 تحت Wine. لذلك يجب عدم اعتبار MT5 جاهزاً لمجرد أن عملية `terminal64.exe` تعمل؛ يلزم نجاح `mt5.initialize()` فعلياً قبل تشغيل التداول. مشكلة IPC هذه حُلّت لاحقاً بحسب إفادة صاحب السيرفر؛ لا تُعامل هذا الوصف التاريخي على أنه حالة التشغيل الحالية.
+- الفرع: `REAL/DEMO`، مشتق من `AI`.
+- التنفيذ الحالي: **DEMO-only**.
+- منطق التداول في هذا الفرع: **AI-native**؛ `Engine.ai_native_only = True`.
+- Telegram موجود ويمكن تعطيله عبر `TELEGRAM_ENABLED=false`.
+- T4Bot Control API اختياري عبر `CONTROL_API_ENABLED=true`.
+- Control API محمي بـ Bearer token ولا يفعّل Swagger/OpenAPI public docs.
+- T4Bot يحصل على snapshot وحالة الحساب والمراكز والإعدادات والتحليل وسجل التداول، ويستقبل الأحداث عبر WebSocket.
+- إعدادات التداول محفوظة **لكل حساب MT5 بشكل مستقل** داخل SQLite.
+- الحساب الجديد لا يرث إعدادات حساب آخر. يوجد migration للإعدادات القديمة فقط عند استعادة الحساب المحفوظ في startup.
+- بيانات دخول MT5 المحفوظة محلياً تستخدم `~/.mt5bot_credentials.json`.
+- سجل التشغيل والإعدادات في `storage/bot.db`.
+- البيئة المستهدفة على الخادم: Ubuntu + Wine Staging + Windows Python + MT5.
 
-## المعمارية
-
-مسار التشغيل الرئيسي:
+## المعمارية الحالية
 
 ```text
 main.py
- ├─ core/config.py          إعدادات .env
- ├─ storage/db.py           SQLite: settings + audit
- ├─ core/mt5_gateway.py     طبقة MetaTrader5 API
- ├─ core/engine.py          دورة التداول وإدارة المراكز
- │   ├─ core/analyzer.py    تحليل السوق وتوليد الإشارات
- │   ├─ core/risk.py        السبريد وحساب الحجم
- │   └─ core/models.py      Signal / TradeState / Regime
- └─ bot/telegram_app.py     واجهة Telegram
+ ├─ core/config.py
+ ├─ storage/db.py
+ ├─ core/mt5_gateway.py
+ ├─ core/engine.py
+ │   ├─ core/analyzer.py
+ │   ├─ core/risk.py
+ │   ├─ core/ai_native_selector.py
+ │   ├─ core/ai_advisor.py
+ │   └─ core/web_research.py
+ ├─ bot/telegram_app.py
+ └─ api/
+     ├─ control_api.py
+     └─ events.py
 ```
 
-`main.py` ينشئ قاعدة البيانات والـGateway والـEngine والواجهة، يستعيد إعدادات المستخدم، ثم يبدأ Telegram polling.
+`main.py` ينشئ DB وMT5Gateway وEngine وEventHub. إذا وجد credentials محفوظة يحاول استعادة حساب MT5، ثم يحمّل profile الإعدادات الخاص بذلك الحساب. بعد ذلك يمكن تشغيل Control API وTelegram كلٌ حسب إعداداته.
 
-## التحليل والاستراتيجيات
+## AI-native
 
-`Analyzer` يستخدم أسعار ticks مع شموع MT5 المغلقة والسياق متعدد الأطر الزمنية. تصنيف السوق يتضمن `TREND` و`RANGE` و`BREAKOUT` و`VOLATILE` و`NO_TRADE`.
+الفرع الحالي يتجاوز توليد الدخول التقليدي عند التداول الفعلي ويستخدم `AINativeSelector` لاتخاذ قرار الصفقة. القرار يعاد بشكل منظم ويتضمن عند وجود SIGNAL عناصر مثل:
 
-الاستراتيجيات الموجودة حالياً:
+- BUY / SELL.
+- strategy id.
+- confidence.
+- regime.
+- SL وTP.
+- protection وtrailing.
+- مدة متوقعة.
+- سبب القرار.
+- إمكانية طلب بحث ويب عند الحاجة.
 
-1. `scalp_breakout` — كسر M5 مع retest مباشر وتأكيد M15/H1.
-2. `ema_cross_scalp` — تقاطع EMA 9/21 على شموع مغلقة (M1 أساساً وM5 fallback)، ولا يستخدم لـ XAUUSD.
-3. `scalp_trend` — استمرار اتجاه مع M15 وpullback على EMA20 في M5 وتسارع لحظي.
-4. `gold_scalp` — منطق مخصص لـ XAUUSD للحركة/التوسع اللحظي.
-5. `scalp_m5_reversal` — انعكاس M5 عند دعم/مقاومة في بيئة غير اتجاهية.
-6. `scalp_reversion` — mean reversion عند تطرف قصير المدى مع تأكيد انعكاس لحظي.
+الـAI يستخدم cache على حالة الشموع لتجنب تكرار الطلب لنفس السوق، ويمنع إعادة استخدام SIGNAL مستهلك، ويطبق cooldown لكل رمز وفاصل عالمي وprovider backoff عند 429.
 
-التحليل يطبق أيضاً فلاتر مثل spike في السبريد، doji/sideways، زخم ticks، ATR، ADX/DI، EMA، بنية السعر، وانحياز M15/H1 حسب الاستراتيجية. الحد الأدنى الافتراضي للثقة في الـEngine هو 75% ويمكن تغييره من Telegram بين 50% و95%.
+إذا كان `NVIDIA_API_KEY` غير موجود يفشل المسار بشكل مغلق إلى `NO_TRADE` بدلاً من فتح صفقة بدون قرار AI.
+
+توجد أيضاً `AIAdvisor` كطبقة AI أخرى في المشروع، بنموذج أساسي وإمكانية escalation لنموذج أعمق عند انخفاض الثقة. الردود تتحقق من schema وتفشل إلى REJECT عند الخطأ.
+
+## البحث الإخباري
+
+`core/web_research.py` يوفر بحثاً محدوداً عند طلب AI للبحث، باستخدام GDELT مع نطاقات موثوقة محددة في الكود، ويرصد عناوين حديثة مرتبطة بأحداث عالية التأثير. فشل البحث لا يتحول تلقائياً إلى إذن بالتداول، ويتم تسجيل النتيجة في audit.
+
+## إعدادات التداول لكل حساب
+
+الإعدادات التشغيلية الأساسية داخل Engine تشمل افتراضياً:
+
+| الإعداد | الافتراضي |
+|---|---:|
+| Risk per trade | 0.25% |
+| Legacy R:R | 1:3 |
+| Minimum confidence | 75% |
+| Protection | 45% |
+| Trailing gap | 5% |
+| Max trade duration | 10 دقائق |
+| Max positions | 1 |
+| Consecutive-loss limit | 3 |
+| Daily equity loss limit | 2% |
+| Session profit target | معطل (0) |
+| Re-entry cooldown | 120 ثانية |
+
+في AI-native توجد overrides مستقلة لـ RR وSL وTP وProtection وTrailing والمدة. القيمة `0` تعني أن AI يقرر ذلك العنصر بدلاً من فرض override يدوي.
+
+مفاتيح الإعدادات للحساب المتصل تحفظ بصيغة:
+
+```text
+account:<MT5_LOGIN>:<setting>
+```
+
+وبذلك لا تنتقل إعدادات حساب إلى حساب آخر.
+
+## هدف الجلسة
+
+يوجد `session_profit_limit` مع `session_start_balance` وحالة session محفوظة في SQLite. عند بدء جلسة نظيفة يسجل المحرك Balance البداية، ويمكن استخدام هدف ربح للجلسة. حالة الجلسة تبقى قابلة للاستعادة بعد restart بدلاً من اعتبار restart جلسة جديدة تلقائياً.
 
 ## التنفيذ وإدارة المخاطر
 
-قبل إرسال الصفقة يتحقق المحرك من حساب DEMO وصلاحيات MT5، ومن حداثة ticks والسعر الحي وحد انخفاض Equity اليومي، ثم يحسب الحجم اعتماداً على Equity والمسافة إلى SL. يختار سياسة الملء المتاحة للرمز، ويستخدم `order_check` قبل `order_send`. أوامر البوت تحمل magic number `4009`. الفحص المسبق لا يضمن قبول التنفيذ عند الوسيط.
+قبل بدء المحرك، الكود الحالي يتحقق من:
 
-الإعدادات المهمة:
+1. صلاحية إعدادات المخاطرة والحدود.
+2. وجود حساب MT5.
+3. أن الحساب **DEMO**.
+4. حد Equity اليومي.
+5. جاهزية MT5 وAlgo Trading.
+6. إمكانية قراءة المراكز.
+7. عدم وجود مركز قديم يحمل magic البوت `4009` وغير متتبع.
 
-| الإعداد | الافتراضي / النطاق |
-|---|---|
-| Risk per trade | 0.25% افتراضياً؛ Telegram يسمح 0.25–50% |
-| R:R | 1:3 افتراضياً؛ Telegram يسمح 0.5–10 |
-| Minimum confidence | 75% افتراضياً؛ 50–95% |
-| Protection trigger | 45% افتراضياً؛ 5–90% |
-| Max positions | 1 افتراضياً؛ 1–10 |
-| Consecutive-loss limit | 3 افتراضياً؛ 0–20، و0 يعطل الحد |
-| Max trade duration | 10 دقائق داخل Engine؛ 3–240 من Telegram |
-| Re-entry cooldown | 120 ثانية |
-| Spread multiplier | 1.8 × المتوسط المتحرك |
-| Slippage/deviation | 10 points |
-| Magic number | 4009 |
-
-`Risk` يحتفظ بتاريخ spread مستقل لكل رمز، ويستخدم متوسطاً حديثاً وحداً نسبياً. بعد كل 3 رفضات متتالية بسبب السبريد يوسع الحد 10% بحد أقصى مرتين؛ القراءات المرفوضة لا تدخل في المتوسط. هذا لا يغني عن وضع `MAX_SPREAD_POINTS` مناسب لرموز الوسيط.
-
-حد انخفاض Equity اليومي (`DAILY_LOSS_LIMIT_PCT`) يقارن Equity الحالي بقيمة أول فحص في يوم السيرفر ويحفظ خط الأساس في SQLite حتى بعد إعادة تشغيل البوت. عند بلوغ الحد يتوقف **الدخول الجديد** وتستمر إدارة المراكز المتتبعة. الإيداع والسحب والمراكز المحمولة من يوم سابق قد تؤثر على هذه المقارنة؛ ليست حساباً دقيقاً للخسارة المحققة. `cooldown_after_losses_min` إعداد محجوز غير مطبق.
+التنفيذ يمر عبر `MT5Gateway` وRisk ويستخدم بيانات الرمز والسعر الفعلي وسياسة الملء المتاحة وقيود الوسيط. لا تعتبر نتيجة `order_check` ضماناً لقبول `order_send`.
 
 ## متابعة الصفقات
 
-كل مركز يتتبعه `TradeState` مستقل. المحرك يعتمد القيم الفعلية للمركز بعد التنفيذ، ويسجل بيانات الدخول وSL/TP والحجم والاستراتيجية والثقة. توجد آليات حماية/Trailing وإغلاق زمني ضمن الـEngine، مع منع فتح صفقة قديمة غير متتبعة عند بدء المحرك.
+كل ticket له `TradeState` مستقل. المحرك يحتفظ بحالة الصفقات المتتبعة، ويراقب الحماية وtrailing والمدة والإغلاق، ويسجل أحداث التنفيذ والنتائج في audit.
 
-إذا ظهر مركز يحمل magic البوت وغير موجود في ذاكرة المحرك، يوقف المحرك الدخول ويطلب فحص المركز يدوياً. عند فشل ربط مركز بعد إرسال أمر ناجح يوقف المحرك بالكامل. إغلاق جزئي عبر زر Stop يُبقي المركز المتبقي مسجلاً في الذاكرة لكن المحرك يكون متوقفاً، لذا افحص المتبقي يدوياً في MT5 ولا تعتمد على رسالة Telegram وحدها.
+إذا ظهر مركز للبوت غير موجود في ذاكرة المحرك، يمنع بدء تشغيل جديد حتى تتم مراجعته. هذا يمنع تبني مركز قديم بصورة عمياء بعد restart أو deployment.
 
-زر Stop في Telegram يوقف الدخول الجديد ويحاول إغلاق المراكز التي يديرها البوت، مع تسجيل النتيجة.
+## T4Bot Control API
 
-## Telegram UI
+يعمل فقط إذا:
 
-الواجهة عربية ومبنية على `python-telegram-bot`. تشمل القوائم الرئيسية: Dashboard/الحالة، التداول، التحليل، الإعدادات، والحساب.
+```dotenv
+CONTROL_API_ENABLED=true
+CONTROL_API_TOKEN=<strong-secret>
+```
 
-الوظائف الحالية تشمل:
+الإعداد الافتراضي:
 
-- تسجيل دخول MT5 من رسالة واحدة تحتوي `Server` و`Login` و`Password`، ثم محاولة حذف رسالة بيانات الدخول.
-- عرض حالة الحساب وMT5/Algo readiness.
-- اختيار رمز واحد أو عدة رموز، مع قائمة رموز شائعة ومسح سريع للرموز ذات ticks الحديثة.
-- تحليل الأزواج المختارة.
+```text
+host = 127.0.0.1
+port = 7099
+```
+
+المسارات الحالية تشمل:
+
+```text
+GET   /v1/health
+GET   /v1/snapshot
+POST  /v1/engine/start
+POST  /v1/engine/stop
+POST  /v1/account/login
+PATCH /v1/settings
+GET   /v1/symbols
+PUT   /v1/symbols
+POST  /v1/analysis/run
+GET   /v1/audit
+GET   /v1/trades/history
+GET   /v1/media/{media_id}
+WS    /v1/ws
+```
+
+جميعها محمية بالمصادقة المناسبة. WebSocket يرسل أحداث Engine فوراً، ويحدّث snapshot لحالة MT5 مع coalescing للتحديثات غير المتغيرة.
+
+### قيود الحساب الحالية في T4Bot
+
+`POST /v1/account/login` يرفض حالياً أي حساب ليس DEMO. لذلك **Real غير مفعّل بعد** حتى لو كان اسم الفرع `REAL/DEMO`.
+
+## Telegram
+
+Telegram واجهة تحكم إضافية وليست إلزامية عند تعطيلها من البيئة. عند تشغيلها تستخدم `TELEGRAM_ALLOWED_USER_ID` لتقييد المستخدم.
+
+تدعم الوظائف الموجودة في المشروع مثل:
+
+- حالة المحرك والحساب.
+- تسجيل دخول MT5.
+- اختيار رمز أو عدة رموز.
 - Start / Stop.
-- تعديل Risk وConfidence وProtection وR:R وMax Positions وMax Losses ومدة الصفقة.
-- `/clean` لتنظيف الرسائل التي تتبعها الواجهة.
-- معالجة `RetryAfter` و`BadRequest` لتقليل مشاكل Telegram flood.
-- رسائل التداول المصورة يمكن تحديث caption الخاص بها بدلاً من إرسال رسالة جديدة لكل تغير.
-- شاشة الحالة تعرض عدد دورات المحرك ومدة آخر دورة؛ يسجل `ENGINE_CYCLE` ملخصاً مرة كل دقيقة تقريباً لتشخيص البطء دون كتابة سجل لكل فحص.
+- تحليل.
+- إعدادات المخاطرة والثقة والحماية والحدود.
+- تنظيف رسائل الواجهة.
+- التعامل مع Telegram flood / RetryAfter.
+- تحديث رسائل الصفقة أثناء تغير حالتها.
 
-الأوامر المسجلة حالياً تشمل `/start`, `/cancel`, `/clean`, `/symbol`, `/symbols`, `/rr`, `/risk`, `/confidence`, `/protection`, `/maxpos`, `/maxloss`.
-`/cancel` يلغي إدخال الإعداد أو بيانات الدخول الجاري فقط؛ لا يحذف credentials ولا يفصل MT5. زر «تحليل الآن» يستخدم نفس أطر M1/M5/M15/H1 المستخدمة في المحرك، ويرفض عرض فرصة من ticks قديمة.
-
-## الاختبار التاريخي
-
-`backtest.py` إعادة تشغيل تاريخية للإشارات، وتستخدم الآن أطر M1/M5/M15/H1 والقيم الافتراضية الأساسية للمحرك. ليست اختبار تنفيذ عند الوسيط: لا تحاكي الرسوم والانزلاق والسيولة والقيود الزمنية أو تزامن المراكز كاملاً. لا تستخدم `Equity index` فيها كتوقع لأداء الحساب.
+لا تشغل أكثر من polling instance لنفس Telegram bot token.
 
 ## قاعدة البيانات
 
-الملف الافتراضي:
+المسار الافتراضي:
 
 ```text
 storage/bot.db
 ```
 
-الجداول:
+الجداول الأساسية:
 
-- `settings(key, value)` — إعدادات Telegram/Engine المحفوظة.
-- `audit(id, ts, event, symbol, details)` — سجل الأحداث والتنفيذ والأخطاء المهمة.
+- `settings(key, value)`
+- `audit(id, ts, event, symbol, details)`
 
-لا تحذف قاعدة البيانات أثناء deployment إذا كنت تريد الاحتفاظ بالإعدادات والسجل.
+توجد وظائف لاستخراج الأداء الحديث للاستراتيجيات، audit الحديث، وتاريخ الصفقات المغلقة. تاريخ الصفقات المقدم للحساب الحالي يطبق account scoping ولا ينسب السجلات القديمة غير الموسومة إلى الحساب الحالي.
 
-## الإعداد عبر .env
+**لا تحذف قاعدة البيانات أثناء deployment** إذا كنت تريد الاحتفاظ بالإعدادات والسجل وحالة الجلسة.
 
-`core/config.py` يقرأ `.env` من جذر المشروع. أهم المتغيرات:
+## إعدادات .env
+
+`core/config.py` يستخدم .env لإعدادات bootstrap/runtime فقط. إعدادات التداول القابلة للتغيير تحفظ في SQLite لكل حساب ولا يفترض أن تأتي من .env.
+
+مثال:
 
 ```dotenv
+TELEGRAM_ENABLED=true
 TELEGRAM_BOT_TOKEN=...
 TELEGRAM_ALLOWED_USER_ID=...
+
+CONTROL_API_ENABLED=false
+CONTROL_API_HOST=127.0.0.1
+CONTROL_API_PORT=7099
+CONTROL_API_TOKEN=...
+
+MT5_TERMINAL_PATH=C:\\Program Files\\MetaTrader 5\\terminal64.exe
 APP_MODE=DEMO
 
-MT5_LOGIN=
-MT5_PASSWORD=
-MT5_SERVER=
-MT5_TERMINAL_PATH=C:\Program Files\MetaTrader 5\terminal64.exe
-
-DEFAULT_SYMBOL=EURUSD
-RISK_PER_TRADE_PCT=0.25
-DAILY_LOSS_LIMIT_PCT=2
-MAX_CONSECUTIVE_LOSSES=3
-COOLDOWN_AFTER_LOSSES_MIN=30
-RR=3
-MIN_HOLD_SECONDS=5
-MAX_HOLD_SECONDS=120
-MIN_SL_POINTS=10
-MAX_TEST_LOT=0.10
 SPREAD_SAMPLE_SIZE=60
 MAX_SPREAD_MULTIPLIER=1.8
 MAX_SPREAD_POINTS=0
 MAX_SLIPPAGE_POINTS=10
-MAX_TICK_AGE_SECONDS=15
+MIN_SL_POINTS=10
 POLL_INTERVAL_MS=150
+MAX_TICK_AGE_SECONDS=15
+
+NVIDIA_API_KEY=...
 ```
 
-لا ترفع `.env` أو credentials إلى GitHub.
+يوجد في config أيضاً إعدادات APNs، لكن تنبيهات التداول الحالية لـT4Bot تبث كأحداث realtime ويحوّلها تطبيق iOS إلى local notifications؛ وجود حقول APNs في config لا يعني أن Mtbot يرسل APNs حالياً.
+
+لا ترفع `.env` أو credentials أو tokens إلى GitHub.
 
 ## المتطلبات
+
+المتطلبات الحالية في `requirements.txt`:
 
 ```text
 python-telegram-bot==22.5
@@ -163,13 +237,16 @@ python-dotenv>=1.0
 aiosqlite>=0.20
 numpy>=1.26
 pandas>=2.2
+fastapi>=0.115,<1
+uvicorn>=0.30,<1
+PyJWT[crypto]>=2.9,<3
 ```
 
-في Linux/Wine يجب تشغيل **Windows Python داخل نفس Wine prefix الذي يعمل فيه MT5**. لا تعتمد على Python Linux الأصلي لحزمة `MetaTrader5`.
+في Linux/Wine يجب تشغيل Windows Python داخل Wine prefix المتصل بنفس MT5؛ Python Linux الأصلي ليس بديلاً عن بيئة MetaTrader5 المستخدمة هنا.
 
-## بيئة الخادم المستخدمة
+## بيئة الخادم المعروفة
 
-المسار الحالي للمشروع:
+المشروع:
 
 ```text
 /home/ubuntu/.wine/drive_c/mt5bot
@@ -193,127 +270,130 @@ Wine prefix:
 /home/ubuntu/.wine
 ```
 
-واجهة X الحالية تستخدم `DISPLAY=:1` و`XAUTHORITY=/home/ubuntu/.Xauthority`.
+واجهة X المستخدمة سابقاً:
 
-## تشغيل يدوي للتطوير
+```text
+DISPLAY=:1
+XAUTHORITY=/home/ubuntu/.Xauthority
+```
 
-بعد التأكد من أن MT5 وPython IPC يعملان:
+هذه معلومات بيئة معروفة وليست إثباتاً للحالة اللحظية للسيرفر.
+
+## التشغيل
+
+مثال تشغيل يدوي في بيئة الخادم المعروفة:
 
 ```bash
 cd "$HOME/.wine/drive_c/mt5bot"
-
-APP_MODE=DEMO WINEDEBUG=-all PYTHONUNBUFFERED=1 /opt/wine-staging/bin/wine "C:\users\ubuntu\AppData\Local\Programs\Python\Python311\python.exe" -u main.py
+WINEDEBUG=-all PYTHONUNBUFFERED=1 /opt/wine-staging/bin/wine   "C:\users\ubuntu\AppData\Local\Programs\Python\Python311\python.exe" -u main.py
 ```
 
-لا تشغّل Terminal إضافياً يدوياً إذا كان MT5 يعمل بالفعل داخل Wine prefix نفسه. كذلك لا تشغّل البوت يدوياً بالتزامن مع `mtbot.service` حتى لا تتكرر جلسة Telegram polling.
+لا تشغّل نسخة يدوية بالتزامن مع `mtbot.service`، ولا تشغّل Terminal إضافياً داخل نفس Wine prefix بدون حاجة.
 
-## تشغيل البوت عبر systemd
+## systemd
 
-على هذا السيرفر توجد خدمة واحدة للبوت: `mtbot.service`. لا توجد خدمة باسم `mt5.service`. يمكن تشغيل البوت يدوياً بدلاً من الخدمة، لكن لا تشغّل الطريقتين معاً. يعمل MT5 داخل Wine على جلسة VNC/XFCE ذات `DISPLAY=:1`، ويمكن لـ `mt5.initialize()` تشغيل Terminal عند الحاجة؛ تأكد من عدم وجود نسختين من `terminal64.exe` على Wine prefix نفسه.
+الخدمة المعروفة للبوت هي:
 
-لفحص خدمة البوت دون عرض المتغيرات السرية:
+```text
+mtbot.service
+```
+
+فحص الحالة بدون عرض الأسرار:
 
 ```bash
 systemctl show mtbot.service -p ActiveState -p SubState -p MainPID -p NRestarts
 ```
 
-قبل تشغيل المحرك من Telegram، تحقق أن الاتصال بـMT5 نجح وأن الحساب التجريبي متصل. حل صاحب السيرفر مشكلة IPC التي ظهرت بعد تحديث Terminal؛ هذا المستند لا يفترض أن العطل لا يزال قائماً.
+وجود `terminal64.exe` كعملية لا يكفي لإثبات جاهزية MT5. يجب نجاح `mt5.initialize()` ثم التحقق من connected وtrade permissions.
 
-اختبار API مستقل:
+## MT5 / Wine IPC
 
-```bash
-env HOME=/home/ubuntu DISPLAY=:1 XAUTHORITY=/home/ubuntu/.Xauthority WINEPREFIX=/home/ubuntu/.wine WINEDEBUG=-all /opt/wine-staging/bin/wine 'C:\users\ubuntu\AppData\Local\Programs\Python\Python311\python.exe' -c "
-import MetaTrader5 as mt5
-ok = mt5.initialize(
-    r'C:\Program Files\MetaTrader 5\terminal64.exe',
-    timeout=30000,
-    portable=True,
-)
-print('initialize =', ok)
-print('last_error =', mt5.last_error())
-if ok:
-    print(mt5.terminal_info())
-    print(mt5.account_info())
-    mt5.shutdown()
-"
+حدث تاريخياً بعد تحديث MT5 إلى build 6207 خطأ:
+
+```text
+(-10005, 'IPC timeout')
 ```
 
-لا تعتبر النظام جاهزاً إلا إذا كانت `initialize=True`، ثم تحقق من `terminal_info().connected` و`trade_allowed` و`tradeapi_disabled` وحالة الحساب.
+ثم أبلغ صاحب السيرفر لاحقاً أن المشكلة حُلّت. لذلك هذه المعلومة تاريخية وليست وصفاً للحالة الحالية. عند ظهور المشكلة مجدداً يجب تشخيص طبقة MT5 ↔ Wine ↔ MetaTrader5 Python قبل تغيير Analyzer أو استراتيجية التداول.
 
-## Algo Trading
+## الاختبار التاريخي
 
-`core/mt5_gateway.py` يحتوي حالياً على `_enable_algo_trading()` التي تعدل `Config/common.ini` مع الحفاظ على encoding، وتضع تحت `[Experts]`:
+`backtest.py` الموجود حالياً ما زال signal replay للـAnalyzer التقليدي على M1/M5/M15/H1 لرموز محددة، ولا يمثل backtest كاملاً لمسار AI-native الحالي.
 
-```ini
-AllowLiveTrading=1
-Enabled=1
-Account=0
-Profile=0
-Api=0
-```
+لا يحاكي بدقة:
 
-هذه الإعدادات **لا تعالج IPC timeout**. في آخر فحص قبل مشكلة IPC كان الحساب نفسه يسمح بالتداول، لكن حالة Terminal Algo تحتاج دائماً للتحقق من `terminal_info()` بعد نجاح الاتصال.
+- broker fills.
+- fees/commission.
+- slippage الفعلي.
+- rollover.
+- margin.
+- portfolio concurrency.
+- stop/freeze restrictions.
+- provider latency أو قرارات AI-native الحية.
 
-## مشكلة MT5 build 6207 / IPC
+لذلك لا تستخدم Equity index الناتج كتوقع لأداء الحساب الحقيقي.
 
-في 2026-09-23 قام MT5 LiveUpdate بتحديث Terminal من build 6204 إلى 6207. بعد التحديث:
+## Deployment لهذا الفرع
 
-- Terminal يبدأ ويظهر في process list.
-- تم التأكد من وجود Terminal واحد فقط أثناء الاختبار.
-- إعادة تشغيل Wine بالكامل لم تحل المشكلة.
-- `mt5.initialize(path=..., portable=True)` وبدون `path` أعادا `(-10005, 'IPC timeout')`.
-- حزمة Python كانت `MetaTrader5 5.0.6180` على Python 3.11.9.
-- استمرت المشكلة تاريخياً حتى عند تجربة بدء Terminal عبر Python نفسه.
-- تحذيرات `libEGL/DRI3` ظهرت في إحدى المحاولات؛ لا يوجد في النتائج الحالية ما يثبت أنها سبب IPC.
-- هذه نتائج تشخيص تاريخية؛ أبلغ صاحب السيرفر لاحقاً بحل مشكلة IPC.
+هذا الفرع **ليس `main`**. عند نشره لاحقاً يجب تحديد `REAL/DEMO` صراحة وعدم استخدام أمر deployment الخاص بـmain بالخطأ.
 
-لذلك عند استكمال التشخيص يجب التركيز على طبقة **MT5 6207 ↔ Wine ↔ MetaTrader5 Python IPC**، وليس تغيير استراتيجية التداول أو Analyzer.
+لا يتم أي deployment لمجرد تحديث GitHub. النشر على السيرفر خطوة مستقلة ويجب التأكد قبلها من:
 
-## Deployment من GitHub
-
-الفرع المستخدم هو `main`. على الخادم:
-
-```bash
-cd "$HOME/.wine/drive_c/mt5bot" && git fetch origin main && git reset --hard origin/main
-```
-
-هذا لا ينبغي أن يحذف `.env` غير المتتبع، لكن تحقق دائماً من الأسرار وقاعدة البيانات قبل أي تنظيف يدوي. لا تستخدم أوامر حذف واسعة داخل مجلد المشروع.
+- الفرع والـcommit المطلوبين.
+- حفظ `.env`.
+- حفظ `storage/bot.db`.
+- عدم حذف credentials المحلية.
+- عدم تشغيل نسختين من البوت أو Telegram polling.
+- نجاح MT5 IPC بعد إعادة التشغيل.
 
 ## الأمان
 
-- DEMO فقط في النسخة الحالية.
-- لا تضع Telegram token أو كلمة مرور MT5 أو مفاتيح AWS داخل Git.
-- اسمح فقط لـ Telegram user ID الموثوق.
-- ملف credentials المحلي يجب أن يبقى بصلاحيات ضيقة.
-- لا تعرض VNC أو SSH للعالم بشكل دائم؛ قيد Security Group إلى عناوين موثوقة.
-- لا تشغل أكثر من MT5 على نفس Wine prefix دون سبب واضح.
-- لا تشغل المحرك إذا فشل MT5 IPC أو كانت حالة التداول غير جاهزة.
-- راقب `storage/bot.db` وsystemd logs بعد أي deployment.
+- التنفيذ الحالي DEMO-only.
+- لا تضع Telegram token أو Control API token أو NVIDIA key أو MT5 password أو مفاتيح AWS داخل Git.
+- Control API يجب أن يبقى خلف مصادقة وشبكة موثوقة.
+- لا تعتبر اسم `REAL/DEMO` تصريحاً بالتداول الحقيقي.
+- دعم Real يجب أن يضاف كميزة صريحة مع حواجز واضحة واختبارات Demo أولاً.
+- لا تشغل المحرك إذا فشل MT5 IPC أو كانت صلاحيات التداول غير جاهزة.
+- لا تحذف SQLite أثناء deployment.
+- راقب audit وsystemd logs بعد أي نشر.
 
-## ملاحظات للمطور
+## قاعدة العمل للمطور
 
-عند تعديل أي وظيفة، تتبع المسار كاملاً بدلاً من تعديل ملف منفرد فقط:
+أي تعديل يجب تتبعه عبر المسار الكامل المتأثر:
 
 ```text
-Telegram UI
-  → Engine
-    → Analyzer / Risk
-      → MT5Gateway
-        → MetaTrader5 terminal
-  → SQLite settings/audit
+Telegram / T4Bot
+       ↓
+     Engine
+       ↓
+AI / Analyzer / Risk
+       ↓
+   MT5Gateway
+       ↓
+MetaTrader5 Terminal
+       ↓
+SQLite audit/settings
 ```
 
-أي تغيير في تسجيل الدخول أو التشغيل يجب اختباره مع lifecycle الخاص بـWine/MT5. وأي تغيير في استراتيجية أو إدارة صفقة يجب مراجعته مع إدارة المخاطر، تعدد الرموز، المراكز الحالية، الإشعارات، واستعادة الإعدادات بعد restart.
+قبل تعديل تسجيل الدخول أو دعم Real/DEMO، راجع أيضاً account-scoped settings وحالة session والمراكز المفتوحة وإعادة التشغيل. قبل تعديل إدارة الصفقة، راجع التنفيذ والحماية وtrailing والمدة والإشعارات وسجل audit معاً.
 
-## حدود معروفة / أعمال لاحقة
+## الخطوة القادمة للفرع REAL/DEMO
 
-- توثيق سبب حل IPC الذي أجراه صاحب السيرفر، والتحقق من نجاح الاتصال بعد أي تحديث لاحق.
-- التحقق من حد انخفاض Equity اليومي مع الإيداع والسحب والمراكز المحمولة عبر منتصف الليل.
-- اختبار سياسات الملء والإغلاق الجزئي لكل رمز مع الوسيط على DEMO.
-- اختبار restart/reconciliation للمراكز المفتوحة بشكل أوسع.
-- إضافة سياسة أخبار اقتصادية إذا كانت مطلوبة.
-- اختبار Demo soak طويل قبل التفكير في Live.
+الهدف المقصود من هذا الفرع هو إضافة دعم حسابات **Real + Demo** بصورة صريحة وآمنة. هذا العمل **لم يُنفذ بعد** في الحالة الموثقة هنا.
+
+قبل اعتبار Real مدعوماً يجب على الأقل تحديث واختبار:
+
+1. سياسة قبول نوع الحساب في Engine.
+2. سياسة login في Control API وTelegram.
+3. إظهار نوع الحساب بوضوح في كل واجهة.
+4. قفل/تأكيد مستقل للتداول الحقيقي.
+5. حفظ حالة Real authorization بطريقة آمنة.
+6. منع أي انتقال صامت من Demo إلى Real.
+7. اختبارات restart/reconnect/account switching.
+8. اختبار إدارة المراكز الموجودة قبل التشغيل.
+9. حدود مخاطرة مناسبة للحساب الحقيقي.
+10. Demo soak واختبار شامل قبل تفعيل Real.
 
 ---
 
-**الوضع الحالي للمشروع: DEMO / safety-first. اختبر كل تغيير على حساب تجريبي أولاً.**
+**الحالة الموثقة من الكود الحالي: فرع REAL/DEMO موجود، لكن التنفيذ لا يزال DEMO-only وAI-native.**
