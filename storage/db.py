@@ -124,7 +124,9 @@ class DB:
     tagged=details.get('account_login')
     try: tagged=int(tagged) if tagged is not None else None
     except (TypeError,ValueError): tagged=None
-    if account_login is None or tagged is None or tagged==account_login:
+    # Account-scoped history is strict: never attribute legacy/untagged
+    # rows to the currently logged-in MT5 account.
+    if account_login is None or tagged==account_login:
      opens[ticket]=row
     continue
    if row.get('event') not in ('TP','SL','PROTECTED_EXIT','TRAILING_EXIT','BREAKEVEN_EXIT','MAX_DURATION_EXIT','POSITION_CLOSED'):
@@ -132,9 +134,9 @@ class DB:
    close_tag=details.get('account_login')
    try: close_tag=int(close_tag) if close_tag is not None else None
    except (TypeError,ValueError): close_tag=None
-   if account_login is not None and close_tag is not None and close_tag!=account_login:
+   if account_login is not None and close_tag!=account_login:
     continue
-   if account_login is not None and ticket and ticket not in opens:
+   if account_login is not None and (not ticket or ticket not in opens):
     continue
    opened=opens.get(ticket,{}) if ticket else {}
    open_details=opened.get('details') or {}
