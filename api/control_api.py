@@ -212,9 +212,27 @@ class ControlAPI:
             return {'ok': True, 'message': 'تم حفظ الإعدادات على Mtbot.'}
 
         @app.get('/v1/symbols')
-        async def get_symbols(_=Depends(auth)):
-            available = [item.name for item in self.gateway.available_symbols()]
-            return {'selected': list(self.engine.symbols), 'available': available}
+        async def get_symbols(
+            q: str = Query(default='', max_length=80),
+            limit: int = Query(default=200, ge=1, le=500),
+            offset: int = Query(default=0, ge=0),
+            _=Depends(auth),
+        ):
+            symbols = list(self.gateway.available_symbols())
+            active = [item.name for item in symbols if bool(getattr(item, 'visible', False))]
+            names = self.gateway.ranked_symbol_names()
+            query = q.strip().upper()
+            if query:
+                names = [name for name in names if query in name.upper()]
+            total = len(names)
+            page = names[offset:offset + limit]
+            return {
+                'selected': list(self.engine.symbols),
+                'active': active,
+                'available': page,
+                'total': total,
+                'has_more': offset + len(page) < total,
+            }
 
         @app.put('/v1/symbols')
         async def put_symbols(payload: SymbolsPayload, _=Depends(auth)):
@@ -237,7 +255,15 @@ class ControlAPI:
             await self.engine.save_setting('symbols', json.dumps(selected))
             await self.db.log('SYMBOLS_UPDATED', source='t4bot', symbols=selected)
             await self.event_hub.broadcast('symbols_changed', {'symbols': selected})
-            return {'selected': selected, 'available': available}
+            active = [item.name for item in self.gateway.available_symbols() if bool(getattr(item, 'visible', False))]
+            ranked = self.gateway.ranked_symbol_names()
+            return {
+                'selected': selected,
+                'active': active,
+                'available': ranked[:200],
+                'total': len(ranked),
+                'has_more': len(ranked) > 200,
+            }
 
         @app.post('/v1/analysis/run')
         async def run_analysis(_=Depends(auth)):
@@ -250,7 +276,9 @@ class ControlAPI:
             return await self.db.recent_audit(limit)
         @app.get('/v1/trades/history')
         async def trade_history(limit: int = Query(default=100, ge=1, le=500), _=Depends(auth)):
-            rows = await self.db.closed_trades(limit)
+            account = self.gateway.account()
+            login = int(getattr(account, 'login', 0) or 0) if account else None
+            rows = await self.db.closed_trades(limit, account_login=login)
             for row in rows:
                 row['image_id'] = self.event_hub.media_id_for_ticket(row.get('ticket'))
             return rows
@@ -317,6 +345,12 @@ class ControlAPI:
             positions = ()
 
         readiness = self.gateway.algo_status()
+        session_visible = bool(self.engine.session_active or self.engine.session_profit_hit)
+        session_start = self._number(self.engine.session_start_balance) if session_visible else 0.0
+        session_profit = (
+            self._number((getattr(account,'balance',0) or 0)-self.engine.session_start_balance)
+            if session_visible and self.engine.session_start_balance>0 else 0.0
+        )
         return {
             'server_time': time.time(),
             'engine': {
@@ -326,8 +360,8 @@ class ControlAPI:
                 'last_cycle_at': self._number(self.engine.last_cycle_at),
                 'tracked_positions': len(self.engine.trades),
                 'max_positions': int(self.engine.max_positions),
-                'session_start_balance': self._number(self.engine.session_start_balance),
-                'session_profit': self._number((getattr(account,'balance',0) or 0)-self.engine.session_start_balance) if self.engine.session_start_balance>0 else 0.0,
+                'session_start_balance': session_start,
+                'session_profit': session_profit,
                 'session_profit_hit': bool(self.engine.session_profit_hit),
             },
             'account': self._account_payload(account) if account else None,

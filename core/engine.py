@@ -43,6 +43,7 @@ class Engine:
   self.session_profit_limit=0.0
   self.session_start_balance=0.0
   self.session_profit_hit=False
+  self.session_active=False
   self.consecutive_losses=0
   self.loss_limit_notified=False
   self.daily_loss_notified=False
@@ -133,6 +134,7 @@ class Engine:
    'protection_pct':45.0,'trailing_gap_pct':5.0,
    'max_trade_minutes':10.0,'max_positions':1,
    'max_consecutive_losses':3,'daily_loss_limit_pct':2.0,'session_profit_limit':0.0,
+   'session_start_balance':0.0,'session_profit_hit':0,'session_active':0,
    'consecutive_losses':0,
    'ai_rr_override':0.0,'ai_sl_points_override':0.0,'ai_tp_points_override':0.0,
    'ai_protection_override':0.0,'ai_trailing_override':0.0,'ai_duration_override':0.0,
@@ -143,12 +145,13 @@ class Engine:
    'max_trade_minutes':'max_trade_minutes','max_positions':'max_positions',
    'max_consecutive_losses':'max_consecutive_losses',
    'daily_loss_limit_pct':'daily_loss_limit_pct','session_profit_limit':'session_profit_limit',
+   'session_start_balance':'session_start_balance','session_profit_hit':'session_profit_hit','session_active':'session_active',
    'consecutive_losses':'consecutive_losses',
    'ai_rr_override':'ai_rr_override','ai_sl_points_override':'ai_sl_points_override',
    'ai_tp_points_override':'ai_tp_points_override','ai_protection_override':'ai_protection_override',
    'ai_trailing_override':'ai_trailing_override','ai_duration_override':'ai_duration_override',
   }
-  int_keys={'max_positions','max_consecutive_losses','consecutive_losses'}
+  int_keys={'max_positions','max_consecutive_losses','consecutive_losses','session_profit_hit','session_active'}
   for key,default in defaults.items():
    scoped=await self._account_key(key,login)
    raw=await self.db.get(scoped)
@@ -186,6 +189,8 @@ class Engine:
    import json
    await self.db.set(symbols_key,json.dumps(self.symbols))
 
+  self.session_profit_hit=bool(self.session_profit_hit)
+  self.session_active=bool(self.session_active)
   await self._refresh_strategy_performance(force=True)
 
 
@@ -257,11 +262,15 @@ class Engine:
    await self.notify('ℹ️ البوت يعمل بالفعل.')
    return True
 
-  # A manual Start always creates a fresh profit session from realized Balance.
-  self.session_start_balance=float(getattr(account,'balance',0) or 0)
-  self.session_profit_hit=False
-  await self.save_setting('session_start_balance',self.session_start_balance)
-  await self.save_setting('session_profit_hit',0)
+  # A clean Stop ends a session. A service/process restart does not:
+  # if session_active survived in SQLite we resume the same realized Balance baseline.
+  if not (self.session_active and self.session_start_balance>0 and not self.session_profit_hit):
+   self.session_start_balance=float(getattr(account,'balance',0) or 0)
+   self.session_profit_hit=False
+   self.session_active=True
+   await self.save_setting('session_start_balance',self.session_start_balance)
+   await self.save_setting('session_profit_hit',0)
+   await self.save_setting('session_active',1)
 
   if not self.symbols:
    await self.notify('⚠️ اختر زوجاً واحداً على الأقل قبل التشغيل.')
@@ -294,8 +303,10 @@ class Engine:
   return True
 
  async def stop(self):
-  # منع أي دخول جديد فوراً
+  # منع أي دخول جديد فوراً وإنهاء جلسة التشغيل بشكل صريح.
   self.running=False
+  self.session_active=False
+  await self.save_setting('session_active',0)
 
   # دعم مؤقت للصفقة القديمة أثناء مرحلة التحويل
   managed=list(self.trades.values())
@@ -468,10 +479,12 @@ class Engine:
      self.session_profit_hit=True
      await self.save_setting('session_profit_hit',1)
      await self.db.log('SESSION_PROFIT_LIMIT',balance=balance,baseline=self.session_start_balance,profit=realized,limit=self.session_profit_limit)
-     await self.notify(f'🎯 تحقق حد ربح الجلسة: +${realized:.2f}. توقف التحليل والدخول الجديد.')
+     await self.notify(f'🎯 تحقق حد ربح الجلسة: +${realized:.2f}. توقف التحليل والدخول الجديد.',event_type='session_profit_limit',trade_result=realized)
     # Existing positions keep deterministic management; no analysis/new entries.
     if not self.trades:
      self.running=False
+     self.session_active=False
+     await self.save_setting('session_active',0)
     return
 
   # لا دخول جديد عند بلوغ الحدود
@@ -582,6 +595,7 @@ class Engine:
      'max_consecutive_losses':int(self.max_consecutive_losses),
      'consecutive_losses':int(self.consecutive_losses),
      'daily_loss_limit_pct':float(self.daily_loss_limit_pct),
+     'session_profit_limit':float(self.session_profit_limit),
      'manual_overrides':{
       'rr':float(self.ai_rr_override),'sl_points':float(self.ai_sl_points_override),
       'tp_points':float(self.ai_tp_points_override),'protection_pct':float(self.ai_protection_override),
@@ -1115,6 +1129,7 @@ class Engine:
 
    await self.db.log(
     'OPEN',symbol,ticket=pos.ticket,entry=fill,sl=sl,tp=tp,volume=vol,
+    account_login=int(getattr(account,'login',0) or 0),
     side=sig.side.value,strategy=sig.strategy,regime=reg.value,
     confidence=float(sig.confidence),reason=sig.reason,
     risk_cash=actual_risk,risk_pct=actual_risk_pct,rr_actual=actual_rr,
@@ -1265,7 +1280,7 @@ class Engine:
    tick=self.gw.tick(t.symbol)
    current=float(tick.bid if t.side==Side.BUY else tick.ask) if tick else t.entry
    caption=await self._trade_caption(t,current_price=current)
-   await self.notify(caption,photo_path=path,caption=caption,trade_ticket=t.ticket,pin=True)
+   await self.notify(caption,photo_path=path,caption=caption,trade_ticket=t.ticket,pin=True,event_type='trade_opened',symbol=t.symbol,side=t.side.value)
    await self.db.log('TRADE_CHART_SENT',t.symbol,ticket=t.ticket)
   except Exception as ex:
    await self.db.log('TRADE_CHART_FAILED',t.symbol,ticket=t.ticket,error=str(ex))
@@ -1335,6 +1350,8 @@ class Engine:
   )
 
  async def manage(self,t,tick,info):
+  account=self.gw.account()
+  account_login=int(getattr(account,'login',0) or 0) if account else 0
   price=tick.bid if t.side==Side.BUY else tick.ask
   # In AI-native mode the AI-selected duration is the hard time horizon.
   age=time.time()-t.opened_at
@@ -1407,15 +1424,16 @@ class Engine:
 
     await self.db.log(
      event,t.symbol,ticket=t.ticket,strategy=t.strategy,
+     account_login=account_login,
      exit_price=exit_price,pnl=pnl,reason=reason
     )
     await self._refresh_strategy_performance(force=True)
     caption=await self._trade_caption(t,pnl=pnl,closed=True)
-    await self.notify(caption,trade_ticket=t.ticket,trade_update=True,trade_result=pnl,trade_result_reason=result_reason)
+    await self.notify(caption,trade_ticket=t.ticket,trade_update=True,trade_result=pnl,trade_result_reason=result_reason,event_type='trade_closed',symbol=t.symbol,side=t.side.value)
    else:
     await self.db.log('POSITION_CLOSED',t.symbol,reason='history_not_found')
     caption=await self._trade_caption(t,pnl=None,closed=True)
-    await self.notify(caption,trade_ticket=t.ticket,trade_update=True)
+    await self.notify(caption,trade_ticket=t.ticket,trade_update=True,event_type='trade_closed',symbol=t.symbol,side=t.side.value)
 
    self.last_close_by_symbol[t.symbol]=time.time()
    self.blocked_signal_by_symbol[t.symbol]=_signal_key(
@@ -1475,6 +1493,11 @@ class Engine:
      spread_reference_points=spread_reference,
      current_spread_points=spread_points,
      target_progress=target_progress,target_progress_pct=target_progress*100.0
+    )
+    await self.notify(
+     f'🛡️ تم تفعيل حماية الربح • {t.symbol}',
+     trade_ticket=t.ticket,event_type='profit_protection',
+     symbol=t.symbol,side=t.side.value,t4bot_only=True
     )
 
    else:

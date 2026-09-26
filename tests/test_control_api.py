@@ -35,6 +35,7 @@ class FakeEngine:
         self.session_profit_limit=0.0
         self.session_start_balance=0.0
         self.session_profit_hit=False
+        self.session_active=False
         self.ai_rr_override=0.0
         self.ai_sl_points_override=0.0
         self.ai_tp_points_override=0.0
@@ -75,7 +76,10 @@ class FakeGateway:
         }
 
     def available_symbols(self):
-        return (SimpleNamespace(name='EURUSD'),)
+        return (SimpleNamespace(name='EURUSD', visible=True),)
+
+    def ranked_symbol_names(self):
+        return ['EURUSD']
 
 
 class FakeDB:

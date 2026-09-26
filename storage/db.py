@@ -89,9 +89,30 @@ class DB:
   return rows
 
 
- async def closed_trades(self,limit=100):
+ async def closed_trades(self,limit=100,account_login=None):
   limit=max(1,min(int(limit),500))
-  rows=await self.recent_audit(min(5000,max(500,limit*20)))
+  try: account_login=int(account_login) if account_login is not None else None
+  except (TypeError,ValueError): account_login=None
+  scan_limit=min(20000,max(1000,limit*8))
+  rows=[]
+  async with aiosqlite.connect(self.path) as d:
+   async with d.execute(
+    """SELECT id,ts,event,symbol,details
+       FROM audit
+       WHERE event IN ('OPEN','TP','SL','PROTECTED_EXIT','TRAILING_EXIT','BREAKEVEN_EXIT','MAX_DURATION_EXIT','POSITION_CLOSED')
+       ORDER BY id DESC LIMIT ?""",
+    (scan_limit,)
+   ) as cur:
+    async for row_id,ts,event,symbol,details in cur:
+     try:
+      parsed=json.loads(details or '{}')
+     except (TypeError,json.JSONDecodeError):
+      parsed={'raw':str(details or '')}
+     rows.append({
+      'id':int(row_id),'ts':float(ts or 0),'event':str(event or ''),
+      'symbol':str(symbol or ''),
+      'details':parsed if isinstance(parsed,dict) else {'value':parsed},
+     })
   opens={}
   closed=[]
   for row in reversed(rows):
@@ -100,9 +121,20 @@ class DB:
    try: ticket=int(ticket)
    except (TypeError,ValueError): ticket=0
    if row.get('event')=='OPEN' and ticket:
-    opens[ticket]=row
+    tagged=details.get('account_login')
+    try: tagged=int(tagged) if tagged is not None else None
+    except (TypeError,ValueError): tagged=None
+    if account_login is None or tagged is None or tagged==account_login:
+     opens[ticket]=row
     continue
-   if row.get('event') not in ('TP','SL','POSITION_CLOSED'):
+   if row.get('event') not in ('TP','SL','PROTECTED_EXIT','TRAILING_EXIT','BREAKEVEN_EXIT','MAX_DURATION_EXIT','POSITION_CLOSED'):
+    continue
+   close_tag=details.get('account_login')
+   try: close_tag=int(close_tag) if close_tag is not None else None
+   except (TypeError,ValueError): close_tag=None
+   if account_login is not None and close_tag is not None and close_tag!=account_login:
+    continue
+   if account_login is not None and ticket and ticket not in opens:
     continue
    opened=opens.get(ticket,{}) if ticket else {}
    open_details=opened.get('details') or {}
