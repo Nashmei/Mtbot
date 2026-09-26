@@ -102,7 +102,6 @@ class AINativeSelector:
    protection=float(o.get("protection_pct",0));trailing=float(o.get("trailing_gap_pct",0))
    duration=float(o.get("expected_duration_minutes",0))
    if sl_price<=0 or tp_price<=0:raise ValueError("invalid AI SL/TP")
-   if not 0.5<=rr<=5.0:raise ValueError("invalid AI R:R")
    if not 15.0<=protection<=80.0:raise ValueError("invalid protection percent")
    if not 2.0<=trailing<=25.0:raise ValueError("invalid trailing gap percent")
    if not 2.0<=duration<=10.0:raise ValueError("invalid expected duration")
