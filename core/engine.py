@@ -785,6 +785,32 @@ class Engine:
      await self._log_reject('AI_PLAN_REJECT',symbol,reason='INVALID_AI_MANAGEMENT')
      return
     sl=round(sl,int(info.digits));tp=round(tp,int(info.digits))
+
+    # Shadow validator: observe plan quality against the fresh MT5 quote without
+    # reducing opportunity count yet. This is telemetry only, not an entry gate.
+    sl_distance=abs(float(price)-float(sl))
+    tp_distance=abs(float(tp)-float(price))
+    shadow_rr=(tp_distance/sl_distance) if sl_distance>0 else 0.0
+    atr_points=float(native_snapshot.get('atr_m5_points',0) or 0)
+    atr_price=atr_points*point
+    shadow_reasons=[]
+    if shadow_rr < 1.50:
+     shadow_reasons.append('POOR_RR')
+    if atr_price>0:
+     if sl_distance < atr_price*0.5: shadow_reasons.append('SL_TIGHT_VS_ATR')
+     if sl_distance > atr_price*5.0: shadow_reasons.append('SL_WIDE_VS_ATR')
+     if tp_distance < atr_price: shadow_reasons.append('TP_CLOSE_VS_ATR')
+     if tp_distance > atr_price*10.0: shadow_reasons.append('TP_FAR_VS_ATR')
+    await self.db.log(
+     'AI_PLAN_SHADOW',symbol,
+     strategy=sig.strategy,side=sig.side.value,
+     snapshot_entry=float(native_snapshot.get('ask') if sig.side==Side.BUY else native_snapshot.get('bid')),
+     fresh_entry=float(price),sl=float(sl),tp=float(tp),
+     actual_rr=float(shadow_rr),atr_m5_points=atr_points,
+     spread_points=float((tick.ask-tick.bid)/point),
+     would_reject=bool(shadow_reasons),reasons=shadow_reasons,
+     mode='observe_only',
+    )
    else:
     sl_points=max(float(sig.sl_points),float(settings.min_sl_points),broker_stop_points+2.0)
     spread_points=max(0.0,(float(tick.ask)-float(tick.bid))/float(info.point))
@@ -1032,6 +1058,20 @@ class Engine:
     )
     await self._handle_invalid_initial_r(symbol,pos,fill,actual_sl)
     return
+
+   # Post-fill shadow check uses the real fill. It never closes/rejects a trade
+   # in observe-only mode; it measures execution drift and realized geometry.
+   post_tp_distance=abs(float(tp)-float(fill))
+   post_rr=(post_tp_distance/actual_initial_r) if actual_initial_r>0 else 0.0
+   await self.db.log(
+    'AI_POST_FILL_SHADOW',symbol,ticket=pos.ticket,
+    strategy=sig.strategy,side=sig.side.value,
+    fill=float(fill),sl=float(actual_sl),tp=float(tp),
+    actual_rr=float(post_rr),
+    would_reject=bool(post_rr<1.50),
+    reasons=(['POOR_RR'] if post_rr<1.50 else []),
+    mode='observe_only',
+   )
 
    self.trades[pos.ticket]=t
    self.trade_alert_meta[pos.ticket]={
