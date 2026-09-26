@@ -68,20 +68,40 @@ class MT5Gateway:
 
     def login(self, login, password, server):
         self._enable_algo_trading()
-        for attempt in range(self.MAX_RETRIES):
+
+        # Reuse an already-authorized terminal session when it is the requested
+        # account. This preserves broker discovery/session state established by
+        # the MT5 terminal itself instead of tearing it down and reconnecting.
+        attached = mt5.initialize(settings.mt5_terminal_path) if settings.mt5_terminal_path else mt5.initialize()
+        if attached:
+            current = mt5.account_info()
+            if current is not None and int(current.login) == int(login):
+                return True, (1, 'Success - existing terminal session'), current
+
+        # Resolve an exact broker server name first. Unknown brokers therefore
+        # behave like MT5's Find Your Broker flow without exposing credentials
+        # to the resolver. The original server name remains the final fallback.
+        from .broker_resolver import resolve_server
+        server_name = str(server).strip()
+        candidates = resolve_server(server_name, timeout=5.0)
+        if server_name and server_name not in candidates:
+            candidates.append(server_name)
+
+        for candidate in candidates:
             mt5.shutdown()
-            kw = {'login': int(login), 'password': password, 'server': server}
+            kw = {
+                'login': int(login),
+                'password': password,
+                'server': candidate,
+                'timeout': 8000,
+            }
             ok = mt5.initialize(settings.mt5_terminal_path, **kw) if settings.mt5_terminal_path else mt5.initialize(**kw)
             if not ok:
-                if attempt < self.MAX_RETRIES - 1:
-                    time.sleep(self.RETRY_DELAY)
                 continue
             a = mt5.account_info()
-            if not a:
-                if attempt < self.MAX_RETRIES - 1:
-                    time.sleep(self.RETRY_DELAY)
-                continue
-            return True, (1, 'Success'), a
+            if a is not None and int(a.login) == int(login):
+                return True, (1, 'Success'), a
+
         return False, mt5.last_error(), None
 
     def account(self):
