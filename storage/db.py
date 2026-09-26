@@ -64,3 +64,63 @@ class DB:
     async for strategy,trades,points,avg_points in cur:
      out[str(strategy)]={'trades':int(trades or 0),'points':float(points or 0),'avg_points':float(avg_points or 0),'window':window}
   return out
+
+
+ async def recent_audit(self,limit=100):
+  limit=max(1,min(int(limit),500))
+  rows=[]
+  async with aiosqlite.connect(self.path) as d:
+   async with d.execute(
+    'SELECT id,ts,event,symbol,details FROM audit ORDER BY id DESC LIMIT ?',
+    (limit,)
+   ) as cur:
+    async for row_id,ts,event,symbol,details in cur:
+     try:
+      parsed=json.loads(details or '{}')
+     except (TypeError,json.JSONDecodeError):
+      parsed={'raw':str(details or '')}
+     rows.append({
+      'id':int(row_id),
+      'ts':float(ts or 0),
+      'event':str(event or ''),
+      'symbol':str(symbol or ''),
+      'details':parsed if isinstance(parsed,dict) else {'value':parsed},
+     })
+  return rows
+
+
+ async def closed_trades(self,limit=100):
+  limit=max(1,min(int(limit),500))
+  rows=await self.recent_audit(min(5000,max(500,limit*20)))
+  opens={}
+  closed=[]
+  for row in reversed(rows):
+   details=row.get('details') or {}
+   ticket=details.get('ticket')
+   try: ticket=int(ticket)
+   except (TypeError,ValueError): ticket=0
+   if row.get('event')=='OPEN' and ticket:
+    opens[ticket]=row
+    continue
+   if row.get('event') not in ('TP','SL','POSITION_CLOSED'):
+    continue
+   opened=opens.get(ticket,{}) if ticket else {}
+   open_details=opened.get('details') or {}
+   closed.append({
+    'id':int(row.get('id') or 0),
+    'ticket':ticket,
+    'symbol':str(row.get('symbol') or opened.get('symbol') or ''),
+    'side':str(open_details.get('side') or ''),
+    'strategy':str(open_details.get('strategy') or ''),
+    'opened_at':float(opened.get('ts') or 0),
+    'closed_at':float(row.get('ts') or 0),
+    'entry':float(open_details.get('entry') or 0),
+    'exit':float(details.get('exit_price') or 0),
+    'sl':float(open_details.get('sl') or 0),
+    'tp':float(open_details.get('tp') or 0),
+    'volume':float(open_details.get('volume') or 0),
+    'pnl':float(details.get('pnl') or 0),
+    'result':str(row.get('event') or ''),
+    'reason':str(details.get('reason') or ''),
+   })
+  return list(reversed(closed[-limit:]))
