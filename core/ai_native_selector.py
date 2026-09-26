@@ -105,7 +105,9 @@ class AINativeSelector:
    if not 15.0<=protection<=80.0:raise ValueError("invalid protection percent")
    if not 2.0<=trailing<=25.0:raise ValueError("invalid trailing gap percent")
    if not 2.0<=duration<=10.0:raise ValueError("invalid expected duration")
-  else:\n   if reason_code not in no_trade_codes:raise ValueError("invalid NO_TRADE reason_code")\n   s="NONE";sid="none";sl_price=0.0;tp_price=0.0;protection=0.0;trailing=0.0;duration=0.0
+  else:
+   if reason_code not in no_trade_codes:raise ValueError("invalid NO_TRADE reason_code")
+   s="NONE";sid="none";sl_price=0.0;tp_price=0.0;protection=0.0;trailing=0.0;duration=0.0
   return {"decision":d,"side":s,"strategy_id":sid,"confidence":c,"regime":reg,"sl_price":sl_price,"tp_price":tp_price,"protection_pct":protection,"trailing_gap_pct":trailing,"expected_duration_minutes":duration,
    "research_required":bool(o.get("research_required",False)),"research_query":str(o.get("research_query",""))[:160],
    "reason_code":reason_code[:80],"reason":str(o.get("reason",""))[:160]}
