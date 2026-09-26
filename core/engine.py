@@ -534,6 +534,41 @@ class Engine:
   self.reject_log_at[key]=now
   await self.db.log(event,symbol,**details)
 
+ def _native_snapshot(self,symbol,account,info,tick,ticks,m1,m5,m15,h1):
+  snap=self.ai_native.snapshot(symbol,tick,info,ticks,m1,m5,m15,h1,self.strategy_performance)
+  snap['account_context']={
+   'balance':float(getattr(account,'balance',0) or 0),'equity':float(getattr(account,'equity',0) or 0),
+   'used_margin':float(getattr(account,'margin',0) or 0),'free_margin':float(getattr(account,'margin_free',0) or 0),
+   'margin_level_pct':float(getattr(account,'margin_level',0) or 0),'leverage':int(getattr(account,'leverage',0) or 0),
+   'currency':str(getattr(account,'currency','') or ''),'open_bot_positions':len(self.trades),
+  }
+  snap['telegram_settings']={
+   'risk_pct':float(self.risk_pct),'rr':float(self.rr),'min_confidence_pct':float(self.min_confidence),
+   'protection_pct':float(self.protection_pct),'trailing_gap_pct':float(self.trailing_gap_pct),
+   'max_trade_minutes':float(self.max_trade_minutes),'max_positions':int(self.max_positions),
+   'max_consecutive_losses':int(self.max_consecutive_losses),'consecutive_losses':int(self.consecutive_losses),
+   'daily_loss_limit_pct':float(self.daily_loss_limit_pct),'session_profit_limit':float(self.session_profit_limit),
+   'manual_overrides':{'rr':float(self.ai_rr_override),'sl_points':float(self.ai_sl_points_override),
+    'tp_points':float(self.ai_tp_points_override),'protection_pct':float(self.ai_protection_override),
+    'trailing_gap_pct':float(self.ai_trailing_override),'duration_minutes':float(self.ai_duration_override),
+    'rule':'0 means AI decides; positive value is a hard user override'},
+  }
+  return snap
+
+ async def analyze_symbol(self,symbol):
+  account=self.gw.account();info=self.gw.info(symbol);tick=self.gw.tick(symbol)
+  if not account or not info or not tick or not info.point or tick.bid<=0 or tick.ask<=tick.bid:return None,'INVALID_MARKET_DATA'
+  ticks=self.gw.ticks(symbol)
+  if ticks is None or len(ticks)<40:return None,'INSUFFICIENT_TICKS'
+  latest=float(ticks['time_msc'][-1])/1000.0 if 'time_msc' in ticks.dtype.names else float(ticks['time'][-1])
+  if abs(time.time()-latest)>settings.max_tick_age_seconds:return None,'STALE_TICKS'
+  m5=self.gw.rates_m5(symbol,200);m1=self.gw.rates_m1(symbol,300);m15=self.gw.rates_m15(symbol,200);h1=self.gw.rates_h1(symbol,200)
+  snap=self._native_snapshot(symbol,account,info,tick,ticks,m1,m5,m15,h1)
+  decision=await self.ai_native.decide(symbol,snap,consume_signal=False)
+  if decision.get('decision')=='SIGNAL' and float(decision.get('confidence',0))<float(self.min_confidence):
+   decision=dict(decision);decision.update({'decision':'NO_TRADE','reason_code':'CONFIDENCE_REJECT','reason':'Signal confidence below account threshold'})
+  return decision,None
+
  async def _scan_symbol(self,symbol,account):
    # صفقة واحدة كحد أقصى لكل رمز
    if any(t.symbol==symbol for t in self.trades.values()):return
@@ -589,40 +624,8 @@ class Engine:
    if self.ai_native_only:
     # Experimental isolation: old executable strategies/ranker are disabled.
     # AI creates the bounded signal directly from raw market context.
-    native_snapshot=self.ai_native.snapshot(
-     symbol,tick,info,ticks,m1,m5,m15,h1,self.strategy_performance
-    )
-    # Give the AI read-only account state and the exact Telegram-managed settings.
-    # Deterministic risk/margin/execution checks remain authoritative.
-    native_snapshot['account_context']={
-     'balance':float(getattr(account,'balance',0) or 0),
-     'equity':float(getattr(account,'equity',0) or 0),
-     'used_margin':float(getattr(account,'margin',0) or 0),
-     'free_margin':float(getattr(account,'margin_free',0) or 0),
-     'margin_level_pct':float(getattr(account,'margin_level',0) or 0),
-     'leverage':int(getattr(account,'leverage',0) or 0),
-     'currency':str(getattr(account,'currency','') or ''),
-     'open_bot_positions':len(self.trades),
-    }
-    native_snapshot['telegram_settings']={
-     'risk_pct':float(self.risk_pct),
-     'rr':float(self.rr),
-     'min_confidence_pct':float(self.min_confidence),
-     'protection_pct':float(self.protection_pct),
-     'trailing_gap_pct':float(self.trailing_gap_pct),
-     'max_trade_minutes':float(self.max_trade_minutes),
-     'max_positions':int(self.max_positions),
-     'max_consecutive_losses':int(self.max_consecutive_losses),
-     'consecutive_losses':int(self.consecutive_losses),
-     'daily_loss_limit_pct':float(self.daily_loss_limit_pct),
-     'session_profit_limit':float(self.session_profit_limit),
-     'manual_overrides':{
-      'rr':float(self.ai_rr_override),'sl_points':float(self.ai_sl_points_override),
-      'tp_points':float(self.ai_tp_points_override),'protection_pct':float(self.ai_protection_override),
-      'trailing_gap_pct':float(self.ai_trailing_override),'duration_minutes':float(self.ai_duration_override),
-      'rule':'0 means AI decides; positive value is a hard user override',
-     },
-    }
+    # Preview and executable scans share this exact market/account/settings snapshot.
+    native_snapshot=self._native_snapshot(symbol,account,info,tick,ticks,m1,m5,m15,h1)
     native_decision=await self.ai_native.decide(symbol,native_snapshot)
     if native_decision.get('research_required'):
      research=await self.web_research.search(
@@ -1123,7 +1126,7 @@ class Engine:
    # Post-fill shadow check uses the real fill. It never closes/rejects a trade
    # in observe-only mode; it measures execution drift and realized geometry.
    post_tp_distance=abs(float(tp)-float(fill))
-   post_rr=(post_tp_distance/actual_initial_r) if actual_initial_r>0 else 0.0
+   post_rr=(post_tp_distance/initial_r) if initial_r>0 else 0.0
    await self.db.log(
     'AI_POST_FILL_SHADOW',symbol,ticket=pos.ticket,
     strategy=sig.strategy,side=sig.side.value,

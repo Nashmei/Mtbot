@@ -1,20 +1,52 @@
-import aiosqlite, json, time
+import asyncio, aiosqlite, json, time
 from pathlib import Path
 class DB:
- def __init__(self,path): self.path=path
+ def __init__(self,path):
+  self.path=path
+  self._write_lock=asyncio.Lock()
+
+ async def _connect(self):
+  d=await aiosqlite.connect(self.path,timeout=5.0)
+  await d.execute('PRAGMA busy_timeout=5000')
+  await d.execute('PRAGMA foreign_keys=ON')
+  return d
+
  async def init(self):
   Path(self.path).parent.mkdir(parents=True,exist_ok=True)
-  async with aiosqlite.connect(self.path) as d:
-   await d.executescript('''CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,ts REAL,event TEXT,symbol TEXT,details TEXT); CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT);'''); await d.commit()
+  d=await self._connect()
+  try:
+   await d.execute('PRAGMA journal_mode=WAL')
+   await d.execute('PRAGMA synchronous=NORMAL')
+   await d.executescript('''CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,ts REAL,event TEXT,symbol TEXT,details TEXT); CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT);''')
+   await d.commit()
+  finally:
+   await d.close()
+
  async def log(self,event,symbol='',**details):
-  async with aiosqlite.connect(self.path) as d:
-   await d.execute('INSERT INTO audit(ts,event,symbol,details) VALUES(?,?,?,?)',(time.time(),event,symbol,json.dumps(details,ensure_ascii=False,default=str))); await d.commit()
+  async with self._write_lock:
+   d=await self._connect()
+   try:
+    await d.execute('INSERT INTO audit(ts,event,symbol,details) VALUES(?,?,?,?)',(time.time(),event,symbol,json.dumps(details,ensure_ascii=False,default=str)))
+    await d.commit()
+   finally:
+    await d.close()
+
  async def set(self,k,v):
-  async with aiosqlite.connect(self.path) as d: await d.execute('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)',(k,str(v))); await d.commit()
+  async with self._write_lock:
+   d=await self._connect()
+   try:
+    await d.execute('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)',(k,str(v)))
+    await d.commit()
+   finally:
+    await d.close()
+
  async def get(self,k,default=None):
-  async with aiosqlite.connect(self.path) as d:
+  d=await self._connect()
+  try:
    async with d.execute('SELECT value FROM settings WHERE key=?',(k,)) as c:
     r=await c.fetchone(); return r[0] if r else default
+  finally:
+   await d.close()
 
  async def reset_strategy_performance(self,at_ts=None):
   reset_ts=float(time.time() if at_ts is None else at_ts)
@@ -59,17 +91,21 @@ class DB:
   SELECT strategy,COUNT(*),COALESCE(SUM(points),0),COALESCE(AVG(points),0)
   FROM scored WHERE rn<=? GROUP BY strategy"""
   out={}
-  async with aiosqlite.connect(self.path) as d:
+  d=await self._connect()
+  try:
    async with d.execute(sql,(reset_ts,window)) as cur:
     async for strategy,trades,points,avg_points in cur:
      out[str(strategy)]={'trades':int(trades or 0),'points':float(points or 0),'avg_points':float(avg_points or 0),'window':window}
+  finally:
+   await d.close()
   return out
 
 
  async def recent_audit(self,limit=100):
   limit=max(1,min(int(limit),500))
   rows=[]
-  async with aiosqlite.connect(self.path) as d:
+  d=await self._connect()
+  try:
    async with d.execute(
     'SELECT id,ts,event,symbol,details FROM audit ORDER BY id DESC LIMIT ?',
     (limit,)
@@ -86,6 +122,8 @@ class DB:
       'symbol':str(symbol or ''),
       'details':parsed if isinstance(parsed,dict) else {'value':parsed},
      })
+  finally:
+   await d.close()
   return rows
 
 
@@ -95,7 +133,8 @@ class DB:
   except (TypeError,ValueError): account_login=None
   scan_limit=min(20000,max(1000,limit*8))
   rows=[]
-  async with aiosqlite.connect(self.path) as d:
+  d=await self._connect()
+  try:
    async with d.execute(
     """SELECT id,ts,event,symbol,details
        FROM audit
@@ -113,6 +152,8 @@ class DB:
       'symbol':str(symbol or ''),
       'details':parsed if isinstance(parsed,dict) else {'value':parsed},
      })
+  finally:
+   await d.close()
   opens={}
   closed=[]
   for row in reversed(rows):

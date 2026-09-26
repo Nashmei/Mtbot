@@ -248,30 +248,14 @@ class TelegramUI:
      if abs(time.time()-tick_ts)>settings.max_tick_age_seconds:
       lines.append(f'\n💱 {symbol}\n⚠️ آخر سعر قديم؛ لا توجد إشارة صالحة الآن.')
       continue
-     reg,sig,meta=self.e.an.analyze(ticks,i.point,self.e.gw.rates_m5(symbol,200),symbol=symbol,rates_m15=self.e.gw.rates_m15(symbol,200),rates_h1=self.e.gw.rates_h1(symbol,200),rates_m1=self.e.gw.rates_m1(symbol,200),strategy_performance=self.e.strategy_performance,min_confidence=self.e.min_confidence)
-     if sig:
-      direction='شراء 🟢' if sig.side.value=='BUY' else 'بيع 🔴'
-      lines.append(f'\n💱 {symbol}\n📌 الإشارة: {direction}\n🧠 الاستراتيجية: {sig.strategy}\n🎯 قوة الإشارة: {sig.confidence*100:.0f}%\n📊 السوق: {reg.value}')
+     decision,error=await self.e.analyze_symbol(symbol)
+     if error:
+      lines.append(f'\n💱 {symbol}\n⚠️ التحليل غير متاح: {error}')
+     elif decision.get('decision')=='SIGNAL':
+      direction='شراء 🟢' if decision.get('side')=='BUY' else 'بيع 🔴'
+      lines.append(f"\n💱 {symbol}\n📌 الإشارة: {direction}\n🧠 الاستراتيجية: {decision.get('strategy_id')}\n🎯 قوة الإشارة: {decision.get('confidence',0):.0f}%\n📊 السوق: {decision.get('regime','UNKNOWN')}\n🔎 السبب: {decision.get('reason','')}")
      else:
-      reason=str(meta.get('decision','waiting'))
-      labels={'waiting_live_momentum':'انتظار زخم لحظي','waiting_momentum':'انتظار تأكيد الزخم','volatile_no_direction':'حركة قوية بلا اتجاه','direction_not_confirmed':'الاتجاه غير مؤكد'}
-      lines.append(f'\n💱 {symbol}\n⚪ لا توجد فرصة حالياً\n📊 السوق: {reg.value}\n🔎 السبب: {labels.get(reason,reason)}')
-      checks=meta.get('gold_checks') if reason=='gold_wait_confirmation' else meta.get('trend_checks')
-      if checks:
-       check_labels={'gap':'Micro gap','momentum':'الزخم','acceleration':'التسارع','pullback':'Pullback','htf':'M15/H1','direction':'الاتجاه اللحظي','expansion_range':'مدى التوسع','range_floor':'الحد الأدنى للمدى'}
-       detail=['   '+('✅' if ok else '❌')+' '+check_labels.get(name,name) for name,ok in checks.items()]
-       lines[-1]+='\n🧩 شروط الدخول:\n'+'\n'.join(detail)
-       values=meta.get('gold_values') if reason=='gold_wait_confirmation' else meta.get('trend_values')
-       if values:
-        bias_name=lambda v: 'BUY' if v>0 else ('SELL' if v<0 else 'NEUTRAL')
-        if reason=='gold_wait_confirmation':
-         lines[-1]+=(f"\n📐 القيم: Gap {values['micro_gap']}/{values['gap_min']} | Momentum {values['momentum']} (|{values['momentum_abs']}|/{values['momentum_min']}) | Accel {values['acceleration']} (|{values['acceleration_abs']}|/{values['acceleration_min']})\n"
-                     f"   Range {values['tick_range']}/{values['expansion_range_min']} | Floor {values['expansion_range_floor']} | Score {values['confirmation_score']}/{values['confirmation_required']}\n"
-                     f"   Score {values['confirmation_score']}/{values['confirmation_required']} | Side {values['side']} | M15 {bias_name(values['m15_bias'])} | H1 {bias_name(values['h1_bias'])}")
-        else:
-         lines[-1]+=(f"\n📐 القيم: Gap {values['micro_gap']}/{values['momentum_min']} | Momentum {values['momentum']} (|{values['momentum_abs']}|/{values['momentum_min']}) | Accel {values['acceleration']} (|{values['acceleration_abs']}|/{values['acceleration_min']})\n"
-                     f"   Pullback distance {values['pullback_distance_points']}pt | tolerance {values['pullback_tolerance_points']}pt | Live {values['live']} | EMA20 {values['ema20_m5']}\n"
-                     f"   Side {values['side']} | M15 {bias_name(values['m15_bias'])} | H1 {bias_name(values['h1_bias'])}")
+      lines.append(f"\n💱 {symbol}\n⚪ لا توجد فرصة حالياً\n📊 السوق: {decision.get('regime','NO_TRADE')}\n🔎 السبب: {decision.get('reason_code') or decision.get('reason','NO_TRADE')}")
     msg='\n'.join(lines)
   elif x=='symbols':
    names=self.e.gw.ranked_symbol_names()

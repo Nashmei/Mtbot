@@ -67,7 +67,8 @@ class MarketSafetyTests(unittest.TestCase):
         now = int(time.time())
         dtype = [("time", "i8"), ("bid", "f8"), ("ask", "f8")]
         samples = np.array([(now - 99 + i, 1.0, 1.1) for i in range(100)], dtype=dtype)
-        with patch.object(fake_mt5, "copy_ticks_range", return_value=samples, create=True) as get:
+        with patch.object(fake_mt5, "symbol_info", return_value=types.SimpleNamespace(point=0.00001, visible=True), create=True), \
+             patch.object(fake_mt5, "copy_ticks_range", return_value=samples, create=True) as get:
             result = MT5Gateway().ticks("EURUSD", 30)
         self.assertEqual(len(result), 30)
         self.assertEqual(result["time"][-1], now)
@@ -286,6 +287,8 @@ class MarketSafetyTests(unittest.TestCase):
         class Gateway:
             def __init__(self):
                 self.close_calls = 0
+            def account(self):
+                return types.SimpleNamespace(trade_mode=0, login=123, equity=1000, balance=1000, currency="USD")
             def position_by_ticket(self, ticket):
                 return position
             def close(self, pos):
@@ -307,7 +310,7 @@ class MarketSafetyTests(unittest.TestCase):
                 confidence=.80,reason='',volume=.1,protection_pct=45.0,
                 trailing_gap_pct=5.0,protection_45_active=True,trailing=True,
                 best_favorable_price=1.11000,last_progress_at=time.time()-300,
-                signal_bar=0,
+                signal_bar=0,expected_duration_minutes=10,
             )
             # Use the real Side enum so manage() follows the BUY path.
             from core.models import Side
@@ -423,6 +426,8 @@ class MarketSafetyTests(unittest.TestCase):
         class Gateway:
             def __init__(self):
                 self.lookups = 0
+            def account(self):
+                return types.SimpleNamespace(trade_mode=0, login=123, equity=1000, balance=1000, currency="USD")
             def position_by_ticket(self, ticket):
                 self.lookups += 1
                 return position if self.lookups == 1 else remaining

@@ -430,38 +430,22 @@ class ControlAPI:
                 self._analysis_cache[symbol] = row
                 continue
 
-            regime, signal, meta = self.engine.an.analyze(
-                ticks,
-                info.point,
-                self.gateway.rates_m5(symbol, 200),
-                symbol=symbol,
-                rates_m15=self.gateway.rates_m15(symbol, 200),
-                rates_h1=self.gateway.rates_h1(symbol, 200),
-                rates_m1=self.gateway.rates_m1(symbol, 200),
-                strategy_performance=self.engine.strategy_performance,
-                min_confidence=self.engine.min_confidence,
-            )
-
-            if signal:
+            decision, error = await self.engine.analyze_symbol(symbol)
+            if error:
+                row = self._analysis_unavailable(symbol, error.lower(), updated_at)
+            elif decision.get('decision') == 'SIGNAL':
                 row = {
-                    'symbol': symbol,
-                    'regime': regime.value,
-                    'state': 'signal',
-                    'side': signal.side.value,
-                    'strategy': signal.strategy,
-                    'confidence': self._number(signal.confidence),
-                    'reason': signal.reason,
-                    'updated_at': updated_at,
+                    'symbol': symbol, 'regime': decision.get('regime', 'UNKNOWN'), 'state': 'signal',
+                    'side': decision.get('side'), 'strategy': decision.get('strategy_id'),
+                    'confidence': self._number(float(decision.get('confidence', 0)) / 100.0),
+                    'reason': decision.get('reason', ''), 'updated_at': updated_at,
                 }
             else:
                 row = {
-                    'symbol': symbol,
-                    'regime': regime.value,
-                    'state': 'no_signal',
-                    'side': None,
-                    'strategy': None,
-                    'confidence': None,
-                    'reason': str(meta.get('decision', 'waiting')),
+                    'symbol': symbol, 'regime': decision.get('regime', 'NO_TRADE'), 'state': 'no_signal',
+                    'side': None, 'strategy': None,
+                    'confidence': self._number(float(decision.get('confidence', 0)) / 100.0),
+                    'reason': decision.get('reason_code') or decision.get('reason', 'NO_TRADE'),
                     'updated_at': updated_at,
                 }
 

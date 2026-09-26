@@ -48,6 +48,7 @@ class AINativeSelector:
   self.max_backoff=float(os.getenv("MTBOT_AI_NATIVE_MAX_BACKOFF","120"))
   self._last_symbol_call={}
   self._cache={}
+  self._consumed_signal_keys=set()
   self._global_lock=asyncio.Lock()
   self._last_global_call=0.0
   self._backoff_until=0.0
@@ -132,20 +133,20 @@ class AINativeSelector:
   out={"decision":"NO_TRADE","confidence":100,"reason_code":code,"reason":reason}
   out.update(extra);return out
 
- async def decide(self,symbol,snap):
+ async def decide(self,symbol,snap,consume_signal=True):
   if not self.key:
    out=self._no_trade("AI_UNAVAILABLE","NVIDIA_API_KEY missing")
    await self.db.log("AI_NATIVE_UNAVAILABLE",symbol,**out)
    return out
 
-  now=time.monotonic();key=self._snapshot_key(snap);cached=self._cache.get(symbol)
+  now=time.monotonic();key=self._snapshot_key(snap);cache_key=(symbol,key);cached=self._cache.get(symbol)
   if cached and cached[0]==key:
-   # Cache NO_TRADE only. A SIGNAL is single-use: replaying it on every scan can
-   # repeatedly hit execution/margin gates even though the scalp entry is stale.
-   if cached[1].get("decision")!="SIGNAL":
-    out=dict(cached[1]);out["cached"]=True
-    return out
-   return self._no_trade("AI_SIGNAL_ALREADY_CONSUMED","Cached scalp signal already consumed; wait for a fresh market snapshot")
+   out=dict(cached[1]);out["cached"]=True
+   if out.get("decision")!="SIGNAL":return out
+   if cache_key in self._consumed_signal_keys:
+    return self._no_trade("AI_SIGNAL_ALREADY_CONSUMED","Cached scalp signal already consumed; wait for a fresh market snapshot")
+   if consume_signal:self._consumed_signal_keys.add(cache_key)
+   return out
   since=now-self._last_symbol_call.get(symbol,0.0)
   if since<self.min_interval:
    return self._no_trade("AI_RATE_LIMIT_LOCAL","Per-symbol AI cooldown",retry_after_seconds=round(self.min_interval-since,1))
@@ -166,6 +167,7 @@ class AINativeSelector:
     if o["decision"]=="SIGNAL" and o["confidence"]<self.min_conf:
      o.update({"decision":"NO_TRADE","reason_code":"AI_LOW_CONFIDENCE","reason":"AI-native confidence below threshold"})
     self._cache[symbol]=(key,dict(o))
+    if o.get("decision")=="SIGNAL" and consume_signal:self._consumed_signal_keys.add(cache_key)
     await self.db.log("AI_NATIVE_DECISION",symbol,**o,usage=u)
     return o
    except urllib.error.HTTPError as ex:
