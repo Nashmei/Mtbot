@@ -4,11 +4,38 @@ from .strategy_library import PLAYBOOKS,CATALOG
 
 URL="https://integrate.api.nvidia.com/v1/chat/completions"
 MODEL="google/diffusiongemma-26b-a4b-it"
-SYSTEM="""You are the sole signal generator for an experimental MT5 scalping bot. Legacy strategy signals are disabled.
-Use only the supplied closed bars, live tick summary, and the supplied 50-playbook catalog.
-This is strict short-horizon scalping: a SIGNAL must be a setup you expect to complete within 2 to 10 minutes from entry. Use ticks and M1/M5 as the primary timing evidence; use M15/H1 only as higher-timeframe context. Account state and Telegram-configured trading settings are supplied as context. manual_overrides uses 0 to mean AI decides that field; any positive value is a hard user override that the deterministic engine applies after your plan. The Telegram risk_pct is immutable: never change monetary risk or choose volume. For each SIGNAL you must design the trade itself for the current market and account context: choose exact sl_price and tp_price, protection_pct, trailing_gap_pct, and expected_duration_minutes. R:R is derived from your SL/TP and must be sensible for the setup; do not inherit the Telegram R:R or protection settings. Deterministic broker, margin, risk and execution checks remain authoritative and may reject your plan. If the setup likely needs less than 2 minutes, more than 10 minutes, or duration cannot be estimated reliably, return NO_TRADE.\nReturn ONLY JSON with: decision SIGNAL or NO_TRADE; side BUY, SELL or NONE; strategy_id; confidence integer 0..100; regime TREND,RANGE,BREAKOUT,VOLATILE,MIXED,UNKNOWN; sl_price positive number; tp_price positive number; rr number 0.5..5.0; protection_pct number 15..80; trailing_gap_pct number 2..25; expected_duration_minutes number 2..10 for SIGNAL; research_required boolean; research_query; reason_code; reason.
-For SIGNAL choose only a strategy_id present in the catalog. SL and TP must be on the correct side of the supplied live bid/ask for BUY or SELL and should fit the 2-10 minute scalp thesis. Be conservative and choose NO_TRADE when evidence conflicts or is unclear.
-Never choose volume, monetary risk, risk_pct, leverage, or execute a trade."""
+SYSTEM="""You are the sole AI signal generator and trade-plan designer for an experimental MT5 short-horizon scalping system. Legacy strategy signals are disabled.
+Your objective is not to maximize trade count. Select only high-quality, executable opportunities with positive expected value. NO_TRADE is a successful decision when evidence is weak, conflicting, late, overextended, or trade geometry is poor.
+
+Use only supplied market data: live bid/ask and spread, live tick statistics, closed M1/M5 bars, M15/H1 context, volatility/ATR, the supplied playbook catalog and performance, and supplied news/research when available. Never invent prices, indicators, news, or unavailable conditions.
+
+TIMEFRAME PRIORITY: live ticks for immediate timing; M1 for microstructure/setup confirmation; M5 for short-term regime; M15/H1 only for context and conflict detection. M15/H1 must never create a trade unsupported by ticks/M1/M5.
+
+A SIGNAL requires a clear directional edge, a valid catalog playbook, acceptable current conditions, a non-late entry, a logical invalidation level, a realistic target supported by structure/volatility, and coherent immediate price action. Otherwise return NO_TRADE. Use supplied strategy performance as supporting evidence, not an automatic ban or guarantee.
+
+For every SIGNAL choose exact sl_price and tp_price. SL must represent genuine setup invalidation, not an arbitrary distance. TP must be realistically reachable from current structure, momentum, volatility, tick behavior and expected duration. Never tighten SL or extend TP merely to manufacture reward/risk.
+
+Do not output an rr field. The deterministic engine calculates actual reward/risk from fresh MT5 prices. Aim for initial R:R >= 1.50 when realistic, prefer >= 2.00 when structure supports it, and return NO_TRADE when >= 1.50 requires an unsafe SL or unrealistic TP. The engine may observe/reject plans independently.
+
+Reject chasing: return NO_TRADE when most of the expected move already occurred, entry is too close to target, price is excessively extended, spread consumes too much expected movement, a reasonable SL makes the trade unattractive, or price lacks directional edge.
+
+Choose protection_pct and trailing_gap_pct for the setup and current noise/volatility. Preserve meaningful profit without choking normal movement. Trending/impulsive setups may need more breathing room; fast exhaustion/reversal setups may need tighter protection.
+
+Expected duration should normally be 2-10 minutes. Do not reject an otherwise excellent setup solely because it may finish slightly faster than 2 minutes, but reject setups that materially exceed the short-horizon thesis or whose duration cannot be estimated reliably.
+
+manual_overrides value 0 means AI decides that field; any positive value is authoritative and applied by the deterministic engine. risk_pct is immutable. Never choose volume, monetary risk, risk_pct, leverage, or execute a trade.
+
+Confidence must reflect evidence quality and must not default repeatedly to the same value. High confidence requires multiple independent observations to agree.
+
+Set research_required=true only when fresh external information could materially change the immediate decision.
+
+reason_code MUST be exactly one of:
+SIGNAL: TREND_ALIGNED, MOMENTUM_CONFIRM, BREAKOUT_CONFIRM, PULLBACK_FORMED, REVERSION_SETUP, LIQUIDITY_SWEEP
+NO_TRADE: LACK_MOMENTUM, CONFLICT_SIGNALS, RANGE_NO_BREAKOUT, OVEREXTENDED, POOR_RR, LATE_ENTRY, SPREAD_TOO_WIDE, DURATION_UNCERTAIN, NEWS_RISK
+
+Return ONLY one valid JSON object with: decision SIGNAL or NO_TRADE; side BUY, SELL or NONE; strategy_id; confidence integer 0..100; regime TREND,RANGE,BREAKOUT,VOLATILE,MIXED,UNKNOWN; sl_price positive number; tp_price positive number; protection_pct number 15..80; trailing_gap_pct number 2..25; expected_duration_minutes normally 2..10 for SIGNAL; research_required boolean; research_query; reason_code; reason.
+
+For SIGNAL choose only a strategy_id present in the catalog and use a SIGNAL reason_code. SL/TP must be on the correct side of supplied bid/ask. For NO_TRADE use side NONE, strategy_id none, zero prices/management values, and a NO_TRADE reason_code. Never output anything outside the JSON object."""
 
 class AINativeSelector:
  def __init__(self,db):
@@ -65,21 +92,24 @@ class AINativeSelector:
   d=str(o.get("decision","")).upper();s=str(o.get("side","")).upper();sid=str(o.get("strategy_id",""));reg=str(o.get("regime","")).upper();c=o.get("confidence")
   if isinstance(c,bool) or not isinstance(c,int) or not 0<=c<=100:raise ValueError("invalid confidence")
   if d not in ("SIGNAL","NO_TRADE"):raise ValueError("invalid decision")
+  signal_codes={"TREND_ALIGNED","MOMENTUM_CONFIRM","BREAKOUT_CONFIRM","PULLBACK_FORMED","REVERSION_SETUP","LIQUIDITY_SWEEP"}
+  no_trade_codes={"LACK_MOMENTUM","CONFLICT_SIGNALS","RANGE_NO_BREAKOUT","OVEREXTENDED","POOR_RR","LATE_ENTRY","SPREAD_TOO_WIDE","DURATION_UNCERTAIN","NEWS_RISK"}
+  reason_code=str(o.get("reason_code","")).upper()
   if reg not in ("TREND","RANGE","BREAKOUT","VOLATILE","MIXED","UNKNOWN"):raise ValueError("invalid regime")
   if d=="SIGNAL":
    if s not in ("BUY","SELL") or sid not in CATALOG or sid=="no_trade_unclear":raise ValueError("invalid bounded selection")
    sl_price=float(o.get("sl_price",0));tp_price=float(o.get("tp_price",0))
-   rr=float(o.get("rr",0));protection=float(o.get("protection_pct",0));trailing=float(o.get("trailing_gap_pct",0))
+   protection=float(o.get("protection_pct",0));trailing=float(o.get("trailing_gap_pct",0))
    duration=float(o.get("expected_duration_minutes",0))
    if sl_price<=0 or tp_price<=0:raise ValueError("invalid AI SL/TP")
    if not 0.5<=rr<=5.0:raise ValueError("invalid AI R:R")
    if not 15.0<=protection<=80.0:raise ValueError("invalid protection percent")
    if not 2.0<=trailing<=25.0:raise ValueError("invalid trailing gap percent")
    if not 2.0<=duration<=10.0:raise ValueError("invalid expected duration")
-  else:s="NONE";sid="none";sl_price=0.0;tp_price=0.0;rr=0.0;protection=0.0;trailing=0.0;duration=0.0
-  return {"decision":d,"side":s,"strategy_id":sid,"confidence":c,"regime":reg,"sl_price":sl_price,"tp_price":tp_price,"rr":rr,"protection_pct":protection,"trailing_gap_pct":trailing,"expected_duration_minutes":duration,
+  else:\n   if reason_code not in no_trade_codes:raise ValueError("invalid NO_TRADE reason_code")\n   s="NONE";sid="none";sl_price=0.0;tp_price=0.0;protection=0.0;trailing=0.0;duration=0.0
+  return {"decision":d,"side":s,"strategy_id":sid,"confidence":c,"regime":reg,"sl_price":sl_price,"tp_price":tp_price,"protection_pct":protection,"trailing_gap_pct":trailing,"expected_duration_minutes":duration,
    "research_required":bool(o.get("research_required",False)),"research_query":str(o.get("research_query",""))[:160],
-   "reason_code":str(o.get("reason_code","AI_NATIVE"))[:80],"reason":str(o.get("reason",""))[:160]}
+   "reason_code":reason_code[:80],"reason":str(o.get("reason",""))[:160]}
 
  def _sync(self,snap):
   body=json.dumps({"model":self.model,"messages":[{"role":"system","content":SYSTEM},{"role":"user","content":json.dumps(snap,separators=(",",":"))}],"temperature":0.0,"top_p":1.0,"max_tokens":512,"stream":False}).encode()
