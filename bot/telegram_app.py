@@ -434,10 +434,25 @@ class TelegramUI:
   if st.get('step')=='block':
    import re,asyncio
    fields={}
-   pattern=re.compile(r'(?is)\b(server|login|password)\s*[:=]\s*(.*?)(?=\s+\b(?:server|login|password)\s*[:=]|$)')
-   for m in pattern.finditer(value): fields[m.group(1).lower()]=m.group(2).strip()
+   labels={'server':'server','سيرفر':'server','الخادم':'server','خادم':'server','login':'login','لوقن':'login','دخول':'login','الحساب':'login','حساب':'login','password':'password','pass':'password','باسورد':'password','كلمة المرور':'password'}
+   label_alt='|'.join(sorted((re.escape(k) for k in labels),key=len,reverse=True))
+   pattern=re.compile(rf'(?is)(?<!\w)({label_alt})\s*[:=\-]?\s*(.*?)(?=\s+(?:{label_alt})\s*[:=\-]?|$)')
+   for m in pattern.finditer(value):
+    key=labels[m.group(1).lower().strip()];val=m.group(2).strip()
+    if val:fields[key]=val
+   if len(fields)<3:
+    lines=[x.strip() for x in value.splitlines() if x.strip()]
+    if len(lines)==3 and not fields:
+     numeric=[(i,x) for i,x in enumerate(lines) if x.isdigit()]
+     if len(numeric)==1:
+      li,login=numeric[0]
+      remaining=[(i,x) for i,x in enumerate(lines) if i!=li]
+      server_item=next(((i,x) for i,x in remaining if any(c.isalpha() for c in x) and ('-' in x or 'demo' in x.lower() or 'real' in x.lower())),remaining[0])
+      server=server_item[1]
+      secret=next(x for i,x in remaining if i!=server_item[0])
+      fields={'server':server,'login':login,'password':secret}
    login=fields.get('login','').strip();server=fields.get('server','').strip();secret=fields.get('password','').strip()
-   if not login.isdigit() or not server or not secret:return await u.message.reply_text('❌ البيانات ناقصة. أرسل Server و Login و Password في رسالة واحدة، بسطر واحد أو عدة أسطر.')
+   if not login.isdigit() or not server or not secret:return await u.message.reply_text('❌ ما قدرت أحدد Server و Login و Password بأمان. أرسلها بأي ترتيب مع أسمائها، أو 3 أسطر: Server ثم Login ثم Password.')
    self.login_state.pop(uid,None)
    try:await u.message.delete()
    except Exception:pass
