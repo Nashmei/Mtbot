@@ -40,6 +40,8 @@ class Engine:
   self.max_positions=1
   self.max_consecutive_losses=3
   self.daily_loss_limit_pct=2.0
+  # Real trading is an explicit per-account safety lock. Demo does not need it.
+  self.real_trading_enabled=False
   self.session_profit_limit=0.0
   self.session_start_balance=0.0
   self.session_profit_hit=False
@@ -133,7 +135,7 @@ class Engine:
    'rr':3.0,'risk_pct':0.25,'min_confidence':75.0,
    'protection_pct':45.0,'trailing_gap_pct':5.0,
    'max_trade_minutes':10.0,'max_positions':1,
-   'max_consecutive_losses':3,'daily_loss_limit_pct':2.0,'session_profit_limit':0.0,
+   'max_consecutive_losses':3,'daily_loss_limit_pct':2.0,'real_trading_enabled':0,'session_profit_limit':0.0,
    'session_start_balance':0.0,'session_profit_hit':0,'session_active':0,
    'consecutive_losses':0,
    'ai_rr_override':0.0,'ai_sl_points_override':0.0,'ai_tp_points_override':0.0,
@@ -144,14 +146,14 @@ class Engine:
    'protection_pct':'protection_pct','trailing_gap_pct':'trailing_gap_pct',
    'max_trade_minutes':'max_trade_minutes','max_positions':'max_positions',
    'max_consecutive_losses':'max_consecutive_losses',
-   'daily_loss_limit_pct':'daily_loss_limit_pct','session_profit_limit':'session_profit_limit',
+   'daily_loss_limit_pct':'daily_loss_limit_pct','real_trading_enabled':'real_trading_enabled','session_profit_limit':'session_profit_limit',
    'session_start_balance':'session_start_balance','session_profit_hit':'session_profit_hit','session_active':'session_active',
    'consecutive_losses':'consecutive_losses',
    'ai_rr_override':'ai_rr_override','ai_sl_points_override':'ai_sl_points_override',
    'ai_tp_points_override':'ai_tp_points_override','ai_protection_override':'ai_protection_override',
    'ai_trailing_override':'ai_trailing_override','ai_duration_override':'ai_duration_override',
   }
-  int_keys={'max_positions','max_consecutive_losses','consecutive_losses','session_profit_hit','session_active'}
+  int_keys={'max_positions','max_consecutive_losses','consecutive_losses','session_profit_hit','session_active','real_trading_enabled'}
   for key,default in defaults.items():
    scoped=await self._account_key(key,login)
    raw=await self.db.get(scoped)
@@ -191,6 +193,7 @@ class Engine:
 
   self.session_profit_hit=bool(self.session_profit_hit)
   self.session_active=bool(self.session_active)
+  self.real_trading_enabled=bool(self.real_trading_enabled)
   await self._refresh_strategy_performance(force=True)
 
 
@@ -213,9 +216,12 @@ class Engine:
 
   symbols=', '.join(self.symbols) if self.symbols else 'لا يوجد'
   state='🟢 يعمل' if self.running else '⚪ متوقف'
+  is_demo=getattr(a,'trade_mode',None)==mt5.ACCOUNT_TRADE_MODE_DEMO
+  account_mode='تجريبي' if is_demo else 'حقيقي'
+  real_lock='' if is_demo else (' | 🔓 Real مفعّل' if self.real_trading_enabled else ' | 🔒 Real مقفل')
 
   return (
-   f'{state} | 🔒 تجريبي\n'
+   f'{state} | {account_mode}{real_lock}\n'
    f'🔄 دورات المحرك: {self.scan_count} | آخر مدة: {self.last_cycle_seconds:.2f}ث\n'
    f'💱 الأزواج: {symbols}\n'
    f'📂 المراكز: {len(self.trades)} / {self.max_positions}\n'
@@ -240,8 +246,16 @@ class Engine:
    await self.notify('⚠️ إعدادات المخاطرة أو العائد أو حد المراكز غير صالحة.')
    return False
   account=self.gw.account()
-  if not account or account.trade_mode!=mt5.ACCOUNT_TRADE_MODE_DEMO:
-   await self.notify('🔒 يلزم اتصال بحساب MT5 تجريبي قبل التشغيل.')
+  if not account:
+   await self.notify('⚠️ يلزم اتصال بحساب MT5 قبل التشغيل.')
+   return False
+  trade_mode=getattr(account,'trade_mode',None)
+  allowed_modes={mt5.ACCOUNT_TRADE_MODE_DEMO,getattr(mt5,'ACCOUNT_TRADE_MODE_REAL',2)}
+  if trade_mode not in allowed_modes:
+   await self.notify('⚠️ نوع حساب MT5 غير مدعوم. المسموح Demo أو Real فقط.')
+   return False
+  if trade_mode!=mt5.ACCOUNT_TRADE_MODE_DEMO and not self.real_trading_enabled:
+   await self.notify('🔒 الحساب Real متصل لكن التداول الحقيقي غير مفعّل لهذا الحساب.')
    return False
   if not await self._daily_entry_allowed(account):
    return False
@@ -448,8 +462,14 @@ class Engine:
 
  async def step(self):
   account=self.gw.account()
-  if not account or account.trade_mode!=mt5.ACCOUNT_TRADE_MODE_DEMO:
-   self.running=False; await self.notify('🔒 الحساب التجريبي فقط.'); return
+  if not account:
+   self.running=False; await self.notify('⚠️ انقطع حساب MT5؛ تم إيقاف المحرك.'); return
+  trade_mode=getattr(account,'trade_mode',None)
+  allowed_modes={mt5.ACCOUNT_TRADE_MODE_DEMO,getattr(mt5,'ACCOUNT_TRADE_MODE_REAL',2)}
+  if trade_mode not in allowed_modes:
+   self.running=False; await self.notify('⚠️ نوع حساب MT5 غير مدعوم؛ تم إيقاف المحرك.'); return
+  if trade_mode!=mt5.ACCOUNT_TRADE_MODE_DEMO and not self.real_trading_enabled:
+   self.running=False; await self.notify('🔒 قفل Real غير مفعّل لهذا الحساب؛ تم إيقاف المحرك.'); return
 
   positions=self.gw.positions()
   if positions is None:
