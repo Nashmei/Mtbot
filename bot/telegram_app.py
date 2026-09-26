@@ -134,7 +134,16 @@ class TelegramUI:
   [InlineKeyboardButton('♻️ الكل AI = 0',callback_data='ai_reset')],
   [InlineKeyboardButton('↩️ الإعدادات',callback_data='settings_menu')]
  ])
- def account_kb(self): return InlineKeyboardMarkup([[InlineKeyboardButton('🔐 ربط MT5',callback_data='mt5login'),InlineKeyboardButton('📈 الإحصائيات',callback_data='accountstats')],[InlineKeyboardButton('🧪 فحص الجاهزية',callback_data='readiness')],[InlineKeyboardButton('↩️ الرئيسية',callback_data='dashboard')]])
+ def account_kb(self):
+  a=self.e.gw.account()
+  rows=[[InlineKeyboardButton('🔐 ربط MT5',callback_data='mt5login'),InlineKeyboardButton('📈 الإحصائيات',callback_data='accountstats')],[InlineKeyboardButton('🧪 فحص الجاهزية',callback_data='readiness')]]
+  if a:
+   import MetaTrader5 as mt5
+   if getattr(a,'trade_mode',None)==getattr(mt5,'ACCOUNT_TRADE_MODE_REAL',2):
+    label='🔒 قفل تداول Real' if self.e.real_trading_enabled else '🔓 تفعيل تداول Real'
+    rows.append([InlineKeyboardButton(label,callback_data='real_lock')])
+  rows.append([InlineKeyboardButton('↩️ الرئيسية',callback_data='dashboard')])
+  return InlineKeyboardMarkup(rows)
  async def start(self,u,c):
   if not self.allowed(u.effective_user) or u.effective_chat.id!=settings.telegram_allowed_user_id:return
   a=self.e.gw.account(); state=f'MT5: ✅ {a.login} / {a.server}' if a else 'MT5: ❌ غير مسجل الدخول\nاستخدم 🔐 حساب MT5'
@@ -186,13 +195,17 @@ class TelegramUI:
   if x=='mt5login':
    if self.e.running:
     return await self._edit(q,'⏹ أوقف المحرك قبل تغيير حساب MT5.',self.account_kb())
-   self.login_state[q.from_user.id]={'step':'block'}; msg='🔐 تسجيل دخول MT5 التجريبي\n\nأرسل Server و Login و Password في رسالة واحدة.\nاستخدم /cancel للإلغاء.'
+   self.login_state[q.from_user.id]={'step':'block'}; msg='🔐 تسجيل دخول MT5 — Demo / Real\n\nأرسل Server و Login و Password في رسالة واحدة.\nيمكن أن تكون في سطر واحد أو عدة أسطر.\nاستخدم /cancel للإلغاء.'
   elif x=='start':
    if not self.e.gw.account(): msg='❌ حساب MT5 غير متصل. استخدم 🔐 حساب MT5 أولاً.'
    else:
     await self._edit(q,'⏳ جاري تشغيل المحرك.',self.trade_kb(),arm=False)
     started=await self.e.start()
-    msg='🟢 تم تشغيل البوت على الحساب التجريبي.' if started else '⚠️ لم يبدأ المحرك. راجع رسالة السبب وفحص الجاهزية.'
+    if started:
+     import MetaTrader5 as mt5
+     a=self.e.gw.account(); mode='Demo' if getattr(a,'trade_mode',None)==mt5.ACCOUNT_TRADE_MODE_DEMO else 'Real'
+     msg=f'🟢 تم تشغيل البوت على حساب {mode}.'
+    else: msg='⚠️ لم يبدأ المحرك. راجع رسالة السبب وفحص الجاهزية.'
   elif x=='stop':
    await self._edit(q,'⏳ جاري إيقاف المحرك.',self.trade_kb(),arm=False)
    await self.e.stop(); msg='⏹ تم إيقاف البوت.'
@@ -345,7 +358,22 @@ class TelegramUI:
   elif x=='rr':
    self.input_state[q.from_user.id]='rr'
    msg='⚖️ أرسل الرقم فقط\nمثال: 3 يعني 1:3\nالمسموح: 0.5 إلى 10'
-  elif x=='live': msg='🔒 التداول الحقيقي مقفل في نسخة الأمان الحالية.'
+  elif x=='real_lock':
+   import MetaTrader5 as mt5
+   a=self.e.gw.account()
+   if not a or getattr(a,'trade_mode',None)!=getattr(mt5,'ACCOUNT_TRADE_MODE_REAL',2):
+    msg='⚠️ هذا الخيار يعمل فقط مع حساب MT5 Real.'
+   elif self.e.running:
+    msg='⏹ أوقف المحرك أولاً قبل تغيير قفل تداول Real.'
+   elif self.e.real_trading_enabled:
+    self.e.real_trading_enabled=False
+    await self.e.save_setting('real_trading_enabled',0)
+    await self.db.log('REAL_TRADING_LOCK_CHANGED',login=int(a.login),enabled=False,source='telegram')
+    msg='🔒 تم قفل تداول Real لهذا الحساب.'
+   else:
+    self.login_state[q.from_user.id]={'step':'confirm_real'}
+    msg='⚠️ تأكيد تداول حقيقي\n━━━━━━━━━━━━━━\nهذا الحساب Real وسيتم استخدام أموال حقيقية عند تشغيل المحرك.\nللتفعيل اكتب بالضبط: تفعيل REAL\nأو /cancel للإلغاء.'
+  elif x=='live': msg='ℹ️ إدارة Real موجودة داخل 👤 الحساب عند الاتصال بحساب حقيقي.'
   else: msg='⚠️ هذا الزر غير مفعّل بعد.'
   await self._edit(q,msg,reply_markup=self.kb())
  async def cancel(self,u,c):
@@ -390,14 +418,26 @@ class TelegramUI:
 
   st=self.login_state.get(uid)
   if not st:return
+  if st.get('step')=='confirm_real':
+   if value.strip().upper()!='تفعيل REAL':
+    return await u.message.reply_text('❌ لم يتم التفعيل. اكتب بالضبط: تفعيل REAL أو استخدم /cancel.')
+   import MetaTrader5 as mt5
+   a=self.e.gw.account()
+   if not a or getattr(a,'trade_mode',None)!=getattr(mt5,'ACCOUNT_TRADE_MODE_REAL',2):
+    self.login_state.pop(uid,None)
+    return await u.message.reply_text('⚠️ الحساب الحالي ليس Real. لم يتم تغيير القفل.')
+   self.login_state.pop(uid,None)
+   self.e.real_trading_enabled=True
+   await self.e.save_setting('real_trading_enabled',1)
+   await self.db.log('REAL_TRADING_LOCK_CHANGED',login=int(a.login),enabled=True,source='telegram')
+   return await u.message.reply_text('🔓 تم تفعيل تداول Real لهذا الحساب. لن يبدأ التداول حتى تضغط تشغيل المحرك.',reply_markup=self.account_kb())
   if st.get('step')=='block':
    import re,asyncio
    fields={}
-   for line in value.splitlines():
-    m=re.match(r'^\s*(server|login|password)\s*:\s*(.*?)\s*$',line,re.I)
-    if m:fields[m.group(1).lower()]=m.group(2)
-   login=fields.get('login','').strip();server=fields.get('server','').strip();secret=fields.get('password','')
-   if not login.isdigit() or not server or not secret:return await u.message.reply_text('❌ البيانات ناقصة. أرسل Server و Login و Password في رسالة واحدة.')
+   pattern=re.compile(r'(?is)\b(server|login|password)\s*[:=]\s*(.*?)(?=\s+\b(?:server|login|password)\s*[:=]|$)')
+   for m in pattern.finditer(value): fields[m.group(1).lower()]=m.group(2).strip()
+   login=fields.get('login','').strip();server=fields.get('server','').strip();secret=fields.get('password','').strip()
+   if not login.isdigit() or not server or not secret:return await u.message.reply_text('❌ البيانات ناقصة. أرسل Server و Login و Password في رسالة واحدة، بسطر واحد أو عدة أسطر.')
    self.login_state.pop(uid,None)
    try:await u.message.delete()
    except Exception:pass
@@ -418,7 +458,11 @@ class TelegramUI:
     # New/different account gets its own defaults or its previously saved profile.
     await self.e.load_settings(login=int(login),migrate_legacy=False)
     await self.db.log('MT5_LOGIN_SUCCESS',login=int(login),server=server);secret=None
-    await wait.edit_text(f'👤 حساب MT5\n━━━━━━━━━━━━━━\n✅ تم الاتصال بنجاح\n🆔 الحساب: {a.login}\n🌐 الخادم: {a.server}\n🔒 الوضع: تجريبي محمي',reply_markup=self.account_kb())
+    import MetaTrader5 as mt5
+    is_demo=getattr(a,'trade_mode',None)==mt5.ACCOUNT_TRADE_MODE_DEMO
+    mode='Demo 🧪' if is_demo else 'Real 💵'
+    lock='' if is_demo else '\n🔒 تداول Real: مقفل افتراضيًا'
+    await wait.edit_text(f'👤 حساب MT5\n━━━━━━━━━━━━━━\n✅ تم الاتصال بنجاح\n🆔 الحساب: {a.login}\n🌐 الخادم: {a.server}\n📌 النوع: {mode}{lock}',reply_markup=self.account_kb())
    else:
     secret=None;await self.db.log('MT5_LOGIN_FAILED',login=int(login),server=server,error=str(err))
     await wait.edit_text(f'👤 حساب MT5\n━━━━━━━━━━━━━━\n❌ فشل تسجيل الدخول\n📡 الخطأ: {err}\n🔐 لم يتم حفظ بيانات الدخول.',reply_markup=self.account_kb())
