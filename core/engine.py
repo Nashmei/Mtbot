@@ -40,6 +40,9 @@ class Engine:
   self.max_positions=1
   self.max_consecutive_losses=3
   self.daily_loss_limit_pct=2.0
+  self.session_profit_limit=0.0
+  self.session_start_balance=0.0
+  self.session_profit_hit=False
   self.consecutive_losses=0
   self.loss_limit_notified=False
   self.daily_loss_notified=False
@@ -109,6 +112,7 @@ class Engine:
     'max_positions':('max_positions',int),
     'max_consecutive_losses':('max_consecutive_losses',int),
     'daily_loss_limit_pct':('daily_loss_limit_pct',float),
+    'session_profit_limit':('session_profit_limit',float),
     'consecutive_losses':('consecutive_losses',int),
    }
    for key,(attr,cast) in legacy.items():
@@ -128,7 +132,7 @@ class Engine:
    'rr':3.0,'risk_pct':0.25,'min_confidence':75.0,
    'protection_pct':45.0,'trailing_gap_pct':5.0,
    'max_trade_minutes':10.0,'max_positions':1,
-   'max_consecutive_losses':3,'daily_loss_limit_pct':2.0,
+   'max_consecutive_losses':3,'daily_loss_limit_pct':2.0,'session_profit_limit':0.0,
    'consecutive_losses':0,
    'ai_rr_override':0.0,'ai_sl_points_override':0.0,'ai_tp_points_override':0.0,
    'ai_protection_override':0.0,'ai_trailing_override':0.0,'ai_duration_override':0.0,
@@ -138,7 +142,7 @@ class Engine:
    'protection_pct':'protection_pct','trailing_gap_pct':'trailing_gap_pct',
    'max_trade_minutes':'max_trade_minutes','max_positions':'max_positions',
    'max_consecutive_losses':'max_consecutive_losses',
-   'daily_loss_limit_pct':'daily_loss_limit_pct',
+   'daily_loss_limit_pct':'daily_loss_limit_pct','session_profit_limit':'session_profit_limit',
    'consecutive_losses':'consecutive_losses',
    'ai_rr_override':'ai_rr_override','ai_sl_points_override':'ai_sl_points_override',
    'ai_tp_points_override':'ai_tp_points_override','ai_protection_override':'ai_protection_override',
@@ -253,6 +257,12 @@ class Engine:
    await self.notify('ℹ️ البوت يعمل بالفعل.')
    return True
 
+  # A manual Start always creates a fresh profit session from realized Balance.
+  self.session_start_balance=float(getattr(account,'balance',0) or 0)
+  self.session_profit_hit=False
+  await self.save_setting('session_start_balance',self.session_start_balance)
+  await self.save_setting('session_profit_hit',0)
+
   if not self.symbols:
    await self.notify('⚠️ اختر زوجاً واحداً على الأقل قبل التشغيل.')
    return False
@@ -267,7 +277,9 @@ class Engine:
    protection_pct=self.protection_pct,
    max_positions=self.max_positions,
    max_consecutive_losses=self.max_consecutive_losses,
-   daily_loss_limit_pct=self.daily_loss_limit_pct
+   daily_loss_limit_pct=self.daily_loss_limit_pct,
+   session_profit_limit=self.session_profit_limit,
+   session_start_balance=self.session_start_balance
   )
 
   await self.notify(
@@ -446,6 +458,21 @@ class Engine:
    if info and tick: await self.manage(t,tick,info)
 
   await self._refresh_strategy_performance()
+
+  # Session profit uses realized Balance only; floating Equity/PnL is ignored.
+  if self.session_profit_limit>0 and self.session_start_balance>0:
+   balance=float(getattr(account,'balance',0) or 0)
+   realized=balance-self.session_start_balance
+   if realized>=self.session_profit_limit:
+    if not self.session_profit_hit:
+     self.session_profit_hit=True
+     await self.save_setting('session_profit_hit',1)
+     await self.db.log('SESSION_PROFIT_LIMIT',balance=balance,baseline=self.session_start_balance,profit=realized,limit=self.session_profit_limit)
+     await self.notify(f'🎯 تحقق حد ربح الجلسة: +${realized:.2f}. توقف التحليل والدخول الجديد.')
+    # Existing positions keep deterministic management; no analysis/new entries.
+    if not self.trades:
+     self.running=False
+    return
 
   # لا دخول جديد عند بلوغ الحدود
   if not await self._daily_entry_allowed(account):

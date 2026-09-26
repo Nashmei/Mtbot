@@ -32,6 +32,9 @@ class FakeEngine:
         self.max_trade_minutes=10.0
         self.max_consecutive_losses=3
         self.daily_loss_limit_pct=2.0
+        self.session_profit_limit=0.0
+        self.session_start_balance=0.0
+        self.session_profit_hit=False
         self.ai_rr_override=0.0
         self.ai_sl_points_override=0.0
         self.ai_tp_points_override=0.0

@@ -28,6 +28,7 @@ class SettingsPatch(BaseModel):
     max_positions: int | None = Field(default=None, ge=1, le=10)
     max_consecutive_losses: int | None = Field(default=None, ge=0, le=20)
     daily_loss_limit_pct: float | None = Field(default=None, ge=0, le=100)
+    session_profit_limit: float | None = Field(default=None, ge=0, le=1000000000)
 
     @model_validator(mode='after')
     def require_value(self):
@@ -191,6 +192,7 @@ class ControlAPI:
                 'max_positions': ('max_positions', 'max_positions'),
                 'max_consecutive_losses': ('max_consecutive_losses', 'max_consecutive_losses'),
                 'daily_loss_limit_pct': ('daily_loss_limit_pct', 'daily_loss_limit_pct'),
+                'session_profit_limit': ('session_profit_limit', 'session_profit_limit'),
             }
 
             changed = {}
@@ -324,6 +326,9 @@ class ControlAPI:
                 'last_cycle_at': self._number(self.engine.last_cycle_at),
                 'tracked_positions': len(self.engine.trades),
                 'max_positions': int(self.engine.max_positions),
+                'session_start_balance': self._number(self.engine.session_start_balance),
+                'session_profit': self._number((getattr(account,'balance',0) or 0)-self.engine.session_start_balance) if self.engine.session_start_balance>0 else 0.0,
+                'session_profit_hit': bool(self.engine.session_profit_hit),
             },
             'account': self._account_payload(account) if account else None,
             'positions': [self._position_payload(position) for position in positions],
@@ -340,6 +345,7 @@ class ControlAPI:
                 'max_positions': int(self.engine.max_positions),
                 'max_consecutive_losses': int(self.engine.max_consecutive_losses),
                 'daily_loss_limit_pct': self._number(self.engine.daily_loss_limit_pct),
+                'session_profit_limit': self._number(self.engine.session_profit_limit),
             },
             'analysis': list(self._analysis_cache.values()),
             'readiness': {
