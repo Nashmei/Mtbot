@@ -11,6 +11,8 @@ import numpy as np
 fake_mt5 = types.ModuleType("MetaTrader5")
 for name, value in {
     "ACCOUNT_TRADE_MODE_DEMO": 0,
+    "ACCOUNT_TRADE_MODE_CONTEST": 1,
+    "ACCOUNT_TRADE_MODE_REAL": 2,
     "SYMBOL_TRADE_EXECUTION_REQUEST": 0,
     "SYMBOL_TRADE_EXECUTION_INSTANT": 1,
     "SYMBOL_TRADE_EXECUTION_MARKET": 2,
@@ -330,6 +332,62 @@ class MarketSafetyTests(unittest.TestCase):
             self.assertFalse(await second._daily_entry_allowed(types.SimpleNamespace(equity=970)))
             self.assertEqual(len(alerts), 1)
             self.assertEqual(len(db.events), 1)
+        asyncio.run(check())
+
+
+    def test_real_account_requires_explicit_account_lock(self):
+        class Gateway:
+            def account(self):
+                return types.SimpleNamespace(trade_mode=2, equity=1000, currency="USD", balance=1000, login=999)
+            def algo_status(self):
+                return {'connected':True,'trade_allowed':True,'account_trade_allowed':True,'trade_expert':True}
+            def positions(self):
+                return ()
+        messages=[]
+        async def notify(message, **kwargs):
+            messages.append(message)
+        async def check():
+            engine=Engine(Gateway(),FakeDB(),notify)
+            started=await engine.start()
+            self.assertFalse(started)
+            self.assertFalse(engine.running)
+            self.assertTrue(any("Real" in m for m in messages))
+        asyncio.run(check())
+
+    def test_real_account_starts_after_explicit_account_lock(self):
+        class Gateway:
+            def account(self):
+                return types.SimpleNamespace(trade_mode=2, equity=1000, currency="USD", balance=1000, login=999)
+            def algo_status(self):
+                return {'connected':True,'trade_allowed':True,'account_trade_allowed':True,'trade_expert':True}
+            def positions(self):
+                return ()
+        async def notify(message, **kwargs):
+            pass
+        async def idle_loop():
+            return None
+        async def check():
+            engine=Engine(Gateway(),FakeDB(),notify)
+            engine.real_trading_enabled=True
+            engine.loop=idle_loop
+            started=await engine.start()
+            self.assertTrue(started)
+            self.assertTrue(engine.running)
+            await asyncio.sleep(0)
+        asyncio.run(check())
+
+    def test_contest_account_is_rejected(self):
+        class Gateway:
+            def account(self):
+                return types.SimpleNamespace(trade_mode=1, equity=1000, currency="USD", balance=1000, login=888)
+        messages=[]
+        async def notify(message, **kwargs):
+            messages.append(message)
+        async def check():
+            engine=Engine(Gateway(),FakeDB(),notify)
+            started=await engine.start()
+            self.assertFalse(started)
+            self.assertTrue(any("غير مدعوم" in m for m in messages))
         asyncio.run(check())
 
 
