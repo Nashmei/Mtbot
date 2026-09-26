@@ -78,7 +78,7 @@ class FakeGateway:
     def available_symbols(self):
         return (SimpleNamespace(name='EURUSD', visible=True),)
 
-    def ranked_symbol_names(self):
+    def ranked_symbol_names(self, symbols=None):
         return ['EURUSD']
 
 

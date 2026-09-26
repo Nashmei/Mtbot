@@ -220,7 +220,7 @@ class ControlAPI:
         ):
             symbols = list(self.gateway.available_symbols())
             active = [item.name for item in symbols if bool(getattr(item, 'visible', False))]
-            names = self.gateway.ranked_symbol_names()
+            names = self.gateway.ranked_symbol_names(symbols)
             query = q.strip().upper()
             if query:
                 names = [name for name in names if query in name.upper()]
@@ -236,7 +236,8 @@ class ControlAPI:
 
         @app.put('/v1/symbols')
         async def put_symbols(payload: SymbolsPayload, _=Depends(auth)):
-            available = [item.name for item in self.gateway.available_symbols()]
+            symbol_rows = list(self.gateway.available_symbols())
+            available = [item.name for item in symbol_rows]
             selected = []
             for requested in payload.symbols:
                 key = requested.strip().upper()
@@ -255,8 +256,8 @@ class ControlAPI:
             await self.engine.save_setting('symbols', json.dumps(selected))
             await self.db.log('SYMBOLS_UPDATED', source='t4bot', symbols=selected)
             await self.event_hub.broadcast('symbols_changed', {'symbols': selected})
-            active = [item.name for item in self.gateway.available_symbols() if bool(getattr(item, 'visible', False))]
-            ranked = self.gateway.ranked_symbol_names()
+            active = [item.name for item in symbol_rows if bool(getattr(item, 'visible', False))]
+            ranked = self.gateway.ranked_symbol_names(symbol_rows)
             return {
                 'selected': selected,
                 'active': active,

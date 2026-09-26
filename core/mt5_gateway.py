@@ -160,11 +160,12 @@ class MT5Gateway:
         # Broker is the source of truth. Do not hard-code a tradable universe.
         return tuple(x for x in self.symbols() if getattr(x, 'trade_mode', 0) != mt5.SYMBOL_TRADE_MODE_DISABLED)
 
-    def ranked_symbol_names(self):
+    def ranked_symbol_names(self, symbols=None):
         """Popular markets first, then every other tradable broker symbol."""
         popular = ('XAUUSD','EURUSD','GBPUSD','USDJPY','AUDUSD','USDCAD','USDCHF','NZDUSD',
                    'EURJPY','GBPJPY','EURGBP','XAGUSD')
-        names = [x.name for x in self.available_symbols()]
+        source = tuple(symbols) if symbols is not None else self.available_symbols()
+        names = [x.name for x in source]
         def base_rank(name):
             upper = name.upper()
             for i, base in enumerate(popular):
