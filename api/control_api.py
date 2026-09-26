@@ -204,7 +204,8 @@ class ControlAPI:
             for field, value in payload.model_dump(exclude_none=True).items():
                 attr, db_key = mapping[field]
                 setattr(self.engine, attr, value)
-                await self.engine.save_setting(db_key, value)
+                stored_value = int(value) if field == 'real_trading_enabled' else value
+                await self.engine.save_setting(db_key, stored_value)
                 changed[field] = value
 
             if 'max_consecutive_losses' in changed:
