@@ -4,7 +4,7 @@ from telegram.error import BadRequest,RetryAfter
 from core.config import settings
 from bot import v2_views
 class TelegramUI:
- def __init__(self,engine,db): self.e=engine;self.db=db;self.login_state={};self.input_state={};self.message_ids=set();self.menu_message_id=None;self.menu_chat_id=None;self.menu_expiry_task=None
+ def __init__(self,engine,db): self.e=engine;self.db=db;self.login_state={};self.input_state={};self.message_ids=set();self.menu_message_id=None;self.menu_chat_id=None;self.menu_expiry_task=None;self._mt5_login_task=None
  def allowed(self,u): return bool(u and u.id==settings.telegram_allowed_user_id)
  async def _apply_setting(self,key,value):
   import math
@@ -443,14 +443,24 @@ class TelegramUI:
    except Exception:pass
    wait=await c.bot.send_message(u.effective_chat.id,'⏳ جاري تشغيل MT5 وتسجيل الدخول.')
    self.menu_chat_id=u.effective_chat.id;self.menu_message_id=wait.message_id
-   task=asyncio.create_task(asyncio.to_thread(self.e.gw.login,int(login),secret,server));dots=1
-   while not task.done():
+   if self._mt5_login_task and not self._mt5_login_task.done():
+    secret=None
+    return await wait.edit_text('⏳ توجد محاولة تسجيل دخول MT5 جارية بالفعل. انتظر انتهاءها قبل محاولة أخرى.')
+   started_at=asyncio.get_running_loop().time()
+   task=asyncio.create_task(asyncio.to_thread(self.e.gw.login,int(login),secret,server));self._mt5_login_task=task;dots=1
+   while not task.done() and asyncio.get_running_loop().time()-started_at<30:
     try:await wait.edit_text('⏳ جاري تشغيل MT5 وتسجيل الدخول'+'.'*dots)
     except Exception:pass
     dots=1 if dots>=4 else dots+1
     try:await asyncio.wait_for(asyncio.shield(task),timeout=1.2)
     except asyncio.TimeoutError:pass
+   if not task.done():
+    secret=None
+    self.login_state.pop(uid,None)
+    await self.db.log('MT5_LOGIN_TIMEOUT',login=int(login),server=server)
+    return await wait.edit_text('⏱ انتهت مهلة اتصال MT5 بعد 30 ثانية. Terminal لا يستطيع الوصول إلى خادم الوسيط بهذه النسخة حاليًا. لم يتم حفظ بيانات الدخول.')
    ok,err,a=await task
+   self._mt5_login_task=None
    if ok:
     from pathlib import Path
     import json,os
