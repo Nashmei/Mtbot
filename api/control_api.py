@@ -29,6 +29,7 @@ class SettingsPatch(BaseModel):
     max_consecutive_losses: int | None = Field(default=None, ge=0, le=20)
     daily_loss_limit_pct: float | None = Field(default=None, ge=0, le=100)
     session_profit_limit: float | None = Field(default=None, ge=0, le=1000000000)
+    real_trading_enabled: bool | None = None
 
     @model_validator(mode='after')
     def require_value(self):
@@ -97,7 +98,8 @@ class ControlAPI:
                 'ok': True,
                 'service': 'mtbot-control-api',
                 'api_version': 1,
-                'demo_only': True,
+                'demo_only': False,
+                'supports_real': True,
             }
 
         @app.get('/v1/snapshot')
@@ -147,17 +149,19 @@ class ControlAPI:
                 )
                 raise HTTPException(status_code=400, detail=f'فشل تسجيل الدخول إلى MT5: {err}')
 
-            if getattr(account, 'trade_mode', None) != mt5.ACCOUNT_TRADE_MODE_DEMO:
+            trade_mode = getattr(account, 'trade_mode', None)
+            allowed_modes = {mt5.ACCOUNT_TRADE_MODE_DEMO, getattr(mt5, 'ACCOUNT_TRADE_MODE_REAL', 2)}
+            if trade_mode not in allowed_modes:
                 password = None
                 mt5.shutdown()
                 await self.db.log(
                     'MT5_LOGIN_REJECTED',
                     login=int(payload.login),
                     server=server,
-                    reason='NON_DEMO',
+                    reason='UNSUPPORTED_ACCOUNT_TYPE',
                     source='t4bot',
                 )
-                raise HTTPException(status_code=403, detail='T4Bot يسمح بحسابات MT5 التجريبية فقط.')
+                raise HTTPException(status_code=403, detail='T4Bot يدعم حسابات MT5 Demo وReal فقط.')
 
             self._store_credentials(int(payload.login), server, password)
             password = None
@@ -174,7 +178,7 @@ class ControlAPI:
             )
             return {
                 'ok': True,
-                'message': 'تم الاتصال بحساب MT5 التجريبي.',
+                'message': ('تم الاتصال بحساب MT5 التجريبي.' if trade_mode == mt5.ACCOUNT_TRADE_MODE_DEMO else 'تم الاتصال بحساب MT5 الحقيقي. فعّل قفل Real قبل تشغيل المحرك.'),
                 'account': self._account_payload(account),
             }
 
@@ -193,6 +197,7 @@ class ControlAPI:
                 'max_consecutive_losses': ('max_consecutive_losses', 'max_consecutive_losses'),
                 'daily_loss_limit_pct': ('daily_loss_limit_pct', 'daily_loss_limit_pct'),
                 'session_profit_limit': ('session_profit_limit', 'session_profit_limit'),
+                'real_trading_enabled': ('real_trading_enabled', 'real_trading_enabled'),
             }
 
             changed = {}
@@ -381,6 +386,7 @@ class ControlAPI:
                 'max_consecutive_losses': int(self.engine.max_consecutive_losses),
                 'daily_loss_limit_pct': self._number(self.engine.daily_loss_limit_pct),
                 'session_profit_limit': self._number(self.engine.session_profit_limit),
+                'real_trading_enabled': bool(self.engine.real_trading_enabled),
             },
             'analysis': list(self._analysis_cache.values()),
             'readiness': {
@@ -486,6 +492,8 @@ class ControlAPI:
             'margin_free': self._number(getattr(account, 'margin_free', 0)),
             'profit': self._number(getattr(account, 'profit', 0)),
             'is_demo': getattr(account, 'trade_mode', None) == mt5.ACCOUNT_TRADE_MODE_DEMO,
+            'account_type': ('demo' if getattr(account, 'trade_mode', None) == mt5.ACCOUNT_TRADE_MODE_DEMO else ('real' if getattr(account, 'trade_mode', None) == getattr(mt5, 'ACCOUNT_TRADE_MODE_REAL', 2) else 'unsupported')),
+            'real_trading_enabled': bool(self.engine.real_trading_enabled),
         }
 
     def _position_payload(self, position):
