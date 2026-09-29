@@ -476,6 +476,15 @@ class AIAdvisor:
 
     raise
 
+   except (urllib.error.URLError, TimeoutError) as ex:
+    last_error=ex
+
+    if attempt == 1:
+     time.sleep(self.retry_delay)
+     continue
+
+    raise
+
    except Exception as ex:
     last_error=ex
     raise

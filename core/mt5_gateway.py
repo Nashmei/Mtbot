@@ -100,6 +100,16 @@ class MT5Gateway:
                 continue
             a = mt5.account_info()
             if a is not None and int(a.login) == int(login):
+                # Refresh the broker-specific symbol universe after every
+                # account switch. Selecting popular tradable symbols primes
+                # MT5 market data without carrying assumptions from the prior
+                # broker (suffixes such as EURUSDm vs EURUSD can differ).
+                symbols = mt5.symbols_get() or ()
+                popular = ('EURUSD','GBPUSD','USDJPY','AUDUSD','USDCAD','USDCHF','NZDUSD','XAUUSD','XAGUSD')
+                for base in popular:
+                    matches = [x.name for x in symbols if getattr(x, 'trade_mode', 0) != mt5.SYMBOL_TRADE_MODE_DISABLED and (x.name == base or x.name.startswith(base))]
+                    if matches:
+                        mt5.symbol_select(matches[0], True)
                 return True, (1, 'Success'), a
 
         return False, mt5.last_error(), None
@@ -137,20 +147,34 @@ class MT5Gateway:
         return x
 
     def ticks(self, s, n=300, minimum=40):
-        """Return recent ticks for any broker symbol, including quieter FX crosses.
+        """Return recent ticks and adapt immediately after broker/account switches.
 
-        Start with a tiny live window for speed, then widen only when the
-        instrument needs more history. This avoids falsely classifying a valid
-        symbol as insufficient merely because it trades less frequently.
+        MT5 can keep an empty local tick cache for newly selected symbols after
+        login. copy_ticks_from asks the terminal to hydrate that symbol history;
+        the range scan remains a fallback for brokers that serve range history
+        more reliably.
         """
         from datetime import datetime, timezone, timedelta
         info = self.info(s)
         if info is None:
             return None
-        now = datetime.now(timezone.utc)
+        # Explicitly select the symbol for the current account before requesting
+        # history. This is harmless when already selected and important after a
+        # broker/account switch where the symbol universe may have changed.
+        mt5.symbol_select(s, True)
+        live = mt5.symbol_info_tick(s)
+        live_epoch = float(getattr(live, 'time_msc', 0) or 0) / 1000.0
+        if live_epoch <= 0:
+            live_epoch = float(getattr(live, 'time', 0) or 0)
+        # Anchor history to the broker's own live-tick clock. Some MT5/Wine
+        # broker sessions expose timestamps offset from the host UTC clock.
+        # Using the same broker clock at both ends avoids requesting a future
+        # range after an account/server switch.
+        end = datetime.fromtimestamp(live_epoch, timezone.utc) if live_epoch > 0 else datetime.now(timezone.utc)
         best = None
-        for minutes in (1, 5, 15, 30, 60, 180, 360):
-            rows = mt5.copy_ticks_range(s, now - timedelta(minutes=minutes), now, mt5.COPY_TICKS_ALL)
+
+        for minutes in (1, 5, 15, 30, 60, 180, 360, 720, 1440):
+            rows = mt5.copy_ticks_range(s, end - timedelta(minutes=minutes), end, mt5.COPY_TICKS_ALL)
             if rows is not None and (best is None or len(rows) > len(best)):
                 best = rows
             if rows is not None and len(rows) >= minimum:

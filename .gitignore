@@ -27,3 +27,7 @@ __pycache__/
 *.smc_strict_backup
 *.pre_multi_trade_conversion
 *.pretrade_bak
+
+storage/t4bot_media/
+storage/manual_signal.json
+storage/manual_signal_mode

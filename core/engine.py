@@ -1,4 +1,4 @@
-import asyncio,time,traceback
+import asyncio,time,traceback,json
 import MetaTrader5 as mt5
 from .config import settings
 from .models import TradeState,Side
@@ -561,10 +561,11 @@ class Engine:
   ticks=self.gw.ticks(symbol)
   if ticks is None or len(ticks)<40:return None,'INSUFFICIENT_TICKS'
   latest=float(ticks['time_msc'][-1])/1000.0 if 'time_msc' in ticks.dtype.names else float(ticks['time'][-1])
-  if abs(time.time()-latest)>settings.max_tick_age_seconds:return None,'STALE_TICKS'
+  live_epoch=float(getattr(tick,'time_msc',0) or 0)/1000.0 or float(getattr(tick,'time',0) or 0)
+  if live_epoch<=0 or abs(live_epoch-latest)>settings.max_tick_age_seconds:return None,'STALE_TICKS'
   m5=self.gw.rates_m5(symbol,200);m1=self.gw.rates_m1(symbol,300);m15=self.gw.rates_m15(symbol,200);h1=self.gw.rates_h1(symbol,200)
   snap=self._native_snapshot(symbol,account,info,tick,ticks,m1,m5,m15,h1)
-  decision=await self.ai_native.decide(symbol,snap,consume_signal=False)
+  decision=await self.ai_native.decide(symbol,snap,consume_signal=False,min_confidence=self.min_confidence)
   if decision.get('decision')=='SIGNAL' and float(decision.get('confidence',0))<float(self.min_confidence):
    decision=dict(decision);decision.update({'decision':'NO_TRADE','reason_code':'CONFIDENCE_REJECT','reason':'Signal confidence below account threshold'})
   return decision,None
@@ -572,14 +573,24 @@ class Engine:
  async def _scan_symbol(self,symbol,account):
    # صفقة واحدة كحد أقصى لكل رمز
    if any(t.symbol==symbol for t in self.trades.values()):return
-   # No new entries around the daily rollover when spreads commonly widen.
-   # Server is configured to Asia/Riyadh; use local server time intentionally.
-   from datetime import datetime
-   now_local=datetime.now()
-   mins=now_local.hour*60+now_local.minute
-   if mins>=23*60+45 or mins<30:
-    await self._log_reject('TIME_REJECT',symbol,reason='DAILY_ROLLOVER_2345_0030')
-    return
+   # Manual-signal experiment: when this flag exists, automatic AI entry
+   # generation is disabled. Existing positions continue through manage().
+   manual_mode_path='storage/manual_signal_mode'
+   manual_signal_path='storage/manual_signal.json'
+   manual_mode=__import__('os').path.exists(manual_mode_path)
+   manual_decision=None
+   if manual_mode:
+    if not __import__('os').path.exists(manual_signal_path):
+     return
+    try:
+     with open(manual_signal_path,'r',encoding='utf-8') as f:
+      candidate=json.load(f)
+     if str(candidate.get('symbol','')).upper()!=str(symbol).upper():
+      return
+     manual_decision=dict(candidate.get('decision') or {})
+    except Exception as e:
+     await self._log_reject('MANUAL_SIGNAL_REJECT',symbol,reason='INVALID_MANUAL_SIGNAL',error=repr(e))
+     return
    # Avoid stacking the same USD directional exposure across correlated FX pairs.
    usd_group={'EURUSD','GBPUSD','AUDUSD','NZDUSD'}
    info=self.gw.info(symbol); tick=self.gw.tick(symbol)
@@ -599,16 +610,16 @@ class Engine:
      )
      return
 
-   # Under Wine/MT5, symbol_info_tick() can expose a terminal-local timestamp
-   # (for example UTC+3) even though copy_ticks_range() returns Unix UTC.
-   # Use the history tick stream as the authoritative freshness clock and keep
-   # symbol_info_tick() only for the live bid/ask used by spread/execution.
+   # Compare history freshness against the current MT5 quote clock.
+   # This keeps the check broker-relative across account/server switches and
+   # avoids assuming that the host clock and every broker encode time identically.
    ticks=self.gw.ticks(symbol)
    if ticks is None or len(ticks)<40:
     await self._log_reject('SCAN_REJECT',symbol,reason='INSUFFICIENT_TICKS')
     return
    latest=float(ticks['time_msc'][-1])/1000.0 if 'time_msc' in ticks.dtype.names else float(ticks['time'][-1])
-   tick_age=time.time()-latest
+   live_epoch=float(getattr(tick,'time_msc',0) or 0)/1000.0 or float(getattr(tick,'time',0) or 0)
+   tick_age=live_epoch-latest
    if abs(tick_age)>settings.max_tick_age_seconds:
     await self._log_reject('SCAN_REJECT',symbol,reason='STALE_TICKS',age_seconds=tick_age)
     return
@@ -622,11 +633,37 @@ class Engine:
    m15=self.gw.rates_m15(symbol,200)
    h1=self.gw.rates_h1(symbol,200)
    if self.ai_native_only:
+    # Fresh-candle discipline: AI may evaluate only the latest fully closed M1
+    # candle and execution is allowed only at the beginning of its next candle.
+    # Use the broker/MT5 quote clock, never the host clock.
+    if m1 is None or not len(m1):
+     await self._log_reject('SCAN_REJECT',symbol,reason='NO_CLOSED_M1_FOR_FRESH_CANDLE')
+     return
+    last_closed_m1=int(m1['time'][-1])
+    next_m1_open=last_closed_m1+60
+    seconds_into_m1=live_epoch-next_m1_open
+    # The signal belongs to the M1 candle immediately following the evidence
+    # candle. Allow that candle to form for execution, but never carry the
+    # decision into a later M1 candle.
+    if seconds_into_m1 < 0 or seconds_into_m1 >= 60.0:
+     await self._log_reject(
+      'SCAN_REJECT',symbol,reason='NOT_CURRENT_M1_AFTER_CLOSED_SIGNAL',
+      last_closed_m1=last_closed_m1,seconds_into_m1=round(seconds_into_m1,3),
+     )
+     return
     # Experimental isolation: old executable strategies/ranker are disabled.
     # AI creates the bounded signal directly from raw market context.
     # Preview and executable scans share this exact market/account/settings snapshot.
     native_snapshot=self._native_snapshot(symbol,account,info,tick,ticks,m1,m5,m15,h1)
-    native_decision=await self.ai_native.decide(symbol,native_snapshot)
+    if manual_mode:
+     native_decision=manual_decision
+     try:
+      __import__('os').remove(manual_signal_path)
+     except FileNotFoundError:
+      pass
+     await self.db.log('MANUAL_SIGNAL_CONSUMED',symbol,decision=native_decision)
+    else:
+     native_decision=await self.ai_native.decide(symbol,native_snapshot,min_confidence=self.min_confidence)
     if native_decision.get('research_required'):
      research=await self.web_research.search(
       symbol,native_decision.get('research_query','')
@@ -645,7 +682,7 @@ class Engine:
      # Re-ask the AI once with fresh trusted-source research attached.
      native_snapshot=dict(native_snapshot)
      native_snapshot['news']=research
-     native_decision=await self.ai_native.decide(symbol,native_snapshot)
+     native_decision=await self.ai_native.decide(symbol,native_snapshot,min_confidence=self.min_confidence)
      if native_decision.get('research_required'):
       await self._log_reject(
        'AI_RESEARCH_REJECT',symbol,reason='REPEATED_RESEARCH_REQUEST'
@@ -781,8 +818,18 @@ class Engine:
      ask=float(getattr(tick,'ask',0) or 0) if tick else 0,
     )
     return
-   # Re-check freshness from copy_ticks_range(), whose timestamps are Unix UTC
-   # on this Wine/MT5 setup. Do not compare the terminal-local live quote time.
+   # Analysis/provider latency must not turn a fresh-candle setup into a late entry.
+   fresh_live_epoch=float(getattr(tick,'time_msc',0) or 0)/1000.0 or float(getattr(tick,'time',0) or 0)
+   fresh_seconds_into_m1=fresh_live_epoch-(int(m1['time'][-1])+60)
+   if fresh_seconds_into_m1 < 0 or fresh_seconds_into_m1 >= 60.0:
+    await self._log_reject(
+     'SCAN_REJECT',symbol,reason='M1_SIGNAL_EXPIRED_AFTER_ANALYSIS',
+     seconds_into_m1=round(fresh_seconds_into_m1,3),
+     strategy=sig.strategy,side=sig.side.value,
+    )
+    return
+   # Re-check freshness against the current MT5 quote clock immediately
+   # before entry; this uses the same broker-relative basis as the scan above.
    entry_ticks=self.gw.ticks(symbol,80,minimum=40)
    if entry_ticks is None or len(entry_ticks)<40:
     await self._log_reject('SCAN_REJECT',symbol,reason='INSUFFICIENT_ENTRY_TICKS')
@@ -790,7 +837,8 @@ class Engine:
    entry_latest=(float(entry_ticks['time_msc'][-1])/1000.0
                  if 'time_msc' in entry_ticks.dtype.names
                  else float(entry_ticks['time'][-1]))
-   entry_age=time.time()-entry_latest
+   entry_live_epoch=float(getattr(tick,'time_msc',0) or 0)/1000.0 or float(getattr(tick,'time',0) or 0)
+   entry_age=entry_live_epoch-entry_latest
    if abs(entry_age)>settings.max_tick_age_seconds:
     await self._log_reject('SCAN_REJECT',symbol,reason='STALE_ENTRY_QUOTE',age_seconds=entry_age)
     return
@@ -979,7 +1027,7 @@ class Engine:
     return
    req={'action':mt5.TRADE_ACTION_DEAL,'symbol':symbol,'volume':vol,'type':typ,
         'price':price,'sl':sl,'tp':tp,'deviation':settings.max_slippage_points,
-        'magic':4009,'comment':f'TGSCALP:{sig.strategy}',
+        'magic':4009,'comment':('TGSCALP_MANUAL' if manual_mode else f'TGSCALP_{sig.strategy}'),
         'type_time':mt5.ORDER_TIME_GTC,'type_filling':filling}
 
    chk=self.gw.order_check(req)
@@ -1112,7 +1160,7 @@ class Engine:
     )
 
    # Broker-confirmed risk must remain within +/-5% of the Telegram target.
-   if abs(risk_drift_pct)>5.0:
+   if risk_drift_pct>5.0:
     await self.db.log(
      'POST_FILL_RISK_DRIFT_REJECT',symbol,
      ticket=pos.ticket,planned_risk_cash=risk_cash,actual_risk_cash=actual_risk,
@@ -1120,7 +1168,7 @@ class Engine:
      planned_entry=price,actual_entry=fill,actual_sl=actual_sl,
      volume=vol,risk_pct=self.risk_pct,
     )
-    await self._handle_invalid_initial_r(symbol,pos,fill,actual_sl)
+    await self._close_untrackable_position(symbol,pos,reason='POST_FILL_RISK_DRIFT_REJECT',entry=fill,sl=actual_sl)
     return
 
    # Post-fill shadow check uses the real fill. It never closes/rejects a trade
@@ -1167,6 +1215,11 @@ class Engine:
    'INVALID_INITIAL_R',symbol,
    ticket=pos.ticket,entry=fill,sl=actual_sl
   )
+  return await self._close_untrackable_position(
+   symbol,pos,reason='INVALID_INITIAL_R',entry=fill,sl=actual_sl
+  )
+
+ async def _close_untrackable_position(self,symbol,pos,reason,entry=None,sl=None):
   close_res=self.gw.close(pos)
   close_ok=(
    close_res is not None
@@ -1174,24 +1227,40 @@ class Engine:
     mt5.TRADE_RETCODE_DONE,mt5.TRADE_RETCODE_DONE_PARTIAL
    )
   )
+  # A successful market-close response can arrive before MT5 removes the
+  # position from positions_get(). Give the terminal time to converge before
+  # declaring an unmanaged remainder and stopping the engine.
   remaining=self.gw.position_by_ticket(pos.ticket)
+  if close_ok:
+   for _ in range(50):
+    if remaining is None:
+     break
+    await asyncio.sleep(.1)
+    remaining=self.gw.position_by_ticket(pos.ticket)
+  exit_event=f'{reason}_EXIT'
   await self.db.log(
-   'INVALID_INITIAL_R_EXIT',symbol,
-   ticket=pos.ticket,
+   exit_event,symbol,ticket=pos.ticket,
    retcode=getattr(close_res,'retcode',None),
-   comment=getattr(close_res,'comment','') if close_res is not None else ''
+   comment=getattr(close_res,'comment','') if close_res is not None else '',
+   remaining_volume=(float(getattr(remaining,'volume',0) or 0) if remaining is not None else 0.0),
+   entry=entry,sl=sl,
   )
   if not close_ok or remaining is not None:
    self.running=False
    await self.notify(
-    f'🚨 {symbol}: المركز {pos.ticket} لديه R ابتدائية غير صالحة '
-    'ولم يُغلق بالكامل؛ تم إيقاف المحرك لمنع مركز غير متتبع.'
+    f'🚨 {symbol}: تعذر تأكيد الإغلاق الوقائي الكامل للمركز {pos.ticket} '
+    f'({reason})؛ تم إيقاف المحرك لمنع مركز غير متتبع.'
    )
    return False
-  await self.notify(
-   f'⚠️ {symbol}: أُغلقت الصفقة {pos.ticket} حمايةً لأن '
-   'المسافة الابتدائية إلى وقف الخسارة غير صالحة.'
-  )
+  if reason=='INVALID_INITIAL_R':
+   await self.notify(
+    f'⚠️ {symbol}: أُغلقت الصفقة {pos.ticket} حمايةً لأن '
+    'المسافة الابتدائية إلى وقف الخسارة غير صالحة.'
+   )
+  else:
+   await self.notify(
+    f'⚠️ {symbol}: أُغلقت الصفقة {pos.ticket} حمايةً ({reason}).'
+   )
   return True
 
  async def _trade_caption(self,t,current_price=None,pnl=None,closed=False):
@@ -1376,21 +1445,35 @@ class Engine:
   account=self.gw.account()
   account_login=int(getattr(account,'login',0) or 0) if account else 0
   price=tick.bid if t.side==Side.BUY else tick.ask
-  # In AI-native mode the AI-selected duration is the hard time horizon.
-  age=time.time()-t.opened_at
-  trade_minutes=(t.expected_duration_minutes if self.ai_native_only else self.max_trade_minutes)
-  max_age=max(60.0,float(trade_minutes)*60.0)
-  if age>=max_age:
-   pos=self.gw.position_by_ticket(t.ticket)
-   if pos:
-    res=self.gw.close(pos)
-    if res and res.retcode in (mt5.TRADE_RETCODE_DONE,mt5.TRADE_RETCODE_DONE_PARTIAL):
-     await self.db.log('MAX_DURATION_EXIT',t.symbol,ticket=t.ticket,age_seconds=age,max_trade_minutes=trade_minutes)
-     return
-    await self.db.log('MAX_DURATION_EXIT_FAILED',t.symbol,ticket=t.ticket,result=str(res))
+  # Time-based exits are intentionally disabled. AI expected duration is advisory only;
+  # open trades remain managed by broker SL/TP and the protection/trailing logic below.
 
-  favorable=(price-t.entry) if t.side==Side.BUY else (t.entry-price)
-  r=favorable/t.initial_r
+  # Capture favorable intracycle spikes from MT5 tick history instead of relying
+  # only on the single quote visible when this management cycle runs.
+  best_observed_price=float(price)
+  try:
+   recent_ticks=self.gw.ticks(t.symbol,n=10000,minimum=10000)
+  except Exception as ex:
+   recent_ticks=None
+   await self.db.log('MANAGEMENT_TICKS_UNAVAILABLE',t.symbol,ticket=t.ticket,error=repr(ex))
+  if recent_ticks is not None and len(recent_ticks):
+   opened_msc=int(float(t.opened_at)*1000.0)
+   cursor_msc=int(getattr(t,'last_management_tick_msc',opened_msc) or opened_msc)
+   if 'time_msc' in recent_ticks.dtype.names:
+    window=recent_ticks[recent_ticks['time_msc']>=cursor_msc]
+   else:
+    window=recent_ticks[recent_ticks['time']>=int(cursor_msc/1000)]
+   if len(window):
+    field='bid' if t.side==Side.BUY else 'ask'
+    values=window[field]
+    best_observed_price=float(max(values) if t.side==Side.BUY else min(values))
+    if 'time_msc' in window.dtype.names:
+     t.last_management_tick_msc=int(window['time_msc'][-1])
+    else:
+     t.last_management_tick_msc=int(window['time'][-1])*1000
+
+  favorable=(best_observed_price-t.entry) if t.side==Side.BUY else (t.entry-best_observed_price)
+  r=((price-t.entry) if t.side==Side.BUY else (t.entry-price))/t.initial_r
   age=time.time()-t.opened_at
   pos=self.gw.position_by_ticket(t.ticket)
 
@@ -1505,7 +1588,7 @@ class Engine:
     t.sl=protected_sl
     t.protection_45_active=True
     t.trailing=True
-    t.best_favorable_price=price
+    t.best_favorable_price=best_observed_price
     t.last_progress_at=now
 
     await self.db.log(
@@ -1543,14 +1626,17 @@ class Engine:
   # بعد التفعيل: أفضل سعر جديد يحرك SL للأمام. لا يوجد إغلاق بسبب خمول زمني.
   if t.protection_45_active:
    progress=(
-    (t.side==Side.BUY and price>t.best_favorable_price)
+    (t.side==Side.BUY and best_observed_price>t.best_favorable_price)
     or
-    (t.side==Side.SELL and price<t.best_favorable_price)
+    (t.side==Side.SELL and best_observed_price<t.best_favorable_price)
    )
 
-   if progress:
-    t.best_favorable_price=price
-    t.last_progress_at=now
+   # On the activation cycle, place the trailing stop from the best observed
+   # tick immediately; afterwards move it only when a new favorable extreme appears.
+   if progress or not t.trailing_moved:
+    if progress:
+     t.best_favorable_price=best_observed_price
+     t.last_progress_at=now
 
     # فجوة التتبع = 5% من كامل مسافة الدخول إلى TP.
     gap=target_distance*(t.trailing_gap_pct/100.0)
