@@ -1,0 +1,2050 @@
+"""Deterministic, machine-executable intraday strategy catalogue.
+
+Every strategy is a subclass of :class:`BaseStrategy` and declares, through
+:class:`StrategySpec`:
+
+  * symbols/markets it is designed for
+  * regimes that permit it and regimes that forbid it
+  * analysis / context / trigger timeframes
+  * exact indicator parameters
+  * objective market-structure rules and an exact entry trigger
+  * anti-chasing / late-entry guards
+  * technical invalidation -> stop loss
+  * TP / TP1 / TP2 and per-strategy trade management
+  * spread / volatility / session filters
+
+The pack is intentionally curated: only strategies with a stable structural
+rationale are shipped enabled.  `core/strategy_registry.py` maps
+Strategy x Symbol-Class x Regime and can disable combinations.
+"""
+
+from __future__ import annotations
+
+from . import indicators as ta
+from .models import Regime, Side
+from .strategy_base import (
+    MarketContext,
+    StrategySpec,
+    atr_target,
+    base_decision,
+    clamp,
+    confidence_score,
+    rr_of,
+    signal_decision,
+    structural_stop,
+)
+
+
+def _prep(frame):
+    return [dict(zip(frame.dtype.names, row)) if hasattr(frame, 'dtype') else dict(row) for row in frame]
+
+
+def _at(series, index=-1):
+    if not series:
+        return None
+    try:
+        return series[index]
+    except IndexError:
+        return None
+
+
+class BaseStrategy:
+    spec: StrategySpec = None
+
+    def __init__(self, settings=None):
+        self.settings = settings
+
+    # -- eligibility ---------------------------------------------------
+    def eligible(self, ctx, registry=None):
+        spec = self.spec
+        if spec is None:
+            return False, 'NO_SPEC'
+        if registry is not None and not registry.combo_enabled(self, ctx):
+            return False, 'COMBO_DISABLED'
+        regime = ctx.regime.value if ctx.regime else 'NO_TRADE'
+        if regime in spec.forbidden:
+            return False, 'REGIME_FORBIDDEN'
+        if regime not in spec.regimes:
+            return False, 'REGIME_NOT_ALLOWED'
+        if not _symbol_matches(spec.symbols, ctx):
+            return False, 'SYMBOL_NOT_ALLOWED'
+        return True, 'OK'
+
+    # -- shared quality gates -----------------------------------------
+    def base_gates(self, ctx, atr_frame='M5', atr_period=14, max_spread_atr_frac=0.25,
+                   min_atr_points=None):
+        atr_series = ctx.atr(atr_frame, atr_period)
+        atr_value = _at(atr_series)
+        if not atr_value or atr_value <= 0:
+            return False, 'NO_ATR'
+        if min_atr_points and atr_value / ctx.point < min_atr_points:
+            return False, 'ATR_TOO_SMALL'
+        if ctx.spread <= 0:
+            return False, 'NO_SPREAD'
+        if ctx.spread > atr_value * max_spread_atr_frac:
+            return False, 'SPREAD_TOO_WIDE'
+        return True, 'OK'
+
+    def analyze(self, ctx):
+        raise NotImplementedError
+
+    # -- helpers -------------------------------------------------------
+    def wait(self, ctx, code, reason, regime=None):
+        return base_decision(self.spec, ctx, code, reason, regime=regime)
+
+    def chart(self, ctx, levels=None, zones=None, indicators=None):
+        return {
+            'timeframe': self.spec.timeframes[-1] if self.spec.timeframes else 'M5',
+            'levels': levels or [],
+            'zones': zones or [],
+            'indicators': indicators or [],
+        }
+
+
+def _symbol_matches(patterns, ctx):
+    upper = ctx.symbol.upper()
+    for pattern in patterns:
+        token = str(pattern).upper()
+        if token in ('*', 'ANY'):
+            return True
+        if token == 'XAUUSD' and ctx.is_gold:
+            return True
+        if token == 'INDEX' and ctx.is_index:
+            return True
+        if token in upper:
+            return True
+    return False
+
+
+def _xau_only(ctx):
+    return ctx.is_gold
+
+
+# =====================================================================
+# 1. Trend pullback to EMA (FX majors)
+# =====================================================================
+class TrendEMAPullback(BaseStrategy):
+    spec = StrategySpec(
+        id='trend_ema_pullback',
+        name='Trend EMA pullback continuation',
+        family='trend',
+        timeframes=('H1', 'M15', 'M5', 'M1'),
+        symbols=('EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD', 'USDCAD', 'USDCHF', 'NZDUSD', 'EURJPY', 'GBPJPY', 'EURGBP'),
+        regimes=('TREND',),
+        forbidden=('RANGE', 'BREAKOUT', 'VOLATILE', 'NO_TRADE'),
+        indicators=('EMA50 M15', 'EMA200 M15', 'EMA21 M5', 'RSI14 M5', 'ATR14 M5', 'EMA9 M1'),
+        tier='A',
+    )
+
+    def analyze(self, ctx):
+        m15 = ctx.frame('M15'); m5 = ctx.frame('M5'); m1 = ctx.frame('M1')
+        if len(m15) < 210 or len(m5) < 60 or len(m1) < 30:
+            return self.wait(ctx, 'INSUFFICIENT_HISTORY', 'Need M15/M5/M1 history')
+        if ctx.regime_direction() == 'NONE':
+            return self.wait(ctx, 'NO_TREND_DIRECTION', 'M15 trend direction is undefined')
+        c15 = ta.closes(m15)
+        ema50 = ta.ema(c15, 50); ema200 = ta.ema(c15, 200)
+        if _at(ema50) is None or _at(ema200) is None:
+            return self.wait(ctx, 'EMA_WARMUP', 'EMA200 M15 warming up')
+        long_bias = ema50[-1] > ema200[-1]
+        if ctx.regime_direction() == 'UP' and not long_bias:
+            return self.wait(ctx, 'DIRECTION_MISMATCH', 'Regime up but EMA stack is bearish')
+        if ctx.regime_direction() == 'DOWN' and long_bias:
+            return self.wait(ctx, 'DIRECTION_MISMATCH', 'Regime down but EMA stack is bullish')
+
+        ok, reason = self.base_gates(ctx, 'M5', 14)
+        if not ok:
+            return self.wait(ctx, reason, 'Volatility/spread gate')
+
+        c5 = ta.closes(m5); ema21 = ta.ema(c5, 21); rsi5 = ta.rsi(c5, 14)
+        atr5 = ctx.atr('M5', 14)
+        atr_v = _at(atr5)
+        if _at(ema21) is None or _at(rsi5) is None:
+            return self.wait(ctx, 'INDICATOR_WARMUP', 'M5 indicators warming up')
+        last5 = ta.candle(m5[-1])
+        prev5 = ta.candle(m5[-2])
+        distance_atr = abs(last5['close'] - ema21[-1]) / atr_v
+        touched = prev5['low'] <= ema21[-2] + atr_v * 0.25 if long_bias else prev5['high'] >= ema21[-2] - atr_v * 0.25
+        reclaim = (last5['bull'] and last5['close'] > ema21[-1] and last5['close'] > prev5['high']) if long_bias \
+            else (last5['bear'] and last5['close'] < ema21[-1] and last5['close'] < prev5['low'])
+        if not touched:
+            return self.wait(ctx, 'WAIT_PULLBACK', 'Price has not pulled back into EMA21 M5')
+        if not reclaim:
+            return self.wait(ctx, 'WAIT_RECLAIM', 'Pullback present but no M5 reclaim close')
+        # Anti-chasing: entry must be near the mean, not extended.
+        if distance_atr > 1.1:
+            return self.wait(ctx, 'OVEREXTENDED', 'Close is too far from EMA21 to enter')
+        rsi_v = rsi5[-1]
+        if long_bias and not 42 <= rsi_v <= 72:
+            return self.wait(ctx, 'RSI_OUT_OF_BAND', f'RSI14 {rsi_v:.1f} outside pullback band')
+        if not long_bias and not 28 <= rsi_v <= 58:
+            return self.wait(ctx, 'RSI_OUT_OF_BAND', f'RSI14 {rsi_v:.1f} outside pullback band')
+
+        # M1 trigger: momentum resumption in trend direction.
+        c1 = ta.closes(m1); ema9_1 = ta.ema(c1, 9)
+        if _at(ema9_1) is None:
+            return self.wait(ctx, 'M1_WARMUP', 'M1 EMA warming up')
+        last1 = ta.candle(m1[-1]); prev1 = ta.candle(m1[-2])
+        trigger = (last1['bull'] and last1['close'] > ema9_1[-1] and last1['close'] > prev1['high']) if long_bias \
+            else (last1['bear'] and last1['close'] < ema9_1[-1] and last1['close'] < prev1['low'])
+        if not trigger:
+            return self.wait(ctx, 'WAIT_M1_TRIGGER', 'M1 trigger candle has not printed')
+
+        side = Side.BUY if long_bias else Side.SELL
+        price = ctx.price_for(side)
+        swing = min(ta.lows(m5[-6:])) if long_bias else max(ta.highs(m5[-6:]))
+        stop_info = structural_stop(ctx, side, price, swing, buffer_points=4.0,
+                                    min_atr_frac=0.15, atr_frame='M5', max_atr_mult=1.6)
+        if not stop_info:
+            return self.wait(ctx, 'STOP_TOO_WIDE', 'Structural stop exceeds volatility budget')
+        stop, risk = stop_info
+        if ctx.spread / risk > 0.18:
+            return self.wait(ctx, 'SPREAD_TOO_LARGE', 'Spread is a large share of risk')
+        target = atr_target(ctx, side, price, risk, atr_mult=1.4, floor_r=1.5, atr_frame='M5')
+        confidence = confidence_score(66,
+                                      min(8, (abs(ema50[-1] - ema200[-1]) / atr_v - 0.4) * 6),
+                                      min(6, (1.1 - distance_atr) * 5),
+                                      min(5, last5['body_ratio'] * 5))
+        draw = self.chart(ctx, levels=[
+            {'type': 'ENTRY', 'price': price, 'label': 'ENTRY'},
+            {'type': 'SL', 'price': stop, 'label': 'SL'},
+            {'type': 'TP', 'price': target, 'label': 'TP'},
+            {'type': 'EMA', 'price': ema21[-1], 'label': 'EMA21 M5'},
+        ], indicators=[{'name': 'EMA50 M15', 'value': ema50[-1]}, {'name': 'EMA200 M15', 'value': ema200[-1]},
+                       {'name': 'RSI14 M5', 'value': rsi_v}])
+        return signal_decision(
+            self.spec, ctx, side, price, stop, target, confidence,
+            f'EMA50/200 M15 {ctx.regime_direction()} trend, M5 pullback into EMA21 with RSI {rsi_v:.0f}, M1 resumption trigger',
+            management={'protection_pct': 35.0, 'trailing_trigger_pct': 60.0, 'trailing_gap_pct': 7.0,
+                        'max_hold_minutes': 180},
+            draw=draw, regime=ctx.regime.value,
+        )
+
+
+# =====================================================================
+# 2. Trend break & retest
+# =====================================================================
+class TrendBreakRetest(BaseStrategy):
+    spec = StrategySpec(
+        id='trend_break_retest',
+        name='Trend structure break and retest',
+        family='trend',
+        timeframes=('M15', 'M5', 'M1'),
+        symbols=('XAUUSD', 'EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD', 'USDCAD', 'INDEX'),
+        regimes=('TREND', 'BREAKOUT'),
+        forbidden=('RANGE', 'VOLATILE', 'NO_TRADE'),
+        indicators=('Swing structure M15', 'Donchian20 M5', 'ATR14 M5', 'EMA21 M5'),
+        tier='A',
+    )
+
+    def analyze(self, ctx):
+        m15 = ctx.frame('M15'); m5 = ctx.frame('M5'); m1 = ctx.frame('M1')
+        if len(m15) < 60 or len(m5) < 60 or len(m1) < 30:
+            return self.wait(ctx, 'INSUFFICIENT_HISTORY', 'Need M15/M5/M1 history')
+        ok, reason = self.base_gates(ctx, 'M5', 14)
+        if not ok:
+            return self.wait(ctx, reason, 'Volatility/spread gate')
+        atr_v = _at(ctx.atr('M5', 14))
+        swing = ta.swing_points(m15[-40:], 2, 2)
+        highs = [s for s in swing if s['type'] == 'HIGH']
+        lows = [s for s in swing if s['type'] == 'LOW']
+        if not highs or not lows:
+            return self.wait(ctx, 'NO_STRUCTURE', 'No confirmed swings on M15')
+        last_high = highs[-1]; last_low = lows[-1]
+        c5 = ta.closes(m5)
+        don = ta.donchian(m5, 20)
+        last5 = ta.candle(m5[-1]); prev5 = ta.candle(m5[-2])
+        up_break = prev5['close'] > don['upper'][-2] and prev5['close'] > last_high['price']
+        dn_break = prev5['close'] < don['lower'][-2] and prev5['close'] < last_low['price']
+        if not (up_break or dn_break):
+            # allow the break to have happened within the last 6 bars
+            recent = m5[-7:-1]
+            up_break = any(ta.candle(r)['close'] > don['upper'][-7 + i] for i, r in enumerate(recent)) if don['upper'][-7] else False
+            dn_break = any(ta.candle(r)['close'] < don['lower'][-7 + i] for i, r in enumerate(recent)) if don['lower'][-7] else False
+            if not (up_break or dn_break):
+                return self.wait(ctx, 'WAIT_BREAK', 'No structure break yet')
+        side = Side.BUY if up_break else Side.SELL
+        level = last_high['price'] if up_break else last_low['price']
+        retest_tol = max(atr_v * 0.25, ctx.spread * 2.0)
+        if up_break:
+            retested = last5['low'] <= level + retest_tol and last5['close'] > level
+            trigger = last5['bull'] and last5['close'] > prev5['high']
+        else:
+            retested = last5['high'] >= level - retest_tol and last5['close'] < level
+            trigger = last5['bear'] and last5['close'] < prev5['low']
+        if not retested:
+            return self.wait(ctx, 'WAIT_RETEST', 'Waiting for the broken level to be retested and held')
+        if not trigger:
+            return self.wait(ctx, 'WAIT_TRIGGER', 'Retest held but no rejection trigger')
+        price = ctx.price_for(side)
+        # Anti-chase: if price already ran >1 ATR past level, skip.
+        if abs(price - level) > atr_v * 1.0:
+            return self.wait(ctx, 'LATE_ENTRY', 'Price already extended more than 1 ATR beyond the level')
+        anchor = min(ta.lows(m5[-4:])) if up_break else max(ta.highs(m5[-4:]))
+        anchor = min(anchor, level - atr_v * 0.1) if up_break else max(anchor, level + atr_v * 0.1)
+        stop_info = structural_stop(ctx, side, price, anchor, buffer_points=4.0, min_atr_frac=0.12,
+                                    atr_frame='M5', max_atr_mult=1.8)
+        if not stop_info:
+            return self.wait(ctx, 'STOP_TOO_WIDE', 'Structural stop exceeds volatility budget')
+        stop, risk = stop_info
+        target = atr_target(ctx, side, price, risk, atr_mult=1.8, floor_r=1.6, atr_frame='M5')
+        confidence = confidence_score(68, 6 if ctx.regime == Regime.BREAKOUT else 0,
+                                      min(6, last5['body_ratio'] * 6))
+        draw = self.chart(ctx, levels=[
+            {'type': 'ENTRY', 'price': price}, {'type': 'SL', 'price': stop},
+            {'type': 'TP', 'price': target},
+            {'type': 'LEVEL', 'price': level, 'label': 'broken structure'},
+        ])
+        return signal_decision(
+            self.spec, ctx, side, price, stop, target, confidence,
+            f'{ctx.symbol} broke {"swing high" if up_break else "swing low"} {level:.{ctx.digits}f}, retested and confirmed',
+            management={'protection_pct': 40.0, 'trailing_trigger_pct': 65.0, 'trailing_gap_pct': 8.0,
+                        'max_hold_minutes': 240},
+            draw=draw, regime=ctx.regime.value,
+        )
+
+
+# =====================================================================
+# 3. Momentum resume after consolidation
+# =====================================================================
+class TrendMomentumResume(BaseStrategy):
+    spec = StrategySpec(
+        id='trend_momentum_resume',
+        name='Momentum resumption out of consolidation',
+        family='trend',
+        timeframes=('M15', 'M5', 'M1'),
+        symbols=('XAUUSD', 'EURUSD', 'GBPUSD', 'USDJPY', 'INDEX'),
+        regimes=('TREND',),
+        forbidden=('RANGE', 'VOLATILE', 'NO_TRADE'),
+        indicators=('EMA20 M5', 'EMA50 M5', 'MACD 12/26/9 M5', 'ATR14 M5', 'M1 EMA9'),
+        tier='A',
+    )
+
+    def analyze(self, ctx):
+        m15 = ctx.frame('M15'); m5 = ctx.frame('M5'); m1 = ctx.frame('M1')
+        if len(m15) < 60 or len(m5) < 80 or len(m1) < 30:
+            return self.wait(ctx, 'INSUFFICIENT_HISTORY', 'Need more history')
+        ok, reason = self.base_gates(ctx, 'M5', 14)
+        if not ok:
+            return self.wait(ctx, reason, 'Volatility/spread gate')
+        c5 = ta.closes(m5)
+        ema20 = ta.ema(c5, 20); ema50 = ta.ema(c5, 50)
+        if _at(ema20) is None or _at(ema50) is None:
+            return self.wait(ctx, 'EMA_WARMUP', 'M5 EMAs warming up')
+        if ctx.regime_direction() == 'UP' and not ema20[-1] > ema50[-1]:
+            return self.wait(ctx, 'STACK_MISMATCH', 'Bullish regime but EMA20<=EMA50')
+        if ctx.regime_direction() == 'DOWN' and not ema20[-1] < ema50[-1]:
+            return self.wait(ctx, 'STACK_MISMATCH', 'Bearish regime but EMA20>=EMA50')
+        macd = ta.macd(c5, 12, 26, 9)
+        hist = macd['hist']
+        atr_v = _at(ctx.atr('M5', 14))
+        # consolidation: last 6 bars range <= 1.4 ATR
+        recent = m5[-7:-1]
+        box_high = max(ta.highs(recent)); box_low = min(ta.lows(recent))
+        compressed = (box_high - box_low) <= atr_v * 1.4
+        if not compressed:
+            return self.wait(ctx, 'NOT_COMPRESSED', 'No consolidation before the trigger')
+        last5 = ta.candle(m5[-1])
+        prev5 = ta.candle(m5[-2])
+        long_break = last5['close'] > box_high and last5['bull'] and hist[-1] is not None and hist[-1] > 0 and (hist[-2] or 0) <= hist[-1]
+        short_break = last5['close'] < box_low and last5['bear'] and hist[-1] is not None and hist[-1] < 0 and (hist[-2] or 0) >= hist[-1]
+        if not (long_break or short_break):
+            return self.wait(ctx, 'WAIT_RESUME', 'No momentum resolution of the consolidation')
+        side = Side.BUY if long_break else Side.SELL
+        price = ctx.price_for(side)
+        box = (box_high - box_low)
+        if abs(price - (box_high if long_break else box_low)) > max(box, atr_v) * 0.5:
+            return self.wait(ctx, 'LATE_ENTRY', 'Breakout already extended')
+        anchor = box_low if long_break else box_high
+        stop_info = structural_stop(ctx, side, price, anchor, buffer_points=3.0, min_atr_frac=0.10,
+                                    atr_frame='M5', max_atr_mult=1.7)
+        if not stop_info:
+            return self.wait(ctx, 'STOP_TOO_WIDE', 'Structural stop exceeds volatility budget')
+        stop, risk = stop_info
+        if ctx.spread / risk > 0.20:
+            return self.wait(ctx, 'SPREAD_TOO_LARGE', 'Spread/risk too high')
+        target = atr_target(ctx, side, price, risk, atr_mult=1.6, floor_r=1.5, atr_frame='M5')
+        confidence = confidence_score(67, 5 if compressed else 0, min(6, last5['body_ratio'] * 6))
+        return signal_decision(
+            self.spec, ctx, side, price, stop, target, confidence,
+            f'EMA stack aligned with {ctx.regime_direction()} trend, consolidation resolved with MACD acceleration',
+            management={'protection_pct': 38.0, 'trailing_trigger_pct': 60.0, 'trailing_gap_pct': 8.0,
+                        'max_hold_minutes': 180},
+            draw=self.chart(ctx, zones=[{'kind': 'CONSOLIDATION', 'low': box_low, 'high': box_high}],
+                            levels=[{'type': 'ENTRY', 'price': price}, {'type': 'SL', 'price': stop},
+                                    {'type': 'TP', 'price': target}]),
+            regime=ctx.regime.value,
+        )
+
+
+# =====================================================================
+# 4. Range/Bollinger mean reversion (FX)
+# =====================================================================
+class RangeBollingerReversion(BaseStrategy):
+    spec = StrategySpec(
+        id='range_bollinger_reversion',
+        name='Range Bollinger/RSI reversion',
+        family='mean_reversion',
+        timeframes=('M15', 'M5'),
+        symbols=('EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD', 'USDCAD', 'USDCHF', 'NZDUSD', 'EURJPY', 'EURGBP'),
+        regimes=('RANGE',),
+        forbidden=('TREND', 'BREAKOUT', 'VOLATILE', 'NO_TRADE'),
+        indicators=('Bollinger 20/2.0 M5', 'RSI14 M5', 'ATR14 M15', 'M15 range bounds'),
+        tier='A',
+    )
+
+    def analyze(self, ctx):
+        m15 = ctx.frame('M15'); m5 = ctx.frame('M5')
+        if len(m15) < 60 or len(m5) < 60:
+            return self.wait(ctx, 'INSUFFICIENT_HISTORY', 'Need M15/M5 history')
+        ok, reason = self.base_gates(ctx, 'M15', 14)
+        if not ok:
+            return self.wait(ctx, reason, 'Volatility/spread gate')
+        atr15 = _at(ctx.atr('M15', 14))
+        look = m15[-48:]
+        lows = sorted(ta.lows(look)); highs = sorted(ta.highs(look))
+        support = sum(lows[:5]) / 5.0; resistance = sum(highs[-5:]) / 5.0
+        span = resistance - support
+        if span <= max(atr15 * 2.0, ctx.point * 20):
+            return self.wait(ctx, 'RANGE_TOO_TIGHT', 'M15 range span is unusable')
+        c5 = ta.closes(m5)
+        bb = ta.bollinger(c5, 20, 2.0)
+        rsi5 = ta.rsi(c5, 14)
+        if _at(bb['upper']) is None or _at(rsi5) is None:
+            return self.wait(ctx, 'INDICATOR_WARMUP', 'M5 indicators warming up')
+        last5 = ta.candle(m5[-1]); mid = ctx.mid
+        edge = max(span * 0.18, atr15 * 0.5)
+        at_support = mid <= support + edge
+        at_resistance = mid >= resistance - edge
+        if not (at_support or at_resistance):
+            return self.wait(ctx, 'MID_RANGE', 'Price is mid-range; no edge present')
+        if at_support:
+            reject = (last5['low'] <= bb['lower'][-1] and last5['bull']
+                      and last5['close'] > bb['lower'][-1] and last5['lower_wick'] >= max(last5['body'] * 0.7, last5['range'] * 0.25)
+                      and rsi5[-1] < 40)
+            side = Side.BUY
+        else:
+            reject = (last5['high'] >= bb['upper'][-1] and last5['bear']
+                      and last5['close'] < bb['upper'][-1] and last5['upper_wick'] >= max(last5['body'] * 0.7, last5['range'] * 0.25)
+                      and rsi5[-1] > 60)
+            side = Side.SELL
+        if not reject:
+            return self.wait(ctx, 'WAIT_REJECTION', 'At range edge but no rejection candle with RSI extreme')
+        price = ctx.price_for(side)
+        anchor = last5['low'] if side == Side.BUY else last5['high']
+        stop_info = structural_stop(ctx, side, price, anchor, buffer_points=4.0, min_atr_frac=0.15,
+                                    atr_frame='M15', max_atr_mult=1.4)
+        if not stop_info:
+            return self.wait(ctx, 'STOP_TOO_WIDE', 'Structural stop exceeds range size')
+        stop, risk = stop_info
+        target = bb['mid'][-1]
+        if (side == Side.BUY and target <= price) or (side == Side.SELL and target >= price):
+            return self.wait(ctx, 'BAD_TARGET', 'Mean is on the wrong side of entry')
+        rr = rr_of(price, stop, target)
+        if rr < 1.1:
+            return self.wait(ctx, 'RR_TOO_LOW', f'Mean-reversion target only {rr:.2f}R')
+        confidence = confidence_score(70, min(8, rr * 3), 4 if last5['body_ratio'] > 0.3 else 0)
+        return signal_decision(
+            self.spec, ctx, side, price, stop, target, confidence,
+            f'M15 range edge {"support" if side == Side.BUY else "resistance"} with M5 Bollinger rejection and RSI {rsi5[-1]:.0f}',
+            tp1=bb['mid'][-1], tp2=resistance if side == Side.BUY else support,
+            management={'protection_pct': 45.0, 'trailing_trigger_pct': 75.0, 'trailing_gap_pct': 8.0,
+                        'partial_at_tp1': 0.5, 'tp1_lock_to_breakeven': True, 'max_hold_minutes': 240},
+            draw=self.chart(ctx, zones=[{'kind': 'RANGE', 'low': support, 'high': resistance}],
+                            levels=[{'type': 'ENTRY', 'price': price}, {'type': 'SL', 'price': stop},
+                                    {'type': 'TP1', 'price': bb['mid'][-1]},
+                                    {'type': 'TP2', 'price': resistance if side == Side.BUY else support}]),
+            regime=ctx.regime.value,
+        )
+
+
+# =====================================================================
+# 5. Range stochastic reversal (FX)
+# =====================================================================
+class RangeStochasticReversal(BaseStrategy):
+    spec = StrategySpec(
+        id='range_stochastic_reversal',
+        name='Range stochastic extreme reversal',
+        family='mean_reversion',
+        timeframes=('M15', 'M5', 'M1'),
+        symbols=('EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD', 'USDCAD', 'NZDUSD', 'EURGBP'),
+        regimes=('RANGE',),
+        forbidden=('TREND', 'BREAKOUT', 'VOLATILE', 'NO_TRADE'),
+        indicators=('Stochastic 14/3/3 M5', 'RSI14 M5', 'M15 range bounds', 'ATR14 M5'),
+        tier='C',
+    )
+
+    def analyze(self, ctx):
+        m15 = ctx.frame('M15'); m5 = ctx.frame('M5'); m1 = ctx.frame('M1')
+        if len(m15) < 60 or len(m5) < 60 or len(m1) < 20:
+            return self.wait(ctx, 'INSUFFICIENT_HISTORY', 'Need M15/M5/M1 history')
+        ok, reason = self.base_gates(ctx, 'M5', 14)
+        if not ok:
+            return self.wait(ctx, reason, 'Volatility/spread gate')
+        atr15 = _at(ctx.atr('M15', 14))
+        look = m15[-48:]
+        support = sum(sorted(ta.lows(look))[:5]) / 5.0
+        resistance = sum(sorted(ta.highs(look))[-5:]) / 5.0
+        span = resistance - support
+        if span <= max(atr15 * 2.0, ctx.point * 20):
+            return self.wait(ctx, 'RANGE_TOO_TIGHT', 'M15 range span is unusable')
+        edge = max(span * 0.15, atr15 * 0.4)
+        if not (ctx.mid <= support + edge or ctx.mid >= resistance - edge):
+            return self.wait(ctx, 'MID_RANGE', 'Price is mid-range')
+        st = ta.stochastic(m5, 14, 3, 3)
+        k = st['k']; d = st['d']
+        if _at(k) is None or _at(d) is None or _at(k, -2) is None or _at(d, -2) is None:
+            return self.wait(ctx, 'STOCH_WARMUP', 'Stochastic warming up')
+        last5 = ta.candle(m5[-1])
+        long_sig = (k[-2] <= 20 and k[-1] > d[-1] and k[-2] < d[-2] and last5['bull']
+                    and last5['close'] > m5[-2]['close'])
+        short_sig = (k[-2] >= 80 and k[-1] < d[-1] and k[-2] > d[-2] and last5['bear']
+                     and last5['close'] < m5[-2]['close'])
+        near_support = ctx.mid <= support + edge
+        near_resistance = ctx.mid >= resistance - edge
+        if long_sig and near_support:
+            side = Side.BUY
+        elif short_sig and near_resistance:
+            side = Side.SELL
+        else:
+            return self.wait(ctx, 'WAIT_CONFIRMATION', 'No stochastic cross at the range edge')
+        price = ctx.price_for(side)
+        anchor = min(ta.lows(m5[-4:])) if side == Side.BUY else max(ta.highs(m5[-4:]))
+        stop_info = structural_stop(ctx, side, price, anchor, buffer_points=4.0, min_atr_frac=0.18,
+                                    atr_frame='M5', max_atr_mult=1.4)
+        if not stop_info:
+            return self.wait(ctx, 'STOP_TOO_WIDE', 'Structural stop exceeds volatility budget')
+        stop, risk = stop_info
+        target = (support + resistance) / 2.0
+        if (side == Side.BUY and target <= price) or (side == Side.SELL and target >= price):
+            return self.wait(ctx, 'BAD_TARGET', 'Range mid on the wrong side')
+        rr = rr_of(price, stop, target)
+        if rr < 1.0:
+            return self.wait(ctx, 'RR_TOO_LOW', f'Only {rr:.2f}R to range mid')
+        confidence = confidence_score(64, min(8, (abs(k[-2] - 20) if side == Side.BUY else abs(k[-2] - 80)) * 0.4))
+        return signal_decision(
+            self.spec, ctx, side, price, stop, target, confidence,
+            f'Stochastic 14/3/3 cross out of {"oversold" if side == Side.BUY else "overbought"} at M15 range edge',
+            tp1=target, management={'protection_pct': 45.0, 'trailing_trigger_pct': 75.0,
+                                    'trailing_gap_pct': 8.0, 'max_hold_minutes': 240},
+            draw=self.chart(ctx, zones=[{'kind': 'RANGE', 'low': support, 'high': resistance}],
+                            levels=[{'type': 'ENTRY', 'price': price}, {'type': 'SL', 'price': stop},
+                                    {'type': 'TP', 'price': target}]),
+            regime=ctx.regime.value,
+        )
+
+
+# =====================================================================
+# 6. Asian range breakout (FX)
+# =====================================================================
+class AsiaRangeBreakout(BaseStrategy):
+    spec = StrategySpec(
+        id='asia_range_breakout',
+        name='Asian range breakout (London open)',
+        family='breakout',
+        timeframes=('M15', 'M5'),
+        symbols=('EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD', 'USDCAD', 'USDCHF', 'NZDUSD', 'EURJPY', 'GBPJPY'),
+        regimes=('BREAKOUT', 'TREND'),
+        forbidden=('RANGE', 'VOLATILE', 'NO_TRADE'),
+        indicators=('Asian session M15 box', 'ATR14 M15', 'M5 close', 'M5 tick volume'),
+        tier='B',
+    )
+
+    def analyze(self, ctx):
+        if ctx.session not in ('LONDON', 'OVERLAP'):
+            return self.wait(ctx, 'OUTSIDE_SESSION', 'Asian range breakout only trades at London open')
+        m15 = ctx.frame('M15'); m5 = ctx.frame('M5')
+        if len(m15) < 80 or len(m5) < 40:
+            return self.wait(ctx, 'INSUFFICIENT_HISTORY', 'Need M15/M5 history')
+        ok, reason = self.base_gates(ctx, 'M15', 14)
+        if not ok:
+            return self.wait(ctx, reason, 'Volatility/spread gate')
+        atr15 = _at(ctx.atr('M15', 14))
+        # Build the Asian box from the most recent completed 00:00-07:00 UTC bars.
+        import datetime as _dt
+        now = ctx.last_closed('M15')
+        if not now:
+            return self.wait(ctx, 'NO_DATA', 'No M15 bar')
+        day_start = int(_dt.datetime.fromtimestamp(ta._f(now.get('time')), _dt.timezone.utc).replace(
+            hour=0, minute=0, second=0, microsecond=0).timestamp())
+        asia = [r for r in m15 if day_start <= ta._f(r.get('time')) < day_start + 7 * 3600][-28:]
+        if len(asia) < 12:
+            return self.wait(ctx, 'NO_ASIA_RANGE', 'Asian session box not available yet')
+        box_high = max(ta.highs(asia)); box_low = min(ta.lows(asia))
+        box = box_high - box_low
+        if box <= 0 or box > atr15 * 3.5:
+            return self.wait(ctx, 'BOX_INVALID', 'Asian box size is not usable')
+        last5 = ta.candle(m5[-1]); prev5 = ta.candle(m5[-2])
+        buffer = max(ctx.spread * 1.5, box * 0.05)
+        up = last5['close'] > box_high + buffer and last5['bull'] and prev5['close'] <= box_high + buffer
+        dn = last5['close'] < box_low - buffer and last5['bear'] and prev5['close'] >= box_low - buffer
+        if not (up or dn):
+            return self.wait(ctx, 'WAIT_BOX_BREAK', 'No confirmed close outside the Asian box')
+        side = Side.BUY if up else Side.SELL
+        price = ctx.price_for(side)
+        if abs(price - (box_high if up else box_low)) > atr15 * 0.9:
+            return self.wait(ctx, 'LATE_ENTRY', 'Breakout bar already too extended')
+        anchor = box_high - box * 0.15 if up else box_low + box * 0.15
+        stop_info = structural_stop(ctx, side, price, anchor, buffer_points=4.0, min_atr_frac=0.15,
+                                    atr_frame='M15', max_atr_mult=1.5)
+        if not stop_info:
+            return self.wait(ctx, 'STOP_TOO_WIDE', 'Structural stop exceeds budget')
+        stop, risk = stop_info
+        target = atr_target(ctx, side, price, risk, atr_mult=1.8, floor_r=1.6, atr_frame='M15')
+        confidence = confidence_score(65, 6 if ctx.session == 'LONDON' else 2,
+                                      min(6, (box / atr15) * 2))
+        return signal_decision(
+            self.spec, ctx, side, price, stop, target, confidence,
+            f'Asian box {box_low:.{ctx.digits}f}-{box_high:.{ctx.digits}f} broken on the {ctx.session} open',
+            management={'protection_pct': 40.0, 'trailing_trigger_pct': 60.0, 'trailing_gap_pct': 8.0,
+                        'max_hold_minutes': 300},
+            draw=self.chart(ctx, zones=[{'kind': 'ASIA_RANGE', 'low': box_low, 'high': box_high}],
+                            levels=[{'type': 'ENTRY', 'price': price}, {'type': 'SL', 'price': stop},
+                                    {'type': 'TP', 'price': target}]),
+            regime=ctx.regime.value,
+        )
+
+
+# =====================================================================
+# 7. London/NY sweep and reclaim (FX majors + gold)
+# =====================================================================
+class LiquiditySweepReclaim(BaseStrategy):
+    spec = StrategySpec(
+        id='liquidity_sweep_reclaim',
+        name='Liquidity sweep and reclaim reversal',
+        family='reversal',
+        timeframes=('H1', 'M15', 'M5', 'M1'),
+        symbols=('EURUSD', 'GBPUSD', 'USDJPY', 'XAUUSD'),
+        regimes=('RANGE', 'VOLATILE', 'TREND'),
+        forbidden=('NO_TRADE',),
+        indicators=('H1 swing levels', 'M5 wick/close reclaim', 'ATR14 M5', 'Session filter'),
+        tier='B',
+    )
+
+    def analyze(self, ctx):
+        if ctx.session == 'LATE':
+            return self.wait(ctx, 'OUTSIDE_SESSION', 'Sweep strategy avoids the dead late session')
+        h1 = ctx.frame('H1'); m5 = ctx.frame('M5'); m1 = ctx.frame('M1')
+        if len(h1) < 60 or len(m5) < 60 or len(m1) < 20:
+            return self.wait(ctx, 'INSUFFICIENT_HISTORY', 'Need H1/M5/M1 history')
+        ok, reason = self.base_gates(ctx, 'M5', 14)
+        if not ok:
+            return self.wait(ctx, reason, 'Volatility/spread gate')
+        atr_v = _at(ctx.atr('M5', 14))
+        swings = ta.swing_points(h1[-48:], 2, 2)
+        highs = [s['price'] for s in swings if s['type'] == 'HIGH'][-4:]
+        lows = [s['price'] for s in swings if s['type'] == 'LOW'][-4:]
+        if not highs or not lows:
+            return self.wait(ctx, 'NO_LIQUIDITY_LEVELS', 'No recent H1 swings')
+        recent = m5[-6:]
+        last = ta.candle(m5[-1])
+        swept_high = any(ta.candle(r)['high'] > max(highs) for r in recent)
+        swept_low = any(ta.candle(r)['low'] < min(lows) for r in recent)
+        if swept_high and last['close'] < max(highs) and last['bear']:
+            side = Side.SELL
+            level = max(highs)
+        elif swept_low and last['close'] > min(lows) and last['bull']:
+            side = Side.BUY
+            level = min(lows)
+        else:
+            return self.wait(ctx, 'WAIT_SWEEP', 'No swept H1 level reclaimed yet')
+        price = ctx.price_for(side)
+        # reclaim must be decisive, not a mid-move entry
+        if side == Side.BUY and price - level > atr_v * 0.8:
+            return self.wait(ctx, 'LATE_ENTRY', 'Price already far above the reclaimed level')
+        if side == Side.SELL and level - price > atr_v * 0.8:
+            return self.wait(ctx, 'LATE_ENTRY', 'Price already far below the reclaimed level')
+        extreme = last['low'] if side == Side.BUY else last['high']
+        stop_info = structural_stop(ctx, side, price, extreme, buffer_points=5.0, min_atr_frac=0.2,
+                                    atr_frame='M5', max_atr_mult=1.8)
+        if not stop_info:
+            return self.wait(ctx, 'STOP_TOO_WIDE', 'Structural stop exceeds volatility budget')
+        stop, risk = stop_info
+        if ctx.spread / risk > 0.22:
+            return self.wait(ctx, 'SPREAD_TOO_LARGE', 'Spread too large for a sweep entry')
+        target = atr_target(ctx, side, price, risk, atr_mult=1.8, floor_r=1.6, atr_frame='M5')
+        confidence = confidence_score(66, 5 if ctx.session in ('LONDON', 'OVERLAP') else 0,
+                                      min(6, last['body_ratio'] * 6))
+        return signal_decision(
+            self.spec, ctx, side, price, stop, target, confidence,
+            f'H1 {"high" if side == Side.SELL else "low"} {level:.{ctx.digits}f} swept and reclaimed with rejection close',
+            management={'protection_pct': 40.0, 'trailing_trigger_pct': 65.0, 'trailing_gap_pct': 8.0,
+                        'max_hold_minutes': 180},
+            draw=self.chart(ctx, levels=[
+                {'type': 'ENTRY', 'price': price}, {'type': 'SL', 'price': stop},
+                {'type': 'TP', 'price': target},
+                {'type': 'SWEEP', 'price': level, 'label': 'swept level'}]),
+            regime=ctx.regime.value,
+        )
+
+
+# =====================================================================
+# 8. Gold trend pullback (XAUUSD specific)
+# =====================================================================
+class GoldTrendPullback(BaseStrategy):
+    spec = StrategySpec(
+        id='gold_trend_pullback',
+        name='Gold trend pullback (M15 EMA + M5 trigger)',
+        family='trend',
+        timeframes=('M15', 'M5', 'M1'),
+        symbols=('XAUUSD',),
+        regimes=('TREND',),
+        forbidden=('RANGE', 'VOLATILE', 'NO_TRADE'),
+        indicators=('EMA21/EMA50 M15', 'ATR14 M5', 'EMA20 M5', 'M1 engulfing trigger'),
+        tier='A',
+    )
+
+    def analyze(self, ctx):
+        if not ctx.is_gold:
+            return self.wait(ctx, 'WRONG_SYMBOL', 'Gold strategy requires a gold symbol')
+        m15 = ctx.frame('M15'); m5 = ctx.frame('M5'); m1 = ctx.frame('M1')
+        if len(m15) < 60 or len(m5) < 60 or len(m1) < 25:
+            return self.wait(ctx, 'INSUFFICIENT_HISTORY', 'Need M15/M5/M1 history')
+        ok, reason = self.base_gates(ctx, 'M5', 14, max_spread_atr_frac=0.22)
+        if not ok:
+            return self.wait(ctx, reason, 'Gold volatility/spread gate')
+        c15 = ta.closes(m15)
+        ema21 = ta.ema(c15, 21); ema50 = ta.ema(c15, 50)
+        if _at(ema21) is None or _at(ema50) is None:
+            return self.wait(ctx, 'EMA_WARMUP', 'M15 EMAs warming up')
+        direction = ctx.regime_direction()
+        if direction == 'UP' and not ema21[-1] > ema50[-1]:
+            return self.wait(ctx, 'STACK_MISMATCH', 'Bullish regime but M15 EMA21<=EMA50')
+        if direction == 'DOWN' and not ema21[-1] < ema50[-1]:
+            return self.wait(ctx, 'STACK_MISMATCH', 'Bearish regime but M15 EMA21>=EMA50')
+        if direction == 'NONE':
+            return self.wait(ctx, 'NO_DIRECTION', 'No gold trend direction')
+        atr5 = _at(ctx.atr('M5', 14))
+        side = Side.BUY if direction == 'UP' else Side.SELL
+        # pullback into a zone: retracement of 35-65% of the last impulse leg
+        leg = m15[-12:]
+        if side == Side.BUY:
+            base = min(ta.lows(leg)); top = max(ta.highs(leg))
+            low = top - (top - base) * 0.62; high = top - (top - base) * 0.30
+        else:
+            base = max(ta.highs(leg)); bottom = min(ta.lows(leg))
+            low = bottom + (base - bottom) * 0.30; high = bottom + (base - bottom) * 0.62
+        if not low <= ctx.mid <= high:
+            return self.wait(ctx, 'WAIT_PULLBACK_ZONE', 'Price is not inside the 30-62% retracement zone')
+        last1 = ta.candle(m1[-1]); prev1 = ta.candle(m1[-2])
+        trigger = ((last1['close'] > max(prev1['open'], prev1['close'], last1['open']) and last1['bull'])
+                   if side == Side.BUY else
+                   (last1['close'] < min(prev1['open'], prev1['close'], last1['open']) and last1['bear']))
+        if not trigger:
+            return self.wait(ctx, 'WAIT_M1_TRIGGER', 'No M1 engulfing trigger in the pullback zone')
+        price = ctx.price_for(side)
+        anchor = min(ta.lows(m5[-5:])) if side == Side.BUY else max(ta.highs(m5[-5:]))
+        stop_info = structural_stop(ctx, side, price, anchor, buffer_points=6.0, min_atr_frac=0.18,
+                                    atr_frame='M5', max_atr_mult=1.7)
+        if not stop_info:
+            return self.wait(ctx, 'STOP_TOO_WIDE', 'Structural stop exceeds gold volatility budget')
+        stop, risk = stop_info
+        if ctx.spread / risk > 0.15:
+            return self.wait(ctx, 'SPREAD_TOO_LARGE', 'Gold spread too large relative to risk')
+        target = atr_target(ctx, side, price, risk, atr_mult=1.8, floor_r=1.6, atr_frame='M5')
+        confidence = confidence_score(68, min(6, (atr5 / ctx.point) / 60.0), 5 if ctx.session == 'OVERLAP' else 0)
+        return signal_decision(
+            self.spec, ctx, side, price, stop, target, confidence,
+            f'Gold {direction} trend, 30-62% retracement zone with M1 engulfing trigger',
+            management={'protection_pct': 35.0, 'trailing_trigger_pct': 60.0, 'trailing_gap_pct': 7.0,
+                        'max_hold_minutes': 180},
+            draw=self.chart(ctx, zones=[{'kind': 'PULLBACK_ZONE', 'low': low, 'high': high}],
+                            levels=[{'type': 'ENTRY', 'price': price}, {'type': 'SL', 'price': stop},
+                                    {'type': 'TP', 'price': target}]),
+            regime=ctx.regime.value,
+        )
+
+
+# =====================================================================
+# 9. Gold opening-range breakout (NY)
+# =====================================================================
+class GoldOpeningRangeBreakout(BaseStrategy):
+    spec = StrategySpec(
+        id='gold_opening_range_breakout',
+        name='Gold NY opening-range breakout',
+        family='breakout',
+        timeframes=('M15', 'M5'),
+        symbols=('XAUUSD',),
+        regimes=('BREAKOUT', 'TREND', 'VOLATILE'),
+        forbidden=('RANGE', 'NO_TRADE'),
+        indicators=('NY opening range 13:30-14:00 UTC M5', 'ATR14 M5', 'M5 close/retest'),
+        tier='B',
+    )
+
+    def _or_window(self, ctx):
+        import datetime as _dt
+        m5 = ctx.frame('M5')
+        if not m5:
+            return None
+        bar = m5[-1]
+        day = _dt.datetime.fromtimestamp(ta._f(bar.get('time')), _dt.timezone.utc).replace(
+            hour=0, minute=0, second=0, microsecond=0)
+        start = day.replace(hour=13, minute=30)
+        end = day.replace(hour=14, minute=0)
+        window = [r for r in m5 if start.timestamp() <= ta._f(r.get('time')) < end.timestamp()][-8:]
+        return window if len(window) >= 4 else None
+
+    def analyze(self, ctx):
+        if not ctx.is_gold:
+            return self.wait(ctx, 'WRONG_SYMBOL', 'Gold strategy requires a gold symbol')
+        if ctx.session not in ('OVERLAP', 'NEWYORK'):
+            return self.wait(ctx, 'OUTSIDE_SESSION', 'Gold ORB trades the New York window only')
+        m5 = ctx.frame('M5')
+        if len(m5) < 60:
+            return self.wait(ctx, 'INSUFFICIENT_HISTORY', 'Need M5 history')
+        ok, reason = self.base_gates(ctx, 'M5', 14, max_spread_atr_frac=0.22)
+        if not ok:
+            return self.wait(ctx, reason, 'Gold volatility/spread gate')
+        window = self._or_window(ctx)
+        if not window:
+            return self.wait(ctx, 'NO_OPENING_RANGE', 'NY opening range not built yet')
+        high = max(ta.highs(window)); low = min(ta.lows(window))
+        span = high - low
+        atr_v = _at(ctx.atr('M5', 14))
+        if span > atr_v * 3.5:
+            return self.wait(ctx, 'RANGE_TOO_WIDE', 'Opening range too wide to trade')
+        last = ta.candle(m5[-1]); prev = ta.candle(m5[-2])
+        up = last['close'] > high and prev['close'] <= high
+        dn = last['close'] < low and prev['close'] >= low
+        # allow a retest within the last 4 bars
+        if not (up or dn):
+            recent = m5[-5:-1]
+            up = any(ta.candle(r)['close'] > high for r in recent) and last['close'] > high and last['low'] <= high + atr_v * 0.2
+            dn = any(ta.candle(r)['close'] < low for r in recent) and last['close'] < low and last['high'] >= low - atr_v * 0.2
+            if not (up or dn):
+                return self.wait(ctx, 'WAIT_ORB', 'No opening-range break/retest yet')
+        side = Side.BUY if up else Side.SELL
+        price = ctx.price_for(side)
+        if abs(price - (high if up else low)) > atr_v * 1.0:
+            return self.wait(ctx, 'LATE_ENTRY', 'ORB already extended')
+        anchor = low if up else high
+        stop_info = structural_stop(ctx, side, price, anchor, buffer_points=5.0, min_atr_frac=0.15,
+                                    atr_frame='M5', max_atr_mult=1.6)
+        if not stop_info:
+            return self.wait(ctx, 'STOP_TOO_WIDE', 'Structural stop exceeds gold budget')
+        stop, risk = stop_info
+        target = atr_target(ctx, side, price, risk, atr_mult=1.8, floor_r=1.6, atr_frame='M5')
+        confidence = confidence_score(66, 5, min(5, (span / atr_v) * 2))
+        return signal_decision(
+            self.spec, ctx, side, price, stop, target, confidence,
+            f'Gold NY opening range {low:.{ctx.digits}f}-{high:.{ctx.digits}f} broken with retest',
+            management={'protection_pct': 40.0, 'trailing_trigger_pct': 60.0, 'trailing_gap_pct': 8.0,
+                        'max_hold_minutes': 240},
+            draw=self.chart(ctx, zones=[{'kind': 'OPENING_RANGE', 'low': low, 'high': high}],
+                            levels=[{'type': 'ENTRY', 'price': price}, {'type': 'SL', 'price': stop},
+                                    {'type': 'TP', 'price': target}]),
+            regime=ctx.regime.value,
+        )
+
+
+# =====================================================================
+# 10. Volatility squeeze breakout
+# =====================================================================
+class VolatilitySqueezeBreakout(BaseStrategy):
+    spec = StrategySpec(
+        id='volatility_squeeze_breakout',
+        name='Bollinger/Keltner squeeze breakout',
+        family='breakout',
+        timeframes=('M15', 'M5'),
+        symbols=('XAUUSD', 'EURUSD', 'GBPUSD', 'USDJPY', 'INDEX'),
+        regimes=('BREAKOUT', 'RANGE'),
+        forbidden=('VOLATILE', 'NO_TRADE'),
+        indicators=('Bollinger 20/2 M5', 'Keltner 20/1.5 M5', 'ATR14 M5', 'M15 EMA filter'),
+        tier='B',
+    )
+
+    def analyze(self, ctx):
+        m15 = ctx.frame('M15'); m5 = ctx.frame('M5')
+        if len(m15) < 60 or len(m5) < 60:
+            return self.wait(ctx, 'INSUFFICIENT_HISTORY', 'Need M15/M5 history')
+        ok, reason = self.base_gates(ctx, 'M5', 14)
+        if not ok:
+            return self.wait(ctx, reason, 'Volatility/spread gate')
+        c5 = ta.closes(m5)
+        bb = ta.bollinger(c5, 20, 2.0)
+        kc = ta.keltner(m5, 20, 20, 1.5)
+        if _at(bb['upper']) is None or _at(kc['upper']) is None:
+            return self.wait(ctx, 'INDICATOR_WARMUP', 'Squeeze indicators warming up')
+        # squeeze: Bollinger inside Keltner for the last n bars, then release
+        squeeze = [i for i in range(max(0, len(m5) - 8), len(m5))
+                   if bb['upper'][i] is not None and kc['upper'][i] is not None
+                   and bb['upper'][i] < kc['upper'][i] and bb['lower'][i] > kc['lower'][i]]
+        if len(squeeze) < 3:
+            return self.wait(ctx, 'NO_SQUEEZE', 'No recent Bollinger/Keltner squeeze')
+        atr_v = ctx.atr('M5', 14)
+        atr_series = [v for v in atr_v if v is not None]
+        if len(atr_series) < 20:
+            return self.wait(ctx, 'ATR_WARMUP', 'ATR history insufficient')
+        last = ta.candle(m5[-1])
+        release_up = last['close'] > bb['upper'][-1] and last['close'] > kc['upper'][-1] and last['bull']
+        release_dn = last['close'] < bb['lower'][-1] and last['close'] < kc['lower'][-1] and last['bear']
+        if not (release_up or release_dn):
+            return self.wait(ctx, 'WAIT_RELEASE', 'Squeeze present but no directional release')
+        side = Side.BUY if release_up else Side.SELL
+        price = ctx.price_for(side)
+        mid = (bb['mid'][-1] + kc['mid'][-1]) / 2.0
+        if abs(price - mid) > atr_series[-1] * 1.8:
+            return self.wait(ctx, 'LATE_ENTRY', 'Release candle already extended from the mean')
+        anchor = min(ta.lows(m5[-4:])) if side == Side.BUY else max(ta.highs(m5[-4:]))
+        stop_info = structural_stop(ctx, side, price, anchor, buffer_points=4.0, min_atr_frac=0.15,
+                                    atr_frame='M5', max_atr_mult=1.6)
+        if not stop_info:
+            return self.wait(ctx, 'STOP_TOO_WIDE', 'Structural stop exceeds budget')
+        stop, risk = stop_info
+        target = atr_target(ctx, side, price, risk, atr_mult=1.7, floor_r=1.5, atr_frame='M5')
+        confidence = confidence_score(66, 6, min(5, last['body_ratio'] * 5))
+        return signal_decision(
+            self.spec, ctx, side, price, stop, target, confidence,
+            f'Bollinger {20,2} released outside Keltner {20,1.5} after {len(squeeze)}-bar squeeze',
+            management={'protection_pct': 40.0, 'trailing_trigger_pct': 60.0, 'trailing_gap_pct': 8.0,
+                        'max_hold_minutes': 240},
+            draw=self.chart(ctx, zones=[{'kind': 'SQUEEZE', 'low': bb['lower'][-1], 'high': bb['upper'][-1]}],
+                            levels=[{'type': 'ENTRY', 'price': price}, {'type': 'SL', 'price': stop},
+                                    {'type': 'TP', 'price': target}]),
+            regime=ctx.regime.value,
+        )
+
+
+# =====================================================================
+# 11. VWAP trend pullback (intraday, indices + FX)
+# =====================================================================
+class VWAPTrendPullback(BaseStrategy):
+    spec = StrategySpec(
+        id='vwap_trend_pullback',
+        name='Session VWAP trend pullback',
+        family='trend',
+        timeframes=('M15', 'M5', 'M1'),
+        symbols=('INDEX', 'XAUUSD', 'EURUSD', 'GBPUSD', 'USDJPY'),
+        regimes=('TREND',),
+        forbidden=('RANGE', 'VOLATILE', 'NO_TRADE'),
+        indicators=('Session VWAP M5', 'EMA9/EMA21 M5', 'RSI14 M5', 'ATR14 M5'),
+        tier='A',
+    )
+
+    def analyze(self, ctx):
+        m5 = ctx.frame('M5'); m1 = ctx.frame('M1')
+        if len(m5) < 60 or len(m1) < 30:
+            return self.wait(ctx, 'INSUFFICIENT_HISTORY', 'Need M5/M1 history')
+        ok, reason = self.base_gates(ctx, 'M5', 14)
+        if not ok:
+            return self.wait(ctx, reason, 'Volatility/spread gate')
+        c5 = ta.closes(m5)
+        vwap = ta.session_vwap(m5)
+        e9 = ta.ema(c5, 9); e21 = ta.ema(c5, 21); rsi = ta.rsi(c5, 14)
+        if _at(vwap) is None or _at(e9) is None or _at(e21) is None:
+            return self.wait(ctx, 'INDICATOR_WARMUP', 'VWAP/EMA warming up')
+        atr_v = _at(ctx.atr('M5', 14))
+        direction = ctx.regime_direction()
+        bull = direction == 'UP' and c5[-1] > vwap[-1] and e9[-1] > e21[-1]
+        bear = direction == 'DOWN' and c5[-1] < vwap[-1] and e9[-1] < e21[-1]
+        if not (bull or bear):
+            return self.wait(ctx, 'NO_VWAP_TREND', 'Price/EMAs not aligned with the regime direction relative to VWAP')
+        last5 = ta.candle(m5[-1]); prev5 = ta.candle(m5[-2])
+        if bull:
+            touched = prev5['low'] <= vwap[-2] + atr_v * 0.35 or prev5['low'] <= e21[-2] + atr_v * 0.2
+        else:
+            touched = prev5['high'] >= vwap[-2] - atr_v * 0.35 or prev5['high'] >= e21[-2] - atr_v * 0.2
+        if not touched:
+            return self.wait(ctx, 'WAIT_VWAP_PULLBACK', 'No pullback into VWAP/EMA21')
+        if abs(last5['close'] - vwap[-1]) > atr_v * 1.2:
+            return self.wait(ctx, 'OVEREXTENDED', 'Price is too far from VWAP')
+        c1 = ta.closes(m1); e9_1 = ta.ema(c1, 9)
+        if _at(e9_1) is None:
+            return self.wait(ctx, 'M1_WARMUP', 'M1 EMA warming up')
+        last1 = ta.candle(m1[-1]); prev1 = ta.candle(m1[-2])
+        trigger = (last1['bull'] and last1['close'] > e9_1[-1] and last1['close'] > prev1['high']) if bull \
+            else (last1['bear'] and last1['close'] < e9_1[-1] and last1['close'] < prev1['low'])
+        if not trigger:
+            return self.wait(ctx, 'WAIT_M1_TRIGGER', 'No M1 resumption trigger')
+        if bull and not 45 <= rsi[-1] <= 70:
+            return self.wait(ctx, 'RSI_OUT_OF_BAND', f'RSI14 {rsi[-1]:.1f} not in pullback band')
+        if bear and not 30 <= rsi[-1] <= 55:
+            return self.wait(ctx, 'RSI_OUT_OF_BAND', f'RSI14 {rsi[-1]:.1f} not in pullback band')
+        side = Side.BUY if bull else Side.SELL
+        price = ctx.price_for(side)
+        anchor = min(ta.lows(m5[-5:])) if bull else max(ta.highs(m5[-5:]))
+        stop_info = structural_stop(ctx, side, price, anchor, buffer_points=4.0, min_atr_frac=0.15,
+                                    atr_frame='M5', max_atr_mult=1.6)
+        if not stop_info:
+            return self.wait(ctx, 'STOP_TOO_WIDE', 'Structural stop exceeds budget')
+        stop, risk = stop_info
+        target = atr_target(ctx, side, price, risk, atr_mult=1.5, floor_r=1.5, atr_frame='M5')
+        confidence = confidence_score(67, min(6, abs(c5[-1] - vwap[-1]) / atr_v * 6), 5 if ctx.session == 'OVERLAP' else 0)
+        return signal_decision(
+            self.spec, ctx, side, price, stop, target, confidence,
+            f'Price above/below session VWAP in {direction} regime, pullback to VWAP/EMA21 with M1 trigger',
+            management={'protection_pct': 35.0, 'trailing_trigger_pct': 60.0, 'trailing_gap_pct': 7.0,
+                        'max_hold_minutes': 180},
+            draw=self.chart(ctx, levels=[{'type': 'VWAP', 'price': vwap[-1], 'label': 'VWAP'},
+                                         {'type': 'ENTRY', 'price': price}, {'type': 'SL', 'price': stop},
+                                         {'type': 'TP', 'price': target}]),
+            regime=ctx.regime.value,
+        )
+
+
+# =====================================================================
+# 12. Volatility contraction then expansion (FX)
+# =====================================================================
+class VolatilityExpansionFollow(BaseStrategy):
+    spec = StrategySpec(
+        id='volatility_expansion_follow',
+        name='Volatility contraction to expansion follow-through',
+        family='volatility',
+        timeframes=('M15', 'M5'),
+        symbols=('XAUUSD', 'EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD', 'USDCAD', 'INDEX'),
+        regimes=('BREAKOUT', 'VOLATILE'),
+        forbidden=('RANGE', 'NO_TRADE'),
+        indicators=('ATR14 M5 percentile', 'M5 bar range vs ATR', 'EMA21 M15 bias'),
+        tier='B',
+    )
+
+    def analyze(self, ctx):
+        m15 = ctx.frame('M15'); m5 = ctx.frame('M5')
+        if len(m15) < 60 or len(m5) < 60:
+            return self.wait(ctx, 'INSUFFICIENT_HISTORY', 'Need M15/M5 history')
+        ok, reason = self.base_gates(ctx, 'M5', 14)
+        if not ok:
+            return self.wait(ctx, reason, 'Volatility/spread gate')
+        atr_series = [v for v in ctx.atr('M5', 14) if v is not None]
+        if len(atr_series) < 30:
+            return self.wait(ctx, 'ATR_WARMUP', 'ATR history insufficient')
+        recent = atr_series[-1]
+        prior = atr_series[-30:-1]
+        mean_atr = sum(prior) / len(prior)
+        contraction = mean_atr / max(recent, 1e-12)
+        last = ta.candle(m5[-1]); prev = ta.candle(m5[-2])
+        expansion = last['range'] >= recent * 1.35
+        rollover = prev['range'] <= mean_atr * 0.9
+        if not (expansion and rollover):
+            return self.wait(ctx, 'WAIT_EXPANSION', 'No contraction-to-expansion pattern')
+        c15 = ta.closes(m15); ema21 = ta.ema(c15, 21)
+        if _at(ema21) is None:
+            return self.wait(ctx, 'EMA_WARMUP', 'M15 EMA warming up')
+        bias = 'UP' if last['close'] > ema21[-1] else 'DOWN'
+        side = Side.BUY if bias == 'UP' else Side.SELL
+        if (side == Side.BUY and not last['bull']) or (side == Side.SELL and not last['bear']):
+            return self.wait(ctx, 'NO_DIRECTIONAL_CLOSE', 'Expansion bar closed against the bias')
+        price = ctx.price_for(side)
+        if last['body_ratio'] < 0.5:
+            return self.wait(ctx, 'WEAK_BODY', 'Expansion bar body too small')
+        anchor = min(ta.lows(m5[-4:])) if side == Side.BUY else max(ta.highs(m5[-4:]))
+        stop_info = structural_stop(ctx, side, price, anchor, buffer_points=4.0, min_atr_frac=0.18,
+                                    atr_frame='M5', max_atr_mult=1.5)
+        if not stop_info:
+            return self.wait(ctx, 'STOP_TOO_WIDE', 'Structural stop exceeds budget')
+        stop, risk = stop_info
+        if ctx.spread / risk > 0.2:
+            return self.wait(ctx, 'SPREAD_TOO_LARGE', 'Spread too large for expansion entry')
+        target = atr_target(ctx, side, price, risk, atr_mult=1.6, floor_r=1.5, atr_frame='M5')
+        confidence = confidence_score(64, min(8, (contraction - 1.0) * 12), min(6, last['body_ratio'] * 6))
+        return signal_decision(
+            self.spec, ctx, side, price, stop, target, confidence,
+            f'Volatility contraction ({contraction:.2f}x) expanded on the M5 close in the M15 {bias} bias',
+            management={'protection_pct': 38.0, 'trailing_trigger_pct': 58.0, 'trailing_gap_pct': 8.0,
+                        'max_hold_minutes': 150},
+            draw=self.chart(ctx, levels=[{'type': 'EMA21 M15', 'price': ema21[-1]},
+                                         {'type': 'ENTRY', 'price': price}, {'type': 'SL', 'price': stop},
+                                         {'type': 'TP', 'price': target}]),
+            regime=ctx.regime.value,
+        )
+
+
+# =====================================================================
+# 13. London open momentum (FX)
+# =====================================================================
+class LondonOpenMomentum(BaseStrategy):
+    spec = StrategySpec(
+        id='london_open_momentum',
+        name='London open momentum (07:00-09:00 UTC)',
+        family='breakout',
+        timeframes=('M15', 'M5'),
+        symbols=('EURUSD', 'GBPUSD', 'USDJPY', 'EURJPY', 'GBPJPY'),
+        regimes=('BREAKOUT', 'TREND'),
+        forbidden=('RANGE', 'NO_TRADE'),
+        indicators=('M5 pre-London box', 'M5 momentum close', 'H1 EMA bias', 'ATR14 M5'),
+        tier='B',
+    )
+
+    def analyze(self, ctx):
+        import datetime as _dt
+        if ctx.session != 'LONDON':
+            return self.wait(ctx, 'OUTSIDE_SESSION', 'London open momentum trades 07:00-09:00 UTC only')
+        m15 = ctx.frame('M15'); m5 = ctx.frame('M5'); h1 = ctx.frame('H1')
+        if len(m15) < 60 or len(m5) < 60 or len(h1) < 60:
+            return self.wait(ctx, 'INSUFFICIENT_HISTORY', 'Need H1/M15/M5 history')
+        last_bar = m5[-1]
+        bar_time = _dt.datetime.fromtimestamp(ta._f(last_bar.get('time')), _dt.timezone.utc)
+        if not (7 <= bar_time.hour < 9):
+            return self.wait(ctx, 'OUTSIDE_WINDOW', 'Outside the 07:00-09:00 UTC momentum window')
+        ok, reason = self.base_gates(ctx, 'M5', 14)
+        if not ok:
+            return self.wait(ctx, reason, 'Volatility/spread gate')
+        atr_v = _at(ctx.atr('M5', 14))
+        day = bar_time.replace(hour=0, minute=0, second=0, microsecond=0)
+        pre = [r for r in m5 if day.timestamp() <= ta._f(r.get('time')) < day.timestamp() + 7 * 3600][-24:]
+        if len(pre) < 8:
+            return self.wait(ctx, 'NO_PRE_LONDON_BOX', 'Pre-London box not available')
+        box_high = max(ta.highs(pre)); box_low = min(ta.lows(pre))
+        box = box_high - box_low
+        last = ta.candle(m5[-1]); prev = ta.candle(m5[-2])
+        up = last['close'] > box_high and last['body_ratio'] >= 0.55 and last['bull'] and prev['close'] <= box_high
+        dn = last['close'] < box_low and last['body_ratio'] >= 0.55 and last['bear'] and prev['close'] >= box_low
+        if not (up or dn):
+            return self.wait(ctx, 'WAIT_MOMENTUM', 'No decisive momentum close through the pre-London box')
+        c1 = ta.closes(h1); ema50_h1 = ta.ema(c1, 50)
+        if _at(ema50_h1) is not None:
+            if up and last['close'] < ema50_h1[-1]:
+                return self.wait(ctx, 'H1_BIAS_BLOCK', 'Bullish burst against H1 EMA50 bias')
+            if dn and last['close'] > ema50_h1[-1]:
+                return self.wait(ctx, 'H1_BIAS_BLOCK', 'Bearish burst against H1 EMA50 bias')
+        side = Side.BUY if up else Side.SELL
+        price = ctx.price_for(side)
+        if abs(price - (box_high if up else box_low)) > atr_v * 1.0:
+            return self.wait(ctx, 'LATE_ENTRY', 'Momentum already extended beyond the box')
+        anchor = box_high - box * 0.2 if up else box_low + box * 0.2
+        stop_info = structural_stop(ctx, side, price, anchor, buffer_points=4.0, min_atr_frac=0.15,
+                                    atr_frame='M5', max_atr_mult=1.5)
+        if not stop_info:
+            return self.wait(ctx, 'STOP_TOO_WIDE', 'Structural stop exceeds budget')
+        stop, risk = stop_info
+        target = atr_target(ctx, side, price, risk, atr_mult=1.7, floor_r=1.5, atr_frame='M5')
+        confidence = confidence_score(67, min(6, last['body_ratio'] * 6))
+        return signal_decision(
+            self.spec, ctx, side, price, stop, target, confidence,
+            f'Pre-London box {box_low:.{ctx.digits}f}-{box_high:.{ctx.digits}f} broken with a decisive London momentum close',
+            management={'protection_pct': 38.0, 'trailing_trigger_pct': 60.0, 'trailing_gap_pct': 8.0,
+                        'max_hold_minutes': 180},
+            draw=self.chart(ctx, zones=[{'kind': 'PRE_LONDON_BOX', 'low': box_low, 'high': box_high}],
+                            levels=[{'type': 'ENTRY', 'price': price}, {'type': 'SL', 'price': stop},
+                                    {'type': 'TP', 'price': target}]),
+            regime=ctx.regime.value,
+        )
+
+
+# =====================================================================
+# 14. Double top/bottom reversal (FX + gold)
+# =====================================================================
+class DoubleExtremeReversal(BaseStrategy):
+    spec = StrategySpec(
+        id='double_extreme_reversal',
+        name='Double top/bottom neckline reversal',
+        family='reversal',
+        timeframes=('M15', 'M5'),
+        symbols=('EURUSD', 'GBPUSD', 'USDJPY', 'XAUUSD', 'AUDUSD', 'USDCAD'),
+        regimes=('RANGE', 'VOLATILE'),
+        forbidden=('TREND', 'NO_TRADE'),
+        indicators=('M15 swing highs/lows', 'M15 neckline', 'M5 confirmation', 'ATR14 M5'),
+        tier='B',
+    )
+
+    def analyze(self, ctx):
+        m15 = ctx.frame('M15'); m5 = ctx.frame('M5')
+        if len(m15) < 60 or len(m5) < 60:
+            return self.wait(ctx, 'INSUFFICIENT_HISTORY', 'Need M15/M5 history')
+        ok, reason = self.base_gates(ctx, 'M5', 14)
+        if not ok:
+            return self.wait(ctx, reason, 'Volatility/spread gate')
+        atr_v = _at(ctx.atr('M5', 14))
+        swings = ta.swing_points(m15[-60:], 2, 2)
+        highs = [s for s in swings if s['type'] == 'HIGH']
+        lows = [s for s in swings if s['type'] == 'LOW']
+        window = m15[-60:]
+        base_index = len(window) - 60
+        if len(highs) >= 2:
+            a, b = highs[-2], highs[-1]
+            if b['index'] - a['index'] >= 3:
+                if abs(b['price'] - a['price']) <= atr_v * 0.5:
+                    between = [s for s in lows if a['index'] < s['index'] < b['index']]
+                    if between:
+                        neckline = min(s['price'] for s in between)
+                        last = ta.candle(m5[-1]); prev = ta.candle(m5[-2])
+                        if prev['close'] >= neckline > last['close'] and last['bear']:
+                            price = ctx.price_for(Side.SELL)
+                            stop_info = structural_stop(ctx, Side.SELL, price, max(a['price'], b['price']),
+                                                        buffer_points=4.0, min_atr_frac=0.12,
+                                                        atr_frame='M5', max_atr_mult=1.8)
+                            if stop_info:
+                                stop, risk = stop_info
+                                target = neckline - (max(a['price'], b['price']) - neckline) * 0.8
+                                rr = rr_of(price, stop, target)
+                                if rr >= 1.2:
+                                    return signal_decision(
+                                        self.spec, ctx, Side.SELL, price, stop, target,
+                                        confidence_score(66, min(6, (1 - abs(b['price'] - a['price']) / max(atr_v * 0.5, 1e-12)) * 6)),
+                                        'M15 double top with neckline break, M5 confirmation close',
+                                        management={'protection_pct': 40.0, 'trailing_trigger_pct': 65.0,
+                                                    'trailing_gap_pct': 8.0, 'max_hold_minutes': 240},
+                                        draw=self.chart(ctx, levels=[
+                                            {'type': 'NECKLINE', 'price': neckline},
+                                            {'type': 'ENTRY', 'price': price}, {'type': 'SL', 'price': stop},
+                                            {'type': 'TP', 'price': target}]),
+                                        regime=ctx.regime.value)
+        if len(lows) >= 2:
+            a, b = lows[-2], lows[-1]
+            if b['index'] - a['index'] >= 3 and abs(b['price'] - a['price']) <= atr_v * 0.5:
+                between = [s for s in highs if a['index'] < s['index'] < b['index']]
+                if between:
+                    neckline = max(s['price'] for s in between)
+                    last = ta.candle(m5[-1]); prev = ta.candle(m5[-2])
+                    if prev['close'] <= neckline < last['close'] and last['bull']:
+                        price = ctx.price_for(Side.BUY)
+                        stop_info = structural_stop(ctx, Side.BUY, price, min(a['price'], b['price']),
+                                                    buffer_points=4.0, min_atr_frac=0.12,
+                                                    atr_frame='M5', max_atr_mult=1.8)
+                        if stop_info:
+                            stop, risk = stop_info
+                            target = neckline + (neckline - min(a['price'], b['price'])) * 0.8
+                            rr = rr_of(price, stop, target)
+                            if rr >= 1.2:
+                                return signal_decision(
+                                    self.spec, ctx, Side.BUY, price, stop, target,
+                                    confidence_score(66, 6),
+                                    'M15 double bottom with neckline break, M5 confirmation close',
+                                    management={'protection_pct': 40.0, 'trailing_trigger_pct': 65.0,
+                                                'trailing_gap_pct': 8.0, 'max_hold_minutes': 240},
+                                    draw=self.chart(ctx, levels=[
+                                        {'type': 'NECKLINE', 'price': neckline},
+                                        {'type': 'ENTRY', 'price': price}, {'type': 'SL', 'price': stop},
+                                        {'type': 'TP', 'price': target}]),
+                                    regime=ctx.regime.value)
+        return self.wait(ctx, 'NO_PATTERN', 'No confirmed double top/bottom neckline break')
+
+
+# =====================================================================
+# 15. Failed breakout re-entry (fakeout fade with structure)
+# =====================================================================
+class FailedBreakoutReclaim(BaseStrategy):
+    spec = StrategySpec(
+        id='failed_breakout_reclaim',
+        name='Failed breakout reclaim',
+        family='reversal',
+        timeframes=('M15', 'M5'),
+        symbols=('XAUUSD', 'EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD', 'USDCAD', 'INDEX'),
+        regimes=('RANGE', 'VOLATILE', 'BREAKOUT'),
+        forbidden=('NO_TRADE',),
+        indicators=('Donchian20 M5', 'M5 reclaim close', 'tick volume', 'ATR14 M5'),
+        tier='A',
+    )
+
+    def analyze(self, ctx):
+        m15 = ctx.frame('M15'); m5 = ctx.frame('M5')
+        if len(m15) < 40 or len(m5) < 60:
+            return self.wait(ctx, 'INSUFFICIENT_HISTORY', 'Need M15/M5 history')
+        ok, reason = self.base_gates(ctx, 'M5', 14)
+        if not ok:
+            return self.wait(ctx, reason, 'Volatility/spread gate')
+        atr_v = _at(ctx.atr('M5', 14))
+        don = ta.donchian(m5, 20)
+        recent = m5[-5:]
+        last = ta.candle(m5[-1]); prev = ta.candle(m5[-2])
+        up_fail = any(don['upper'][len(m5) - 5 + i] is not None and ta.candle(r)['high'] > don['upper'][len(m5) - 5 + i]
+                      for i, r in enumerate(recent))
+        dn_fail = any(don['lower'][len(m5) - 5 + i] is not None and ta.candle(r)['low'] < don['lower'][len(m5) - 5 + i]
+                      for i, r in enumerate(recent))
+        sup = don['upper'][-2] if up_fail else None
+        res = don['lower'][-2] if dn_fail else None
+        if up_fail and sup is not None and last['close'] < sup and last['bear']:
+            side = Side.SELL; level = sup
+        elif dn_fail and res is not None and last['close'] > res and last['bull']:
+            side = Side.BUY; level = res
+        else:
+            return self.wait(ctx, 'WAIT_RECLAIM', 'No failed breakout reclaim yet')
+        price = ctx.price_for(side)
+        if abs(price - level) > atr_v * 0.9:
+            return self.wait(ctx, 'LATE_ENTRY', 'Reclaim already extended')
+        extreme = max(ta.highs(m5[-5:])) if side == Side.SELL else min(ta.lows(m5[-5:]))
+        stop_info = structural_stop(ctx, side, price, extreme, buffer_points=5.0, min_atr_frac=0.15,
+                                    atr_frame='M5', max_atr_mult=1.6)
+        if not stop_info:
+            return self.wait(ctx, 'STOP_TOO_WIDE', 'Structural stop exceeds budget')
+        stop, risk = stop_info
+        opposite = min(ta.lows(m5[-20:])) if side == Side.SELL else max(ta.highs(m5[-20:]))
+        target = opposite
+        if (side == Side.SELL and target >= price) or (side == Side.BUY and target <= price):
+            target = atr_target(ctx, side, price, risk, atr_mult=1.6, floor_r=1.5, atr_frame='M5')
+        rr = rr_of(price, stop, target)
+        if rr < 1.3:
+            return self.wait(ctx, 'RR_TOO_LOW', f'Failed-break target only {rr:.2f}R')
+        confidence = confidence_score(68, min(6, last['body_ratio'] * 6),
+                                      5 if ctx.regime == Regime.VOLATILE else 0)
+        return signal_decision(
+            self.spec, ctx, side, price, stop, target, confidence,
+            f'Donchian20 breakout failed and price reclaimed {level:.{ctx.digits}f} against the failed direction',
+            management={'protection_pct': 42.0, 'trailing_trigger_pct': 65.0, 'trailing_gap_pct': 8.0,
+                        'partial_at_tp1': 0.4, 'tp1_lock_to_breakeven': True, 'max_hold_minutes': 240},
+            tp1=(price + (target - price) * 0.5) if side == Side.BUY else (price - (price - target) * 0.5),
+            draw=self.chart(ctx, levels=[{'type': 'LEVEL', 'price': level, 'label': 'reclaimed level'},
+                                         {'type': 'ENTRY', 'price': price}, {'type': 'SL', 'price': stop},
+                                         {'type': 'TP', 'price': target}]),
+            regime=ctx.regime.value,
+        )
+
+
+# =====================================================================
+# 16. RSI divergence reversal (FX)
+# =====================================================================
+class RSIDivergenceReversal(BaseStrategy):
+    spec = StrategySpec(
+        id='rsi_divergence_reversal',
+        name='RSI divergence at swing extreme',
+        family='reversal',
+        timeframes=('M15', 'M5'),
+        symbols=('EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD', 'USDCAD', 'USDCHF'),
+        regimes=('RANGE', 'TREND'),
+        forbidden=('BREAKOUT', 'VOLATILE', 'NO_TRADE'),
+        indicators=('RSI14 M15', 'M15 swing highs/lows', 'M5 trigger candle', 'ATR14 M5'),
+        tier='B',
+    )
+
+    def analyze(self, ctx):
+        m15 = ctx.frame('M15'); m5 = ctx.frame('M5')
+        if len(m15) < 60 or len(m5) < 60:
+            return self.wait(ctx, 'INSUFFICIENT_HISTORY', 'Need M15/M5 history')
+        ok, reason = self.base_gates(ctx, 'M5', 14)
+        if not ok:
+            return self.wait(ctx, reason, 'Volatility/spread gate')
+        atr_v = _at(ctx.atr('M5', 14))
+        c15 = ta.closes(m15)
+        rsi15 = ta.rsi(c15, 14)
+        swings = ta.swing_points(m15[-60:], 2, 2)
+        highs = [s for s in swings if s['type'] == 'HIGH']
+        lows = [s for s in swings if s['type'] == 'LOW']
+        last = ta.candle(m5[-1]); prev = ta.candle(m5[-2])
+        if len(highs) >= 2 and rsi15:
+            a, b = highs[-2], highs[-1]
+            idx_a = len(m15) - 60 + a['index']; idx_b = len(m15) - 60 + b['index']
+            rsi_a, rsi_b = _at(rsi15, idx_a), _at(rsi15, idx_b)
+            if b['price'] > a['price'] and rsi_b and rsi_a and rsi_b < rsi_a - 3 and b['index'] - a['index'] >= 4:
+                if prev['close'] < max(a['price'], b['price']) and last['bear'] and last['close'] < prev['low']:
+                    side = Side.SELL
+                    price = ctx.price_for(side)
+                    stop_info = structural_stop(ctx, side, price, b['price'], buffer_points=4.0,
+                                                min_atr_frac=0.12, atr_frame='M5', max_atr_mult=1.6)
+                    if stop_info:
+                        stop, risk = stop_info
+                        target = min(ta.lows(m15[-30:])) if len(m15) >= 30 else price - risk * 1.5
+                        if target < price:
+                            rr = rr_of(price, stop, target)
+                            if rr >= 1.2:
+                                return signal_decision(
+                                    self.spec, ctx, side, price, stop, target,
+                                    confidence_score(65, min(8, (rsi_a - rsi_b) * 1.2)),
+                                    'M15 bearish RSI divergence at a higher high with M5 breakdown confirmation',
+                                    management={'protection_pct': 45.0, 'trailing_trigger_pct': 70.0,
+                                                'trailing_gap_pct': 8.0, 'max_hold_minutes': 240},
+                                    draw=self.chart(ctx, levels=[{'type': 'SWING', 'price': b['price']},
+                                                                 {'type': 'ENTRY', 'price': price},
+                                                                 {'type': 'SL', 'price': stop},
+                                                                 {'type': 'TP', 'price': target}]),
+                                    regime=ctx.regime.value)
+        if len(lows) >= 2 and rsi15:
+            a, b = lows[-2], lows[-1]
+            idx_a = len(m15) - 60 + a['index']; idx_b = len(m15) - 60 + b['index']
+            rsi_a, rsi_b = _at(rsi15, idx_a), _at(rsi15, idx_b)
+            if b['price'] < a['price'] and rsi_b and rsi_a and rsi_b > rsi_a + 3 and b['index'] - a['index'] >= 4:
+                if prev['close'] > min(a['price'], b['price']) and last['bull'] and last['close'] > prev['high']:
+                    side = Side.BUY
+                    price = ctx.price_for(side)
+                    stop_info = structural_stop(ctx, side, price, b['price'], buffer_points=4.0,
+                                                min_atr_frac=0.12, atr_frame='M5', max_atr_mult=1.6)
+                    if stop_info:
+                        stop, risk = stop_info
+                        target = max(ta.highs(m15[-30:])) if len(m15) >= 30 else price + risk * 1.5
+                        if target > price:
+                            rr = rr_of(price, stop, target)
+                            if rr >= 1.2:
+                                return signal_decision(
+                                    self.spec, ctx, side, price, stop, target,
+                                    confidence_score(65, min(8, (rsi_b - rsi_a) * 1.2)),
+                                    'M15 bullish RSI divergence at a lower low with M5 reclaim confirmation',
+                                    management={'protection_pct': 45.0, 'trailing_trigger_pct': 70.0,
+                                                'trailing_gap_pct': 8.0, 'max_hold_minutes': 240},
+                                    draw=self.chart(ctx, levels=[{'type': 'SWING', 'price': b['price']},
+                                                                 {'type': 'ENTRY', 'price': price},
+                                                                 {'type': 'SL', 'price': stop},
+                                                                 {'type': 'TP', 'price': target}]),
+                                    regime=ctx.regime.value)
+        return self.wait(ctx, 'NO_DIVERGENCE', 'No confirmed RSI divergence with a trigger candle')
+
+
+# =====================================================================
+# 17. EMA channel trend ride (M1 momentum stack)
+# =====================================================================
+class EMAMicroStackTrend(BaseStrategy):
+    spec = StrategySpec(
+        id='ema_micro_stack_trend',
+        name='EMA micro-stack trend ride (M1 entry, M5 context)',
+        family='trend',
+        timeframes=('M15', 'M5', 'M1'),
+        symbols=('XAUUSD', 'EURUSD', 'GBPUSD', 'USDJPY', 'INDEX'),
+        regimes=('TREND',),
+        forbidden=('RANGE', 'BREAKOUT', 'VOLATILE', 'NO_TRADE'),
+        indicators=('EMA8/13/21 M1', 'EMA21 M5', 'ATR14 M1', 'ADX14 M5'),
+        tier='A',
+    )
+
+    def analyze(self, ctx):
+        m5 = ctx.frame('M5'); m1 = ctx.frame('M1')
+        if len(m5) < 60 or len(m1) < 60:
+            return self.wait(ctx, 'INSUFFICIENT_HISTORY', 'Need M5/M1 history')
+        ok, reason = self.base_gates(ctx, 'M1', 14)
+        if not ok:
+            return self.wait(ctx, reason, 'Micro volatility/spread gate')
+        c1 = ta.closes(m1)
+        e8 = ta.ema(c1, 8); e13 = ta.ema(c1, 13); e21 = ta.ema(c1, 21)
+        if _at(e8) is None or _at(e13) is None or _at(e21) is None:
+            return self.wait(ctx, 'EMA_WARMUP', 'M1 EMA warming up')
+        adx5 = _at(ta.adx(m5, 14))
+        if adx5 is None or adx5 < 20:
+            return self.wait(ctx, 'WEAK_ADX', 'M5 ADX too low for a trend ride')
+        direction = ctx.regime_direction()
+        stacked_up = e8[-1] > e13[-1] > e21[-1] and e8[-1] > e8[-3]
+        stacked_dn = e8[-1] < e13[-1] < e21[-1] and e8[-1] < e8[-3]
+        if direction == 'UP' and not stacked_up:
+            return self.wait(ctx, 'STACK_NOT_ALIGNED', 'M1 EMA stack not bullish')
+        if direction == 'DOWN' and not stacked_dn:
+            return self.wait(ctx, 'STACK_NOT_ALIGNED', 'M1 EMA stack not bearish')
+        if direction == 'NONE':
+            return self.wait(ctx, 'NO_DIRECTION', 'No trend direction')
+        side = Side.BUY if direction == 'UP' else Side.SELL
+        c5 = ta.closes(m5); e21_5 = ta.ema(c5, 21)
+        if _at(e21_5) is not None:
+            if side == Side.BUY and c5[-1] < e21_5[-1]:
+                return self.wait(ctx, 'M5_FILTER', 'Price below M5 EMA21 in an up regime')
+            if side == Side.SELL and c5[-1] > e21_5[-1]:
+                return self.wait(ctx, 'M5_FILTER', 'Price above M5 EMA21 in a down regime')
+        atr1 = _at(ctx.atr('M1', 14))
+        last = ta.candle(m1[-1]); prev = ta.candle(m1[-2])
+        touched = (min(prev['low'], prev['open'], prev['close']) <= e13[-2]) if side == Side.BUY \
+            else (max(prev['high'], prev['open'], prev['close']) >= e13[-2])
+        if not touched:
+            return self.wait(ctx, 'WAIT_MICRO_PULLBACK', 'No micro pullback into EMA13')
+        trigger = (last['bull'] and last['close'] > e8[-1] and last['close'] > prev['high']) if side == Side.BUY \
+            else (last['bear'] and last['close'] < e8[-1] and last['close'] < prev['low'])
+        if not trigger:
+            return self.wait(ctx, 'WAIT_TRIGGER', 'No M1 close resuming the stack')
+        price = ctx.price_for(side)
+        if abs(price - e21[-1]) > atr1 * 2.2:
+            return self.wait(ctx, 'OVEREXTENDED', 'Price too far from EMA21 for a fresh entry')
+        anchor = min(ta.lows(m1[-6:])) if side == Side.BUY else max(ta.highs(m1[-6:]))
+        stop_info = structural_stop(ctx, side, price, anchor, buffer_points=4.0, min_atr_frac=0.2,
+                                    atr_frame='M1', max_atr_mult=1.8)
+        if not stop_info:
+            return self.wait(ctx, 'STOP_TOO_WIDE', 'Structural stop exceeds micro budget')
+        stop, risk = stop_info
+        if ctx.spread / risk > 0.22:
+            return self.wait(ctx, 'SPREAD_TOO_LARGE', 'Spread too large for a micro entry')
+        target = atr_target(ctx, side, price, risk, atr_mult=1.6, floor_r=1.4, atr_frame='M5')
+        confidence = confidence_score(65, min(6, (adx5 - 20) * 0.3), min(6, last['body_ratio'] * 6))
+        return signal_decision(
+            self.spec, ctx, side, price, stop, target, confidence,
+            f'M1 EMA8/13/21 stack aligned with {direction} regime, micro pullback resumed',
+            management={'protection_pct': 35.0, 'trailing_trigger_pct': 55.0, 'trailing_gap_pct': 6.0,
+                        'max_hold_minutes': 120},
+            draw=self.chart(ctx, levels=[{'type': 'EMA13', 'price': e13[-1], 'label': 'EMA13 M1'},
+                                         {'type': 'ENTRY', 'price': price}, {'type': 'SL', 'price': stop},
+                                         {'type': 'TP', 'price': target}]),
+            regime=ctx.regime.value,
+        )
+
+
+# =====================================================================
+# 18. NY session continuation (USDCAD/USDJPY/indices)
+# =====================================================================
+class NYSessionContinuation(BaseStrategy):
+    spec = StrategySpec(
+        id='ny_session_continuation',
+        name='New York session continuation',
+        family='trend',
+        timeframes=('H1', 'M15', 'M5'),
+        symbols=('USDCAD', 'USDJPY', 'USDCHF', 'INDEX', 'XAUUSD'),
+        regimes=('TREND', 'BREAKOUT'),
+        forbidden=('RANGE', 'NO_TRADE'),
+        indicators=('H1 EMA50 bias', 'M15 impulse leg', 'M5 retest', 'ATR14 M5'),
+        tier='B',
+    )
+
+    def analyze(self, ctx):
+        if ctx.session not in ('OVERLAP', 'NEWYORK'):
+            return self.wait(ctx, 'OUTSIDE_SESSION', 'New York continuation trades 12:00-21:00 UTC only')
+        h1 = ctx.frame('H1'); m15 = ctx.frame('M15'); m5 = ctx.frame('M5')
+        if len(h1) < 60 or len(m15) < 60 or len(m5) < 60:
+            return self.wait(ctx, 'INSUFFICIENT_HISTORY', 'Need H1/M15/M5 history')
+        ok, reason = self.base_gates(ctx, 'M5', 14)
+        if not ok:
+            return self.wait(ctx, reason, 'Volatility/spread gate')
+        c1 = ta.closes(h1); ema50 = ta.ema(c1, 50)
+        if _at(ema50) is None:
+            return self.wait(ctx, 'EMA_WARMUP', 'H1 EMA warming up')
+        bias = 'UP' if c1[-1] > ema50[-1] else 'DOWN'
+        if ctx.regime != Regime.TREND and ctx.regime_direction() not in ('UP', 'DOWN'):
+            return self.wait(ctx, 'NO_SESSION_TREND', 'No directional session bias')
+        atr_v = _at(ctx.atr('M5', 14))
+        leg = m15[-10:]
+        if bias == 'UP':
+            base = min(ta.lows(leg)); top = max(ta.highs(leg))
+            zone_low = top - (top - base) * 0.55; zone_high = top - (top - base) * 0.25
+        else:
+            base = max(ta.highs(leg)); bottom = min(ta.lows(leg))
+            zone_low = bottom + (base - bottom) * 0.25; zone_high = bottom + (base - bottom) * 0.55
+        if not zone_low <= ctx.mid <= zone_high:
+            return self.wait(ctx, 'WAIT_RETRACE_ZONE', 'Price not in the continuation retrace zone')
+        last = ta.candle(m5[-1]); prev = ta.candle(m5[-2])
+        trigger = (last['bull'] and last['close'] > prev['high'] and last['close'] > zone_high) if bias == 'UP' \
+            else (last['bear'] and last['close'] < prev['low'] and last['close'] < zone_low)
+        if not trigger:
+            return self.wait(ctx, 'WAIT_TRIGGER', 'No M5 continuation trigger in the zone')
+        side = Side.BUY if bias == 'UP' else Side.SELL
+        price = ctx.price_for(side)
+        if abs(price - (zone_high if side == Side.BUY else zone_low)) > atr_v * 0.8:
+            return self.wait(ctx, 'LATE_ENTRY', 'Continuation already extended')
+        anchor = min(ta.lows(m5[-5:])) if side == Side.BUY else max(ta.highs(m5[-5:]))
+        stop_info = structural_stop(ctx, side, price, anchor, buffer_points=4.0, min_atr_frac=0.15,
+                                    atr_frame='M5', max_atr_mult=1.6)
+        if not stop_info:
+            return self.wait(ctx, 'STOP_TOO_WIDE', 'Structural stop exceeds budget')
+        stop, risk = stop_info
+        target = atr_target(ctx, side, price, risk, atr_mult=1.6, floor_r=1.5, atr_frame='M5')
+        confidence = confidence_score(66, 5 if ctx.session == 'OVERLAP' else 2,
+                                      min(5, last['body_ratio'] * 5))
+        return signal_decision(
+            self.spec, ctx, side, price, stop, target, confidence,
+            f'H1 {bias} bias with {ctx.session} retracement into the continuation zone and M5 trigger',
+            management={'protection_pct': 38.0, 'trailing_trigger_pct': 60.0, 'trailing_gap_pct': 8.0,
+                        'max_hold_minutes': 240},
+            draw=self.chart(ctx, zones=[{'kind': 'CONTINUATION_ZONE', 'low': zone_low, 'high': zone_high}],
+                            levels=[{'type': 'ENTRY', 'price': price}, {'type': 'SL', 'price': stop},
+                                    {'type': 'TP', 'price': target}]),
+            regime=ctx.regime.value,
+        )
+
+
+# =====================================================================
+# 19. Gold momentum continuation (M1 scalping, high volatility)
+# =====================================================================
+class GoldMomentumScalp(BaseStrategy):
+    spec = StrategySpec(
+        id='gold_momentum_scalp',
+        name='Gold momentum continuation scalp',
+        family='momentum',
+        timeframes=('M15', 'M5', 'M1'),
+        symbols=('XAUUSD',),
+        regimes=('TREND', 'BREAKOUT', 'VOLATILE'),
+        forbidden=('RANGE', 'NO_TRADE'),
+        indicators=('M1 EMA9/EMA21', 'M5 ADX14', 'M1 ATR14', 'M5 momentum bar'),
+        tier='B',
+    )
+
+    def analyze(self, ctx):
+        if not ctx.is_gold:
+            return self.wait(ctx, 'WRONG_SYMBOL', 'Gold strategy requires a gold symbol')
+        m15 = ctx.frame('M15'); m5 = ctx.frame('M5'); m1 = ctx.frame('M1')
+        if len(m15) < 60 or len(m5) < 60 or len(m1) < 60:
+            return self.wait(ctx, 'INSUFFICIENT_HISTORY', 'Need M15/M5/M1 history')
+        ok, reason = self.base_gates(ctx, 'M1', 14, max_spread_atr_frac=0.22)
+        if not ok:
+            return self.wait(ctx, reason, 'Gold micro gate')
+        adx5 = _at(ta.adx(m5, 14))
+        if adx5 is None or adx5 < 22:
+            return self.wait(ctx, 'WEAK_ADX', 'M5 ADX too low for gold momentum')
+        c1 = ta.closes(m1)
+        e9 = ta.ema(c1, 9); e21 = ta.ema(c1, 21)
+        if _at(e9) is None or _at(e21) is None:
+            return self.wait(ctx, 'EMA_WARMUP', 'M1 EMAs warming up')
+        direction = ctx.regime_direction()
+        if direction == 'NONE':
+            return self.wait(ctx, 'NO_DIRECTION', 'Gold direction undefined')
+        bull = direction == 'UP' and e9[-1] > e21[-1] and c1[-1] > e9[-1]
+        bear = direction == 'DOWN' and e9[-1] < e21[-1] and c1[-1] < e9[-1]
+        if not (bull or bear):
+            return self.wait(ctx, 'NO_ALIGNMENT', 'M1 EMA and regime direction disagree')
+        last = ta.candle(m1[-1]); prev = ta.candle(m1[-2])
+        if last['body_ratio'] < 0.55:
+            return self.wait(ctx, 'WEAK_BODY', 'Momentum candle body too small')
+        trigger = (last['close'] > max(ta.highs(m1[-4:-1]))) if bull else (last['close'] < min(ta.lows(m1[-4:-1])))
+        if not trigger:
+            return self.wait(ctx, 'WAIT_BREAK', 'No momentum break of the last 3 M1 bars')
+        side = Side.BUY if bull else Side.SELL
+        price = ctx.price_for(side)
+        atr1 = _at(ctx.atr('M1', 14))
+        if abs(price - e21[-1]) > atr1 * 2.5:
+            return self.wait(ctx, 'OVEREXTENDED', 'Gold price too extended from EMA21 M1')
+        anchor = min(ta.lows(m1[-5:])) if bull else max(ta.highs(m1[-5:]))
+        stop_info = structural_stop(ctx, side, price, anchor, buffer_points=6.0, min_atr_frac=0.25,
+                                    atr_frame='M1', max_atr_mult=2.0)
+        if not stop_info:
+            return self.wait(ctx, 'STOP_TOO_WIDE', 'Structural stop exceeds gold micro budget')
+        stop, risk = stop_info
+        if ctx.spread / risk > 0.18:
+            return self.wait(ctx, 'SPREAD_TOO_LARGE', 'Gold spread too large for a scalp')
+        target = atr_target(ctx, side, price, risk, atr_mult=1.5, floor_r=1.3, atr_frame='M5')
+        confidence = confidence_score(66, min(6, (adx5 - 22) * 0.4), min(6, last['body_ratio'] * 6))
+        return signal_decision(
+            self.spec, ctx, side, price, stop, target, confidence,
+            f'Gold {direction} momentum continuation with M1 EMA stack and 3-bar break',
+            management={'protection_pct': 35.0, 'trailing_trigger_pct': 50.0, 'trailing_gap_pct': 6.0,
+                        'max_hold_minutes': 90},
+            draw=self.chart(ctx, levels=[{'type': 'EMA21 M1', 'price': e21[-1]},
+                                         {'type': 'ENTRY', 'price': price}, {'type': 'SL', 'price': stop},
+                                         {'type': 'TP', 'price': target}]),
+            regime=ctx.regime.value,
+        )
+
+
+# =====================================================================
+# 20. Opening drive & first pullback (indices)
+# =====================================================================
+class IndexOpeningDrive(BaseStrategy):
+    spec = StrategySpec(
+        id='index_opening_drive',
+        name='Index opening drive and first pullback',
+        family='trend',
+        timeframes=('M15', 'M5', 'M1'),
+        symbols=('INDEX',),
+        regimes=('TREND', 'BREAKOUT'),
+        forbidden=('RANGE', 'NO_TRADE'),
+        indicators=('M5 opening drive leg', 'M1 EMA9', 'ATR14 M5', 'session filter'),
+        tier='B',
+    )
+
+    def analyze(self, ctx):
+        if not ctx.is_index:
+            return self.wait(ctx, 'WRONG_SYMBOL', 'Index strategy requires an index symbol')
+        if ctx.session not in ('OVERLAP', 'NEWYORK'):
+            return self.wait(ctx, 'OUTSIDE_SESSION', 'Index opening drive trades the New York window')
+        m15 = ctx.frame('M15'); m5 = ctx.frame('M5'); m1 = ctx.frame('M1')
+        if len(m15) < 40 or len(m5) < 60 or len(m1) < 40:
+            return self.wait(ctx, 'INSUFFICIENT_HISTORY', 'Need M15/M5/M1 history')
+        ok, reason = self.base_gates(ctx, 'M5', 14)
+        if not ok:
+            return self.wait(ctx, reason, 'Volatility/spread gate')
+        atr_v = _at(ctx.atr('M5', 14))
+        drive = m5[-6:-1]
+        drive_high = max(ta.highs(drive)); drive_low = min(ta.lows(drive))
+        span = drive_high - drive_low
+        if span < atr_v * 1.5:
+            return self.wait(ctx, 'NO_DRIVE', 'No impulse leg to trade')
+        up = ta.closes(drive)[-1] > ta.opens(drive)[0]
+        side = Side.BUY if up else Side.SELL
+        zone_low, zone_high = (drive_high - span * 0.4, drive_high - span * 0.15) if up \
+            else (drive_low + span * 0.15, drive_low + span * 0.4)
+        if not zone_low <= ctx.mid <= zone_high:
+            return self.wait(ctx, 'WAIT_FIRST_PULLBACK', 'Price is not in the first-pullback zone')
+        c1 = ta.closes(m1); e9 = ta.ema(c1, 9)
+        if _at(e9) is None:
+            return self.wait(ctx, 'M1_WARMUP', 'M1 EMA warming up')
+        last = ta.candle(m1[-1]); prev = ta.candle(m1[-2])
+        trigger = (last['bull'] and last['close'] > e9[-1] and last['close'] > prev['high']) if up \
+            else (last['bear'] and last['close'] < e9[-1] and last['close'] < prev['low'])
+        if not trigger:
+            return self.wait(ctx, 'WAIT_TRIGGER', 'No M1 resumption trigger in the pullback zone')
+        price = ctx.price_for(side)
+        anchor = min(ta.lows(m5[-4:])) if up else max(ta.highs(m5[-4:]))
+        stop_info = structural_stop(ctx, side, price, anchor, buffer_points=5.0, min_atr_frac=0.15,
+                                    atr_frame='M5', max_atr_mult=1.7)
+        if not stop_info:
+            return self.wait(ctx, 'STOP_TOO_WIDE', 'Structural stop exceeds budget')
+        stop, risk = stop_info
+        target = atr_target(ctx, side, price, risk, atr_mult=1.7, floor_r=1.6, atr_frame='M5')
+        confidence = confidence_score(66, min(6, (span / atr_v - 1.5) * 4))
+        return signal_decision(
+            self.spec, ctx, side, price, stop, target, confidence,
+            f'Index opening drive {drive_low:.{ctx.digits}f}-{drive_high:.{ctx.digits}f} with first pullback and M1 trigger',
+            management={'protection_pct': 40.0, 'trailing_trigger_pct': 60.0, 'trailing_gap_pct': 8.0,
+                        'max_hold_minutes': 180},
+            draw=self.chart(ctx, zones=[{'kind': 'PULLBACK_ZONE', 'low': zone_low, 'high': zone_high}],
+                            levels=[{'type': 'ENTRY', 'price': price}, {'type': 'SL', 'price': stop},
+                                    {'type': 'TP', 'price': target}]),
+            regime=ctx.regime.value,
+        )
+
+
+# =====================================================================
+# 21. Round-number / psychological level reaction (FX + gold)
+# =====================================================================
+class RoundNumberReaction(BaseStrategy):
+    spec = StrategySpec(
+        id='round_number_reaction',
+        name='Round-number reaction with confirmation',
+        family='reversal',
+        timeframes=('H1', 'M15', 'M5'),
+        symbols=('XAUUSD', 'EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD', 'USDCAD'),
+        regimes=('RANGE', 'TREND', 'VOLATILE'),
+        forbidden=('NO_TRADE',),
+        indicators=('Round level grid (0.0050/0.0050/50 pips/0.50)', 'M5 rejection candle', 'ATR14 M5'),
+        tier='C',
+        trial=True,
+    )
+
+    def _grid(self, ctx):
+        if ctx.is_gold:
+            return 10.0
+        if ctx.is_index:
+            return 100.0
+        return 0.0050
+
+    def analyze(self, ctx):
+        m15 = ctx.frame('M15'); m5 = ctx.frame('M5')
+        if len(m15) < 40 or len(m5) < 40:
+            return self.wait(ctx, 'INSUFFICIENT_HISTORY', 'Need M15/M5 history')
+        ok, reason = self.base_gates(ctx, 'M5', 14)
+        if not ok:
+            return self.wait(ctx, reason, 'Volatility/spread gate')
+        step = self._grid(ctx)
+        level = round(ctx.mid / step) * step
+        atr_v = _at(ctx.atr('M5', 14))
+        distance = abs(ctx.mid - level)
+        if distance > atr_v * 0.45:
+            return self.wait(ctx, 'NOT_AT_LEVEL', 'Price is not interacting with the round level')
+        last = ta.candle(m5[-1]); prev = ta.candle(m5[-2])
+        touched = last['low'] <= level <= last['high'] or prev['low'] <= level <= prev['high']
+        if not touched:
+            return self.wait(ctx, 'NO_TOUCH', 'Round level not tested by recent bars')
+        if ctx.mid < level and last['bull'] and last['lower_wick'] >= last['range'] * 0.35:
+            side = Side.BUY
+        elif ctx.mid > level and last['bear'] and last['upper_wick'] >= last['range'] * 0.35:
+            side = Side.SELL
+        else:
+            return self.wait(ctx, 'NO_REJECTION', 'No round-level rejection candle')
+        price = ctx.price_for(side)
+        anchor = last['low'] if side == Side.BUY else last['high']
+        stop_info = structural_stop(ctx, side, price, anchor, buffer_points=5.0, min_atr_frac=0.18,
+                                    atr_frame='M5', max_atr_mult=1.5)
+        if not stop_info:
+            return self.wait(ctx, 'STOP_TOO_WIDE', 'Structural stop exceeds budget')
+        stop, risk = stop_info
+        target = price + risk * 1.4 if side == Side.BUY else price - risk * 1.4
+        direction = 1 if side == Side.BUY else -1
+        target = level + direction * step * 0.8
+        if (side == Side.BUY and target <= price) or (side == Side.SELL and target >= price):
+            return self.wait(ctx, 'BAD_TARGET', 'Next round level is not a valid target')
+        rr = rr_of(price, stop, target)
+        if rr < 1.0:
+            return self.wait(ctx, 'RR_TOO_LOW', f'Only {rr:.2f}R to the next round level')
+        confidence = confidence_score(60, min(6, (0.45 - distance / atr_v) * 12))
+        return signal_decision(
+            self.spec, ctx, side, price, stop, target, confidence,
+            f'Rejection at the round level {level:.{ctx.digits}f} with next level {target:.{ctx.digits}f} as target',
+            management={'protection_pct': 45.0, 'trailing_trigger_pct': 70.0, 'trailing_gap_pct': 8.0,
+                        'max_hold_minutes': 240},
+            draw=self.chart(ctx, levels=[{'type': 'ROUND', 'price': level, 'label': 'round level'},
+                                         {'type': 'ENTRY', 'price': price}, {'type': 'SL', 'price': stop},
+                                         {'type': 'TP', 'price': target}]),
+            regime=ctx.regime.value,
+        )
+
+
+# =====================================================================
+# 22. Three-drive exhaustion fade (FX)
+# =====================================================================
+class ThreeDriveExhaustion(BaseStrategy):
+    spec = StrategySpec(
+        id='three_drive_exhaustion',
+        name='Three-drive exhaustion fade',
+        family='reversal',
+        timeframes=('M15', 'M5'),
+        symbols=('EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD', 'USDCAD', 'XAUUSD'),
+        regimes=('RANGE', 'TREND'),
+        forbidden=('BREAKOUT', 'VOLATILE', 'NO_TRADE'),
+        indicators=('M15 three drives', 'RSI14 M15', 'M5 reversal trigger', 'ATR14 M5'),
+        tier='C',
+        trial=True,
+    )
+
+    def analyze(self, ctx):
+        m15 = ctx.frame('M15'); m5 = ctx.frame('M5')
+        if len(m15) < 60 or len(m5) < 60:
+            return self.wait(ctx, 'INSUFFICIENT_HISTORY', 'Need M15/M5 history')
+        ok, reason = self.base_gates(ctx, 'M5', 14)
+        if not ok:
+            return self.wait(ctx, reason, 'Volatility/spread gate')
+        c15 = ta.closes(m15); rsi15 = ta.rsi(c15, 14)
+        swings = ta.swing_points(m15[-60:], 2, 2)
+        highs = [s for s in swings if s['type'] == 'HIGH']
+        lows = [s for s in swings if s['type'] == 'LOW']
+        last = ta.candle(m5[-1]); prev = ta.candle(m5[-2])
+        atr_v = _at(ctx.atr('M5', 14))
+        if len(highs) >= 3:
+            a, b, cc = highs[-3:]
+            rising = a['price'] < b['price'] < cc['price']
+            rsi_vals = [_at(rsi15, len(m15) - 60 + s['index']) for s in (a, b, cc)]
+            weak = rsi_vals[0] and rsi_vals[2] and rsi_vals[2] < rsi_vals[0] - 2
+            if rising and weak and prev['close'] < cc['price'] and last['bear'] and last['close'] < prev['low']:
+                side = Side.SELL
+                price = ctx.price_for(side)
+                stop_info = structural_stop(ctx, side, price, cc['price'], buffer_points=5.0,
+                                            min_atr_frac=0.15, atr_frame='M5', max_atr_mult=1.6)
+                if stop_info:
+                    stop, risk = stop_info
+                    target = min(ta.lows(m15[-20:]))
+                    if target < price and rr_of(price, stop, target) >= 1.2:
+                        return signal_decision(
+                            self.spec, ctx, side, price, stop, target,
+                            confidence_score(62, 5),
+                            'Three rising M15 drives with weakening RSI, M5 breakdown confirmation',
+                            management={'protection_pct': 45.0, 'trailing_trigger_pct': 70.0,
+                                        'trailing_gap_pct': 8.0, 'max_hold_minutes': 300},
+                            draw=self.chart(ctx, levels=[{'type': 'ENTRY', 'price': price},
+                                                         {'type': 'SL', 'price': stop},
+                                                         {'type': 'TP', 'price': target}]),
+                            regime=ctx.regime.value)
+        if len(lows) >= 3:
+            a, b, cc = lows[-3:]
+            falling = a['price'] > b['price'] > cc['price']
+            rsi_vals = [_at(rsi15, len(m15) - 60 + s['index']) for s in (a, b, cc)]
+            strong = rsi_vals[0] and rsi_vals[2] and rsi_vals[2] > rsi_vals[0] + 2
+            if falling and strong and prev['close'] > cc['price'] and last['bull'] and last['close'] > prev['high']:
+                side = Side.BUY
+                price = ctx.price_for(side)
+                stop_info = structural_stop(ctx, side, price, cc['price'], buffer_points=5.0,
+                                            min_atr_frac=0.15, atr_frame='M5', max_atr_mult=1.6)
+                if stop_info:
+                    stop, risk = stop_info
+                    target = max(ta.highs(m15[-20:]))
+                    if target > price and rr_of(price, stop, target) >= 1.2:
+                        return signal_decision(
+                            self.spec, ctx, side, price, stop, target,
+                            confidence_score(62, 5),
+                            'Three falling M15 drives with strengthening RSI, M5 reclaim confirmation',
+                            management={'protection_pct': 45.0, 'trailing_trigger_pct': 70.0,
+                                        'trailing_gap_pct': 8.0, 'max_hold_minutes': 300},
+                            draw=self.chart(ctx, levels=[{'type': 'ENTRY', 'price': price},
+                                                         {'type': 'SL', 'price': stop},
+                                                         {'type': 'TP', 'price': target}]),
+                            regime=ctx.regime.value)
+        return self.wait(ctx, 'NO_EXHAUSTION', 'No three-drive exhaustion pattern')
+
+
+# =====================================================================
+# 23. Gold London breakout (AUD/USD-style Asia range on gold)
+# =====================================================================
+class GoldAsiaBreakout(BaseStrategy):
+    spec = StrategySpec(
+        id='gold_asia_range_breakout',
+        name='Gold Asian range breakout at London',
+        family='breakout',
+        timeframes=('M15', 'M5'),
+        symbols=('XAUUSD',),
+        regimes=('BREAKOUT', 'TREND'),
+        forbidden=('RANGE', 'VOLATILE', 'NO_TRADE'),
+        indicators=('Asian session box M15', 'M5 momentum close', 'ATR14 M5', 'H1 EMA50 bias'),
+        tier='B',
+    )
+
+    def analyze(self, ctx):
+        if not ctx.is_gold:
+            return self.wait(ctx, 'WRONG_SYMBOL', 'Gold strategy requires a gold symbol')
+        if ctx.session not in ('LONDON', 'OVERLAP'):
+            return self.wait(ctx, 'OUTSIDE_SESSION', 'Gold Asia breakout trades the London window')
+        m15 = ctx.frame('M15'); m5 = ctx.frame('M5'); h1 = ctx.frame('H1')
+        if len(m15) < 80 or len(m5) < 60 or len(h1) < 60:
+            return self.wait(ctx, 'INSUFFICIENT_HISTORY', 'Need H1/M15/M5 history')
+        ok, reason = self.base_gates(ctx, 'M5', 14, max_spread_atr_frac=0.22)
+        if not ok:
+            return self.wait(ctx, reason, 'Gold volatility/spread gate')
+        atr_v = _at(ctx.atr('M5', 14))
+        import datetime as _dt
+        bar = m5[-1]
+        day = _dt.datetime.fromtimestamp(ta._f(bar.get('time')), _dt.timezone.utc).replace(
+            hour=0, minute=0, second=0, microsecond=0)
+        asia = [r for r in m15 if day.timestamp() <= ta._f(r.get('time')) < day.timestamp() + 7 * 3600][-28:]
+        if len(asia) < 12:
+            return self.wait(ctx, 'NO_ASIA_BOX', 'Asian box not built yet')
+        box_high = max(ta.highs(asia)); box_low = min(ta.lows(asia))
+        box = box_high - box_low
+        if box <= 0 or box > atr_v * 4.0:
+            return self.wait(ctx, 'BOX_INVALID', 'Gold Asian box size unusable')
+        last = ta.candle(m5[-1]); prev = ta.candle(m5[-2])
+        up = last['close'] > box_high and last['bull'] and prev['close'] <= box_high
+        dn = last['close'] < box_low and last['bear'] and prev['close'] >= box_low
+        if not (up or dn):
+            return self.wait(ctx, 'WAIT_BOX_BREAK', 'No confirmed gold box break')
+        side = Side.BUY if up else Side.SELL
+        if side == Side.BUY and abs(ctx.mid - box_high) > atr_v * 1.0:
+            return self.wait(ctx, 'LATE_ENTRY', 'Gold breakout already extended')
+        if side == Side.SELL and abs(ctx.mid - box_low) > atr_v * 1.0:
+            return self.wait(ctx, 'LATE_ENTRY', 'Gold breakout already extended')
+        anchor = box_high - box * 0.15 if side == Side.BUY else box_low + box * 0.15
+        stop_info = structural_stop(ctx, side, ctx.price_for(side), anchor, buffer_points=6.0,
+                                    min_atr_frac=0.15, atr_frame='M5', max_atr_mult=1.6)
+        if not stop_info:
+            return self.wait(ctx, 'STOP_TOO_WIDE', 'Structural stop exceeds gold budget')
+        stop, risk = stop_info
+        price = ctx.price_for(side)
+        target = atr_target(ctx, side, price, risk, atr_mult=1.9, floor_r=1.6, atr_frame='M5')
+        confidence = confidence_score(66, 5 if ctx.session == 'LONDON' else 2,
+                                      min(5, last['body_ratio'] * 5))
+        return signal_decision(
+            self.spec, ctx, side, price, stop, target, confidence,
+            f'Gold Asian box {box_low:.{ctx.digits}f}-{box_high:.{ctx.digits}f} broken on the London open',
+            management={'protection_pct': 38.0, 'trailing_trigger_pct': 58.0, 'trailing_gap_pct': 8.0,
+                        'max_hold_minutes': 240},
+            draw=self.chart(ctx, zones=[{'kind': 'ASIA_RANGE', 'low': box_low, 'high': box_high}],
+                            levels=[{'type': 'ENTRY', 'price': price}, {'type': 'SL', 'price': stop},
+                                    {'type': 'TP', 'price': target}]),
+            regime=ctx.regime.value,
+        )
+
+
+# =====================================================================
+# 24. Inside-bar breakout (FX minor + gold)
+# =====================================================================
+class InsideBarBreakout(BaseStrategy):
+    spec = StrategySpec(
+        id='inside_bar_breakout',
+        name='Inside-bar compression breakout',
+        family='breakout',
+        timeframes=('M15', 'M5'),
+        symbols=('XAUUSD', 'EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD', 'USDCAD', 'NZDUSD', 'INDEX'),
+        regimes=('BREAKOUT', 'TREND', 'RANGE'),
+        forbidden=('VOLATILE', 'NO_TRADE'),
+        indicators=('M5 inside bar range', 'ATR14 M5', 'M15 EMA21 bias', 'M5 break close'),
+        tier='C',
+        trial=True,
+    )
+
+    def analyze(self, ctx):
+        m15 = ctx.frame('M15'); m5 = ctx.frame('M5')
+        if len(m15) < 60 or len(m5) < 60:
+            return self.wait(ctx, 'INSUFFICIENT_HISTORY', 'Need M15/M5 history')
+        ok, reason = self.base_gates(ctx, 'M5', 14)
+        if not ok:
+            return self.wait(ctx, reason, 'Volatility/spread gate')
+        atr_v = _at(ctx.atr('M5', 14))
+        mother = ta.candle(m5[-3]); inner = ta.candle(m5[-2]); last = ta.candle(m5[-1])
+        if not (inner['high'] < mother['high'] and inner['low'] > mother['low']):
+            return self.wait(ctx, 'NO_INSIDE_BAR', 'No inside-bar compression on M5')
+        if mother['range'] > atr_v * 2.2:
+            return self.wait(ctx, 'MOTHER_TOO_WIDE', 'Inside-bar mother range too large')
+        up = last['close'] > mother['high'] and last['bull']
+        dn = last['close'] < mother['low'] and last['bear']
+        if not (up or dn):
+            return self.wait(ctx, 'WAIT_BREAK', 'Inside bar not yet resolved')
+        c15 = ta.closes(m15); ema21 = ta.ema(c15, 21)
+        side = Side.BUY if up else Side.SELL
+        if _at(ema21) is not None:
+            if side == Side.BUY and last['close'] < ema21[-1]:
+                return self.wait(ctx, 'M15_BIAS_BLOCK', 'Bullish inside-bar break against M15 EMA21')
+            if side == Side.SELL and last['close'] > ema21[-1]:
+                return self.wait(ctx, 'M15_BIAS_BLOCK', 'Bearish inside-bar break against M15 EMA21')
+        price = ctx.price_for(side)
+        anchor = mother['low'] if side == Side.BUY else mother['high']
+        stop_info = structural_stop(ctx, side, price, anchor, buffer_points=4.0, min_atr_frac=0.12,
+                                    atr_frame='M5', max_atr_mult=1.5)
+        if not stop_info:
+            return self.wait(ctx, 'STOP_TOO_WIDE', 'Structural stop exceeds budget')
+        stop, risk = stop_info
+        target = atr_target(ctx, side, price, risk, atr_mult=1.6, floor_r=1.5, atr_frame='M5')
+        confidence = confidence_score(62, min(6, last['body_ratio'] * 6))
+        return signal_decision(
+            self.spec, ctx, side, price, stop, target, confidence,
+            f'Inside-bar compression resolved {"up" if up else "down"} with a breakout close',
+            management={'protection_pct': 40.0, 'trailing_trigger_pct': 60.0, 'trailing_gap_pct': 8.0,
+                        'max_hold_minutes': 180},
+            draw=self.chart(ctx, zones=[{'kind': 'INSIDE_BAR', 'low': inner['low'], 'high': inner['high']}],
+                            levels=[{'type': 'ENTRY', 'price': price}, {'type': 'SL', 'price': stop},
+                                    {'type': 'TP', 'price': target}]),
+            regime=ctx.regime.value,
+        )
+
+
+# =====================================================================
+# 25. Two-bar reversal with volume (FX + gold, all regimes except dead)
+# =====================================================================
+class TwoBarReversalVolume(BaseStrategy):
+    spec = StrategySpec(
+        id='two_bar_reversal_volume',
+        name='Two-bar reversal with tick-volume confirmation',
+        family='reversal',
+        timeframes=('M15', 'M5'),
+        symbols=('XAUUSD', 'EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD', 'USDCAD', 'INDEX'),
+        regimes=('RANGE', 'TREND', 'VOLATILE'),
+        forbidden=('NO_TRADE',),
+        indicators=('M5 two-bar pattern', 'tick volume 20-bar average', 'ATR14 M5', 'M15 EMA50 filter'),
+        tier='C',
+        trial=True,
+    )
+
+    def analyze(self, ctx):
+        m15 = ctx.frame('M15'); m5 = ctx.frame('M5')
+        if len(m15) < 60 or len(m5) < 60:
+            return self.wait(ctx, 'INSUFFICIENT_HISTORY', 'Need M15/M5 history')
+        ok, reason = self.base_gates(ctx, 'M5', 14)
+        if not ok:
+            return self.wait(ctx, reason, 'Volatility/spread gate')
+        prev = ta.candle(m5[-2]); last = ta.candle(m5[-1])
+        vols = ta.volumes(m5)
+        avg_vol = sum(vols[-21:-1]) / 20.0 if len(vols) >= 21 else 0.0
+        if avg_vol <= 0:
+            return self.wait(ctx, 'NO_VOLUME', 'Tick volume unavailable')
+        vol_ratio = vols[-1] / avg_vol
+        atr_v = _at(ctx.atr('M5', 14))
+        c15 = ta.closes(m15); ema50 = ta.ema(c15, 50)
+        bias = None
+        if _at(ema50) is not None:
+            bias = 'UP' if c15[-1] > ema50[-1] else 'DOWN'
+        bull_reversal = (prev['bear'] and last['bull'] and last['close'] > prev['open']
+                         and last['lower_wick'] >= last['range'] * 0.3 and vol_ratio >= 1.5)
+        bear_reversal = (prev['bull'] and last['bear'] and last['close'] < prev['open']
+                         and last['upper_wick'] >= last['range'] * 0.3 and vol_ratio >= 1.5)
+        side = None
+        if bull_reversal and (bias is None or bias == 'UP'):
+            side = Side.BUY
+        elif bear_reversal and (bias is None or bias == 'DOWN'):
+            side = Side.SELL
+        if side is None:
+            return self.wait(ctx, 'WAIT_VOLUME_REVERSAL', 'No volume-confirmed two-bar reversal aligned with the M15 bias')
+        price = ctx.price_for(side)
+        anchor = min(ta.lows(m5[-3:])) if side == Side.BUY else max(ta.highs(m5[-3:]))
+        stop_info = structural_stop(ctx, side, price, anchor, buffer_points=4.0, min_atr_frac=0.15,
+                                    atr_frame='M5', max_atr_mult=1.6)
+        if not stop_info:
+            return self.wait(ctx, 'STOP_TOO_WIDE', 'Structural stop exceeds budget')
+        stop, risk = stop_info
+        target = atr_target(ctx, side, price, risk, atr_mult=1.5, floor_r=1.4, atr_frame='M5')
+        confidence = confidence_score(62, min(8, (vol_ratio - 1.5) * 8), min(5, last['body_ratio'] * 5))
+        return signal_decision(
+            self.spec, ctx, side, price, stop, target, confidence,
+            f'Two-bar reversal with {vol_ratio:.2f}x tick volume aligned with the M15 bias',
+            management={'protection_pct': 40.0, 'trailing_trigger_pct': 62.0, 'trailing_gap_pct': 8.0,
+                        'max_hold_minutes': 180},
+            draw=self.chart(ctx, levels=[{'type': 'ENTRY', 'price': price}, {'type': 'SL', 'price': stop},
+                                         {'type': 'TP', 'price': target}]),
+            regime=ctx.regime.value,
+        )
+
+
+# =====================================================================
+# Registry assembly
+# =====================================================================
+STRATEGY_CLASSES = [
+    TrendEMAPullback,
+    TrendBreakRetest,
+    TrendMomentumResume,
+    RangeBollingerReversion,
+    RangeStochasticReversal,
+    AsiaRangeBreakout,
+    LiquiditySweepReclaim,
+    GoldTrendPullback,
+    GoldOpeningRangeBreakout,
+    VolatilitySqueezeBreakout,
+    VWAPTrendPullback,
+    VolatilityExpansionFollow,
+    LondonOpenMomentum,
+    DoubleExtremeReversal,
+    FailedBreakoutReclaim,
+    RSIDivergenceReversal,
+    EMAMicroStackTrend,
+    NYSessionContinuation,
+    GoldMomentumScalp,
+    IndexOpeningDrive,
+    RoundNumberReaction,
+    ThreeDriveExhaustion,
+    GoldAsiaBreakout,
+    InsideBarBreakout,
+    TwoBarReversalVolume,
+]
+
+# Every concrete strategy inherits from BaseStrategy through the pack.
+for _cls in STRATEGY_CLASSES:
+    assert _cls.spec is not None, f'{_cls.__name__} missing StrategySpec'

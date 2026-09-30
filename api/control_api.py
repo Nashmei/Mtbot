@@ -18,22 +18,20 @@ class SettingsPatch(BaseModel):
     model_config = ConfigDict(extra='forbid', allow_inf_nan=False)
 
     risk_pct: float | None = Field(default=None, ge=0.25, le=50)
-    rr: float | None = Field(default=None, ge=0, le=10)
-    sl_points: float | None = Field(default=None, ge=0, le=1000000)
-    tp_points: float | None = Field(default=None, ge=0, le=1000000)
     min_confidence: float | None = Field(default=None, ge=50, le=95)
-    protection_pct: float | None = Field(default=None, ge=0, le=80)
-    trailing_gap_pct: float | None = Field(default=None, ge=0, le=25)
-    max_trade_minutes: float | None = Field(default=None, ge=0, le=10)
+    min_entry_confidence: float | None = Field(default=None, ge=50, le=95)
     max_positions: int | None = Field(default=None, ge=1, le=10)
     max_consecutive_losses: int | None = Field(default=None, ge=0, le=20)
     daily_loss_limit_pct: float | None = Field(default=None, ge=0, le=100)
+    max_daily_trades: int | None = Field(default=None, ge=0, le=200)
+    max_correlated_positions: int | None = Field(default=None, ge=0, le=10)
     session_profit_limit: float | None = Field(default=None, ge=0, le=1000000000)
     real_trading_enabled: bool | None = None
 
     @model_validator(mode='after')
     def require_value(self):
-        if not any(value is not None for value in self.model_dump().values()):
+        values = self.model_dump()
+        if not any(value is not None for value in values.values()):
             raise ValueError('at least one setting is required')
         return self
 
@@ -53,8 +51,9 @@ class LoginPayload(BaseModel):
 class ControlAPI:
     """Authenticated API façade over the existing Mtbot engine.
 
-    It deliberately delegates all trading decisions and validation to Engine,
-    Analyzer, Risk and MT5Gateway rather than duplicating that logic.
+    It deliberately delegates all trading decisions and validation to the
+    Engine, deterministic StrategyRegistry and MT5Gateway rather than
+    duplicating that logic.
     """
 
     def __init__(self, engine, db, gateway, event_hub, token):
@@ -68,6 +67,7 @@ class ControlAPI:
         self.event_hub = event_hub
         self._token = token
         self._analysis_cache = {}
+        self._strategy_cache = {}
 
         self.app = FastAPI(
             title='Mtbot Control API',
@@ -186,16 +186,13 @@ class ControlAPI:
         async def update_settings(payload: SettingsPatch, _=Depends(auth)):
             mapping = {
                 'risk_pct': ('risk_pct', 'risk_pct'),
-                'rr': ('ai_rr_override', 'ai_rr_override'),
-                'sl_points': ('ai_sl_points_override', 'ai_sl_points_override'),
-                'tp_points': ('ai_tp_points_override', 'ai_tp_points_override'),
                 'min_confidence': ('min_confidence', 'min_confidence'),
-                'protection_pct': ('ai_protection_override', 'ai_protection_override'),
-                'trailing_gap_pct': ('ai_trailing_override', 'ai_trailing_override'),
-                'max_trade_minutes': ('ai_duration_override', 'ai_duration_override'),
+                'min_entry_confidence': ('min_entry_confidence', 'min_entry_confidence'),
                 'max_positions': ('max_positions', 'max_positions'),
                 'max_consecutive_losses': ('max_consecutive_losses', 'max_consecutive_losses'),
                 'daily_loss_limit_pct': ('daily_loss_limit_pct', 'daily_loss_limit_pct'),
+                'max_daily_trades': ('max_daily_trades', 'max_daily_trades'),
+                'max_correlated_positions': ('max_correlated_positions', 'max_correlated_positions'),
                 'session_profit_limit': ('session_profit_limit', 'session_profit_limit'),
                 'real_trading_enabled': ('real_trading_enabled', 'real_trading_enabled'),
             }
@@ -212,6 +209,8 @@ class ControlAPI:
                 self.engine.loss_limit_notified = False
             if 'daily_loss_limit_pct' in changed:
                 self.engine.daily_loss_notified = False
+            if changed:
+                self._strategy_cache.clear()
 
             await self.db.log('SETTINGS_UPDATED', source='t4bot', changed=changed)
             await self.event_hub.broadcast('settings_changed', changed)
@@ -277,6 +276,20 @@ class ControlAPI:
             rows = await self._run_analysis()
             await self.event_hub.broadcast('analysis_updated', {'symbols': [row['symbol'] for row in rows]})
             return rows
+
+        @app.get('/v1/strategies')
+        async def strategies(_=Depends(auth)):
+            return {
+                'catalog': self.engine.strategy_catalog(),
+                'performance': await self._strategy_performance(200),
+            }
+
+        @app.get('/v1/strategies/performance')
+        async def strategies_performance(
+            window: int = Query(default=200, ge=1, le=2000),
+            _=Depends(auth),
+        ):
+            return await self._strategy_performance(window)
 
         @app.get('/v1/audit')
         async def audit(limit: int = Query(default=100, ge=1, le=500), _=Depends(auth)):
@@ -376,20 +389,21 @@ class ControlAPI:
             'settings': {
                 'symbols': list(self.engine.symbols),
                 'risk_pct': self._number(self.engine.risk_pct),
-                'rr': self._number(self.engine.ai_rr_override),
-                'sl_points': self._number(self.engine.ai_sl_points_override),
-                'tp_points': self._number(self.engine.ai_tp_points_override),
                 'min_confidence': self._number(self.engine.min_confidence),
-                'protection_pct': self._number(self.engine.ai_protection_override),
-                'trailing_gap_pct': self._number(self.engine.ai_trailing_override),
-                'max_trade_minutes': self._number(self.engine.ai_duration_override),
+                'min_entry_confidence': self._number(self.engine.min_entry_confidence),
                 'max_positions': int(self.engine.max_positions),
                 'max_consecutive_losses': int(self.engine.max_consecutive_losses),
                 'daily_loss_limit_pct': self._number(self.engine.daily_loss_limit_pct),
+                'max_daily_trades': int(self.engine.max_daily_trades),
+                'max_correlated_positions': int(self.engine.max_correlated_positions),
                 'session_profit_limit': self._number(self.engine.session_profit_limit),
                 'real_trading_enabled': bool(self.engine.real_trading_enabled),
             },
             'analysis': list(self._analysis_cache.values()),
+            'strategies': {
+                'catalog_size': len(self.engine.registry.strategies),
+                'performance': await self._strategy_performance(200),
+            },
             'readiness': {
                 'connected': bool(readiness.get('connected')),
                 'trade_allowed': bool(readiness.get('trade_allowed')),
@@ -397,6 +411,16 @@ class ControlAPI:
                 'trade_expert': bool(readiness.get('trade_expert')),
             },
         }
+
+    async def _strategy_performance(self, window=200):
+        """Cached per strategy/symbol/regime metrics shared by HTTP surfaces."""
+        now = time.monotonic()
+        cached = self._strategy_cache.get(int(window))
+        if cached and (now - cached['at']) < 5.0:
+            return cached['rows']
+        rows = await self.engine.strategy_report(window=window)
+        self._strategy_cache[int(window)] = {'rows': rows, 'at': now}
+        return rows
 
     async def _run_analysis(self):
         if not self.gateway.account():
@@ -424,7 +448,14 @@ class ControlAPI:
                 if 'time_msc' in ticks.dtype.names
                 else float(ticks['time'][-1])
             )
-            if abs(time.time() - tick_ts) > settings.max_tick_age_seconds:
+            live_tick = self.gateway.tick(symbol)
+            live_epoch = (
+                float(getattr(live_tick, 'time_msc', 0) or 0) / 1000.0
+                if live_tick else 0.0
+            )
+            if live_epoch <= 0 and live_tick:
+                live_epoch = float(getattr(live_tick, 'time', 0) or 0)
+            if live_epoch <= 0 or abs(live_epoch - tick_ts) > settings.max_tick_age_seconds:
                 row = self._analysis_unavailable(symbol, 'stale_tick', updated_at)
                 rows.append(row)
                 self._analysis_cache[symbol] = row
@@ -484,7 +515,7 @@ class ControlAPI:
     def _position_payload(self, position):
         position_type = getattr(position, 'type', None)
         side = 'BUY' if position_type == mt5.POSITION_TYPE_BUY else 'SELL'
-        return {
+        payload = {
             'ticket': int(getattr(position, 'ticket', 0) or 0),
             'symbol': str(getattr(position, 'symbol', '') or ''),
             'side': side,
@@ -497,6 +528,23 @@ class ControlAPI:
             'magic': int(getattr(position, 'magic', 0) or 0),
             'image_id': self.event_hub.media_id_for_ticket(getattr(position, 'ticket', 0)),
         }
+        state = self.engine.trades.get(payload['ticket'])
+        if state is not None:
+            payload.update({
+                'strategy': state.strategy,
+                'regime': state.regime,
+                'confidence': self._number(state.confidence),
+                'tp1': self._number(state.tp1),
+                'tp2': self._number(state.tp2),
+                'mfe_r': self._number(state.mfe_r),
+                'mae_r': self._number(state.mae_r),
+                'risk_cash': self._number(state.risk_cash),
+                'protection_active': bool(state.protection_45_active),
+                'trailing_active': bool(state.trailing_moved),
+                'breakeven_done': bool(state.be_done),
+                'tp1_hit': bool(state.tp1_hit),
+            })
+        return payload
 
     def _store_credentials(self, login, server, password):
         cred_file = Path.home() / '.mt5bot_credentials.json'

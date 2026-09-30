@@ -17,18 +17,11 @@ async def main():
 
  gw=MT5Gateway()
 
- # استرجاع حساب MT5 المحفوظ إن وجد
+ # Saved MT5 credentials are restored after the control surfaces are online.
+ # MT5/Wine initialization is blocking, so it runs in a worker thread and must
+ # never delay T4Bot API or Telegram startup.
  import json
  cred_file=Path.home()/'.mt5bot_credentials.json'
- if cred_file.exists():
-  try:
-   cred=json.loads(cred_file.read_text())
-   ok,err,a=gw.login(cred['login'],cred['password'],cred['server'])
-   print('MT5:',f'connected {a.login} {a.server}' if ok else f'saved login failed: {err}')
-  except Exception as ex:
-   print('MT5: saved login error:',ex)
- else:
-  print('MT5: no saved account; login is available from an enabled control surface')
 
  event_hub=EventHub()
  app_holder={}
@@ -149,9 +142,9 @@ async def main():
      pass
 
  e=Engine(gw,db,notify)
- # Existing saved account: migrate the old global preferences once into this
- # account's profile. Newly linked accounts do not inherit another account.
- await e.load_settings(migrate_legacy=bool(gw.account()))
+ # Load safe defaults immediately. Account-scoped settings are refreshed after
+ # the background MT5 restore succeeds.
+ await e.load_settings(migrate_legacy=False)
 
  api_server=None
  api_task=None
@@ -192,10 +185,31 @@ async def main():
  else:
   print('Telegram: disabled by TELEGRAM_ENABLED=false')
 
+ async def restore_mt5():
+  if not cred_file.exists():
+   print('MT5: no saved account; login is available from an enabled control surface')
+   return
+  try:
+   cred=json.loads(cred_file.read_text())
+   ok,err,a=await asyncio.to_thread(gw.login,cred['login'],cred['password'],cred['server'])
+   if ok:
+    print('MT5:',f'connected {a.login} {a.server}')
+    await e.load_settings(login=int(a.login),migrate_legacy=True)
+   else:
+    print('MT5: saved login failed:',err)
+  except asyncio.CancelledError:
+   raise
+  except Exception as ex:
+   print('MT5: saved login error:',ex)
+
+ mt5_restore_task=asyncio.create_task(restore_mt5())
+
  try:
   while True:
    await asyncio.sleep(3600)
  finally:
+  if mt5_restore_task and not mt5_restore_task.done():
+   mt5_restore_task.cancel()
   if telegram_app:
    await telegram_app.updater.stop()
    await telegram_app.stop()

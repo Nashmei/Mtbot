@@ -1,1681 +1,1607 @@
-import asyncio,time,traceback,json
-import MetaTrader5 as mt5
-from .config import settings
-from .models import TradeState,Side
-from .analyzer import Analyzer
-from .risk import Risk
-from .ai_advisor import AIAdvisor
-from .ai_native_selector import AINativeSelector
-from .web_research import WebResearch
+"""MTBOT execution engine.
 
-def _signal_key(strategy,side_value,signal_bar):
- return (strategy,side_value,signal_bar)
+Pipeline per symbol, per cycle:
+
+    closed bars (M1..W1)  ->  MarketContext
+    MarketContext         ->  RegimeDetector
+    regime + spec         ->  StrategyRegistry (Strategy x Symbol x Regime)
+    winning decision      ->  structural SL/TP owned by the strategy
+    SL + user risk %      ->  exact risk-sized lot (never distorted)
+    broker checks         ->  send / reject safely
+    TradeState            ->  per-strategy protection / partial / trailing / time exit
+    MT5 truth             ->  DB audit + Telegram + T4Bot event hub
+"""
+
+import asyncio
+import json
+import math
+import time
+import traceback
+
+import MetaTrader5 as mt5
+
+from .config import settings
+from .ai_advisor import AIAdvisor
+from . import account_guard
+from .indicators import rows as to_rows
+from .models import Regime, Side, Signal, TradeState
+from .regime import RegimeDetector
+from .risk import Risk
+from .strategy_base import MarketContext, session_of
+from .strategy_registry import ComboPerformance, StrategyRegistry, symbol_class
+
+MAGIC = 4009
+
+# Only these decision sources may open new positions. Deterministic strategies
+# are the primary path; AI is optional and requires its own explicit keys.
+DETERMINISTIC_PREFIXES = (
+    'trend_', 'range_', 'asia_', 'liquidity_', 'gold_', 'volatility_',
+    'vwap_', 'london_', 'double_', 'failed_', 'rsi_', 'ema_', 'ny_',
+    'index_', 'round_', 'three_', 'inside_', 'two_bar_',
+)
+AI_STRATEGY_ID = 'ai_market_analysis'
+
+
+def is_deterministic(strategy_id):
+    return str(strategy_id or '').startswith(DETERMINISTIC_PREFIXES)
+
 
 class Engine:
- def __init__(self,gw,db,notify):
-  self.gw=gw
-  self.db=db
-  self.notify=notify
-  self.running=False
+    def __init__(self, gw, db, notify):
+        self.gw = gw
+        self.db = db
+        self.notify = notify
+        self.running = False
 
-  # إعدادات قابلة للتحكم من Telegram
-  self.symbols=['EURUSD']
-  self.symbol='EURUSD'
-  self.rr=3.0
-  self.risk_pct=0.25
-  self.min_confidence=75.0
-  self.protection_pct=45.0
-  self.trailing_gap_pct=5.0
-  self.max_trade_minutes=10.0
-  # AI-native manual overrides: 0 = AI decides per trade.
-  self.ai_rr_override=0.0
-  self.ai_sl_points_override=0.0
-  self.ai_tp_points_override=0.0
-  self.ai_protection_override=0.0
-  self.ai_trailing_override=0.0
-  self.ai_duration_override=0.0
-  self.reentry_cooldown_seconds=120.0
-  self.last_close_by_symbol={}
-  self.blocked_signal_by_symbol={}
-  self.max_positions=1
-  self.max_consecutive_losses=3
-  self.daily_loss_limit_pct=2.0
-  # Real trading is an explicit per-account safety lock. Demo does not need it.
-  self.real_trading_enabled=False
-  self.session_profit_limit=0.0
-  self.session_start_balance=0.0
-  self.session_profit_hit=False
-  self.session_active=False
-  self.consecutive_losses=0
-  self.loss_limit_notified=False
-  self.daily_loss_notified=False
+        # ---- user/account controlled settings --------------------------
+        self.symbols = ['EURUSD']
+        self.symbol = 'EURUSD'
+        self.rr = 3.0
+        self.risk_pct = 0.5
+        self.min_confidence = 65.0
+        self.protection_pct = 40.0
+        self.trailing_gap_pct = 8.0
+        self.max_positions = 2
+        self.max_consecutive_losses = 4
+        self.daily_loss_limit_pct = 3.0
+        self.max_daily_trades = 20
+        self.max_correlated_positions = 1
+        self.reentry_cooldown_seconds = 300.0
+        self.min_entry_confidence = 65.0
+        # Real trading is an explicit per-account safety lock.
+        self.real_trading_enabled = False
+        self.session_profit_limit = 0.0
+        self.session_start_balance = 0.0
+        self.session_profit_hit = False
+        self.session_active = False
+        self.consecutive_losses = 0
+        self.loss_limit_notified = False
+        self.daily_loss_notified = False
+        self.daily_trades = 0
+        self.daily_trades_date = ''
 
-  # كل ticket له TradeState مستقل
-  self.trades={}
-  self.trade=None
+        # ---- strategy brain --------------------------------------------
+        self.regime_detector = RegimeDetector(settings)
+        self.registry = StrategyRegistry(settings, db)
+        self.ai_advisor = AIAdvisor(db)
 
-  # حالة مستقلة لكل رمز
-  self.last_entry_by_symbol={}
-  self.last_analysis_by_symbol={}
-  self.scan_index=0
+        # ---- runtime state ---------------------------------------------
+        self.trades = {}
+        self.trade = None
+        self.last_entry_by_symbol = {}
+        self.last_analysis_by_symbol = {}
+        self.last_close_by_symbol = {}
+        self.blocked_signal_by_symbol = {}
+        self.last_regime_by_symbol = {}
+        self.last_candidates_by_symbol = {}
+        self.scan_index = 0
+        self.last_entry = 0
+        self.risk = Risk()
+        self.reject_log_at = {}
+        self.reject_log_interval = 90.0
+        self.trade_alert_meta = {}
+        self.execution_notice_once = set()
+        self.scan_count = 0
+        self.last_cycle_seconds = 0.0
+        self.last_cycle_at = 0.0
+        self.last_cycle_log_at = 0.0
+        self._settings_login = None
 
-  self.last_entry=0
-  self.last_analysis_key=None
-  self.an=Analyzer()
-  self.risk=Risk()
-  self.ai=AIAdvisor(db)
-  # AI branch experiment: legacy strategy signal generation is bypassed.
-  self.ai_native=AINativeSelector(db)
-  self.web_research=WebResearch(db)
-  self.ai_native_only=True
-  self.reject_log_at={}
-  self.reject_log_interval=60.0
-  self.trade_alert_meta={}
-  self.execution_notice_once=set()
-  self.scan_count=0
-  self.last_cycle_seconds=0.0
-  self.last_cycle_at=0.0
-  self.last_cycle_log_at=0.0
-  self.strategy_performance={}
-  self.strategy_performance_window=50
-  self.strategy_performance_refreshed_at=0.0
+    # ==================================================================
+    # settings
+    # ==================================================================
+    async def _account_key(self, key, login=None):
+        if login is None and self.gw is not None:
+            account = self.gw.account()
+            raw_login = getattr(account, 'login', None) if account else None
+            login = int(raw_login) if raw_login is not None else None
+        return f'account:{int(login)}:{key}' if login is not None else key
 
-  # الإعدادات المحفوظة تُحمّل لاحقاً داخل سياق async
+    async def save_setting(self, key, value):
+        db_key = await self._account_key(key)
+        if db_key is None:
+            raise RuntimeError('MT5 account is not connected')
+        await self.db.set(db_key, value)
 
-
- async def _account_key(self,key,login=None):
-  if login is None and self.gw is not None:
-   account=self.gw.account()
-   raw_login=getattr(account,'login',None) if account else None
-   login=int(raw_login) if raw_login is not None else None
-  return f'account:{int(login)}:{key}' if login is not None else key
-
- async def save_setting(self,key,value):
-  db_key=await self._account_key(key)
-  if db_key is None:
-   raise RuntimeError('MT5 account is not connected')
-  await self.db.set(db_key,value)
-
- async def load_settings(self,login=None,migrate_legacy=False):
-  # Every MT5 account owns an independent Telegram-managed profile.
-  # A newly linked account starts from safe built-in defaults.
-  if login is None and self.gw is not None:
-   account=self.gw.account()
-   raw_login=getattr(account,'login',None) if account else None
-   login=int(raw_login) if raw_login is not None else None
-  # Compatibility path for isolated/unit use without an MT5 account:
-  # load legacy global DB settings, but never use this path for a connected account.
-  if login is None:
-   legacy={
-    'rr':('rr',float),'risk_pct':('risk_pct',float),
-    'min_confidence':('min_confidence',float),
-    'protection_pct':('protection_pct',float),
-    'trailing_gap_pct':('trailing_gap_pct',float),
-    'max_trade_minutes':('max_trade_minutes',float),
-    'max_positions':('max_positions',int),
-    'max_consecutive_losses':('max_consecutive_losses',int),
-    'daily_loss_limit_pct':('daily_loss_limit_pct',float),
-    'session_profit_limit':('session_profit_limit',float),
-    'consecutive_losses':('consecutive_losses',int),
-   }
-   for key,(attr,cast) in legacy.items():
-    raw=await self.db.get(key)
-    if raw is None:
-     continue
-    try:
-     value=cast(raw)
-     if key=='consecutive_losses': value=max(0,value)
-     setattr(self,attr,value)
-    except (TypeError,ValueError):
-     pass
-   await self._refresh_strategy_performance(force=True)
-   return
-
-  defaults={
-   'rr':3.0,'risk_pct':0.25,'min_confidence':75.0,
-   'protection_pct':45.0,'trailing_gap_pct':5.0,
-   'max_trade_minutes':10.0,'max_positions':1,
-   'max_consecutive_losses':3,'daily_loss_limit_pct':2.0,'real_trading_enabled':0,'session_profit_limit':0.0,
-   'session_start_balance':0.0,'session_profit_hit':0,'session_active':0,
-   'consecutive_losses':0,
-   'ai_rr_override':0.0,'ai_sl_points_override':0.0,'ai_tp_points_override':0.0,
-   'ai_protection_override':0.0,'ai_trailing_override':0.0,'ai_duration_override':0.0,
-  }
-  attrs={
-   'rr':'rr','risk_pct':'risk_pct','min_confidence':'min_confidence',
-   'protection_pct':'protection_pct','trailing_gap_pct':'trailing_gap_pct',
-   'max_trade_minutes':'max_trade_minutes','max_positions':'max_positions',
-   'max_consecutive_losses':'max_consecutive_losses',
-   'daily_loss_limit_pct':'daily_loss_limit_pct','real_trading_enabled':'real_trading_enabled','session_profit_limit':'session_profit_limit',
-   'session_start_balance':'session_start_balance','session_profit_hit':'session_profit_hit','session_active':'session_active',
-   'consecutive_losses':'consecutive_losses',
-   'ai_rr_override':'ai_rr_override','ai_sl_points_override':'ai_sl_points_override',
-   'ai_tp_points_override':'ai_tp_points_override','ai_protection_override':'ai_protection_override',
-   'ai_trailing_override':'ai_trailing_override','ai_duration_override':'ai_duration_override',
-  }
-  int_keys={'max_positions','max_consecutive_losses','consecutive_losses','session_profit_hit','session_active','real_trading_enabled'}
-  for key,default in defaults.items():
-   scoped=await self._account_key(key,login)
-   raw=await self.db.get(scoped)
-   if raw is None and migrate_legacy:
-    raw=await self.db.get(key)
-    if raw is not None:
-     await self.db.set(scoped,raw)
-   if raw is None:
-    raw=default
-    await self.db.set(scoped,raw)
-   try:
-    value=int(raw) if key in int_keys else float(raw)
-    if key=='consecutive_losses': value=max(0,value)
-    setattr(self,attrs[key],value)
-   except (TypeError,ValueError):
-    setattr(self,attrs[key],default)
-
-  symbols_key=await self._account_key('symbols',login)
-  raw_symbols=await self.db.get(symbols_key)
-  if raw_symbols is None and migrate_legacy:
-   raw_symbols=await self.db.get('symbols')
-   if raw_symbols is not None:
-    await self.db.set(symbols_key,raw_symbols)
-  if raw_symbols:
-   try:
-    import json
-    saved=json.loads(raw_symbols)
-    if isinstance(saved,list) and saved:
-     self.symbols=[str(x) for x in saved]
-     self.symbol=self.symbols[0]
-   except Exception:
-    pass
-  else:
-   self.symbols=['EURUSD'];self.symbol='EURUSD'
-   import json
-   await self.db.set(symbols_key,json.dumps(self.symbols))
-
-  self.session_profit_hit=bool(self.session_profit_hit)
-  self.session_active=bool(self.session_active)
-  self.real_trading_enabled=bool(self.real_trading_enabled)
-  await self._refresh_strategy_performance(force=True)
-
-
- async def _refresh_strategy_performance(self,force=False):
-  now=time.monotonic()
-  if not force and now-self.strategy_performance_refreshed_at<60.0:
-   return
-  try:
-   self.strategy_performance=await self.db.strategy_performance(self.strategy_performance_window)
-   self.strategy_performance_refreshed_at=now
-  except Exception as ex:
-   self.strategy_performance_refreshed_at=now
-   await self.db.log('STRATEGY_PERFORMANCE_ERROR',error=repr(ex))
-
-
- async def status(self):
-  a=self.gw.account()
-  if not a:
-   return 'MT5 غير متصل'
-
-  symbols=', '.join(self.symbols) if self.symbols else 'لا يوجد'
-  state='🟢 يعمل' if self.running else '⚪ متوقف'
-  is_demo=getattr(a,'trade_mode',None)==mt5.ACCOUNT_TRADE_MODE_DEMO
-  account_mode='تجريبي' if is_demo else 'حقيقي'
-  real_lock='' if is_demo else (' | 🔓 Real مفعّل' if self.real_trading_enabled else ' | 🔒 Real مقفل')
-
-  return (
-   f'{state} | {account_mode}{real_lock}\n'
-   f'🔄 دورات المحرك: {self.scan_count} | آخر مدة: {self.last_cycle_seconds:.2f}ث\n'
-   f'💱 الأزواج: {symbols}\n'
-   f'📂 المراكز: {len(self.trades)} / {self.max_positions}\n'
-   f'⚠️ المخاطرة: {self.risk_pct:g}% لكل صفقة\n'
-   f'🧠 إدارة الصفقة: AI مع overrides اختيارية (0=AI)\n'
-   f'⚖️ RR override: {self.ai_rr_override:g} | SL/TP: {self.ai_sl_points_override:g}/{self.ai_tp_points_override:g} pt\n'
-   f'🛡 Protection/Trailing: {self.ai_protection_override:g}/{self.ai_trailing_override:g} | ⏱ {self.ai_duration_override:g}m\n'
-   f'❌ الخسائر المتتالية: {self.consecutive_losses} / {self.max_consecutive_losses}\n'
-   f'📉 حد Equity اليومي: {self.daily_loss_limit_pct:g}%'
-   f'{" (معطل)" if self.daily_loss_limit_pct<=0 else ""}\n'
-   f'⚖️ العائد/المخاطرة: 1:{self.rr:g}\n'
-   f'💰 Equity: {a.equity:.2f} {a.currency}'
-  )
-
- async def start(self):
-  import math
-  if not (math.isfinite(self.risk_pct) and 0<self.risk_pct<=50
-          and math.isfinite(self.rr) and .5<=self.rr<=10
-          and 1<=self.max_positions<=10
-          and math.isfinite(self.daily_loss_limit_pct)
-          and 0<=self.daily_loss_limit_pct<=100):
-   await self.notify('⚠️ إعدادات المخاطرة أو العائد أو حد المراكز غير صالحة.')
-   return False
-  account=self.gw.account()
-  if not account:
-   await self.notify('⚠️ يلزم اتصال بحساب MT5 قبل التشغيل.')
-   return False
-  trade_mode=getattr(account,'trade_mode',None)
-  allowed_modes={mt5.ACCOUNT_TRADE_MODE_DEMO,getattr(mt5,'ACCOUNT_TRADE_MODE_REAL',2)}
-  if trade_mode not in allowed_modes:
-   await self.notify('⚠️ نوع حساب MT5 غير مدعوم. المسموح Demo أو Real فقط.')
-   return False
-  if trade_mode!=mt5.ACCOUNT_TRADE_MODE_DEMO and not self.real_trading_enabled:
-   await self.notify('🔒 الحساب Real متصل لكن التداول الحقيقي غير مفعّل لهذا الحساب.')
-   return False
-  if not await self._daily_entry_allowed(account):
-   return False
-  permissions=self.gw.algo_status()
-  if not all(permissions.get(key) for key in ('connected','trade_allowed','account_trade_allowed','trade_expert')):
-   await self.notify('⚠️ اتصال MT5 أو صلاحية Algo Trading غير جاهزة. افحص الجاهزية أولاً.')
-   return False
-  positions=self.gw.positions()
-  if positions is None:
-   await self.notify('⚠️ تعذر قراءة مراكز MT5؛ لن يبدأ المحرك.')
-   return False
-  old=[p for p in positions if getattr(p,'magic',0)==4009 and p.ticket not in self.trades]
-  if old:
-   await self.notify('⚠️ توجد صفقة قديمة للبوت غير متتبعة. أغلقها يدويًا قبل التشغيل.')
-   return False
-
-  if self.running:
-   await self.notify('ℹ️ البوت يعمل بالفعل.')
-   return True
-
-  # A clean Stop ends a session. A service/process restart does not:
-  # if session_active survived in SQLite we resume the same realized Balance baseline.
-  if not (self.session_active and self.session_start_balance>0 and not self.session_profit_hit):
-   self.session_start_balance=float(getattr(account,'balance',0) or 0)
-   self.session_profit_hit=False
-   self.session_active=True
-   await self.save_setting('session_start_balance',self.session_start_balance)
-   await self.save_setting('session_profit_hit',0)
-   await self.save_setting('session_active',1)
-
-  if not self.symbols:
-   await self.notify('⚠️ اختر زوجاً واحداً على الأقل قبل التشغيل.')
-   return False
-
-  self.running=True
-  self.last_analysis_by_symbol={}
-
-  await self.db.log(
-   'BOT_STARTED',
-   symbols=self.symbols,
-   risk_pct=self.risk_pct,
-   protection_pct=self.protection_pct,
-   max_positions=self.max_positions,
-   max_consecutive_losses=self.max_consecutive_losses,
-   daily_loss_limit_pct=self.daily_loss_limit_pct,
-   session_profit_limit=self.session_profit_limit,
-   session_start_balance=self.session_start_balance
-  )
-
-  await self.notify(
-   f'▶️ تم تشغيل البوت\n'
-   f'💱 مراقبة: {", ".join(self.symbols)}\n'
-   f'📂 حد المراكز: {self.max_positions}\n'
-   f'⚠️ المخاطرة: {self.risk_pct:g}%\n'
-   f'🛡 الحماية: {self.protection_pct:g}%'
-  )
-
-  self.loop_task=asyncio.create_task(self.loop())
-  return True
-
- async def stop(self):
-  # منع أي دخول جديد فوراً وإنهاء جلسة التشغيل بشكل صريح.
-  self.running=False
-  self.session_active=False
-  await self.save_setting('session_active',0)
-
-  # دعم مؤقت للصفقة القديمة أثناء مرحلة التحويل
-  managed=list(self.trades.values())
-  if self.trade and self.trade.ticket not in self.trades:
-   managed.append(self.trade)
-
-  failed=0
-  closed=0
-
-  for t in managed:
-   pos=self.gw.position_by_ticket(t.ticket)
-
-   if not pos:
-    self.trades.pop(t.ticket,None)
-    if self.trade and self.trade.ticket==t.ticket:
-     self.trade=None
-    continue
-
-   res=self.gw.close(pos)
-
-   if res and res.retcode in (
-    mt5.TRADE_RETCODE_DONE,
-    mt5.TRADE_RETCODE_DONE_PARTIAL
-   ):
-    remaining=self.gw.position_by_ticket(t.ticket)
-    if remaining:
-     failed+=1
-     await self.db.log('STOP_EXIT_PARTIAL',t.symbol,ticket=t.ticket,remaining_volume=remaining.volume)
-     await self.notify(
-      f'⚠️ إغلاق جزئي للمركز {t.ticket} ({t.symbol}). '
-      f'المتبقي {remaining.volume:g} لوت؛ افحصه في MT5.'
-     )
-     continue
-    closed+=1
-    await asyncio.sleep(.3)
-
-    exit_price=float(getattr(res,'price',0) or 0)
-    pnl=None
-
-    deals=self.gw.history_deals_by_position(t.ticket)
-    for d in deals:
-     if getattr(d,'entry',None) in (
-      getattr(mt5,'DEAL_ENTRY_OUT',1),
-      getattr(mt5,'DEAL_ENTRY_OUT_BY',3)
-     ):
-      exit_price=float(getattr(d,'price',exit_price) or exit_price)
-      pnl=(float(getattr(d,'profit',0) or 0)
-           +float(getattr(d,'swap',0) or 0)
-           +float(getattr(d,'commission',0) or 0))
-
-    await self.db.log(
-     'STOP_EXIT',t.symbol,
-     ticket=t.ticket,exit_price=exit_price,pnl=pnl
-    )
-
-    pnl_text=f'{pnl:.2f}' if pnl is not None else 'بانتظار سجل MT5'
-    await self.notify(
-     f'⏹ إغلاق بسبب إيقاف البوت — {t.symbol}\n'
-     f'🎫 المركز: {t.ticket}\n'
-     f'🚪 سعر الخروج: {exit_price}\n'
-     f'💰 الربح/الخسارة: {pnl_text}'
-    )
-
-    self.trades.pop(t.ticket,None)
-    if self.trade and self.trade.ticket==t.ticket:
-     self.trade=None
-
-   else:
-    failed+=1
-    await self.db.log(
-     'STOP_EXIT_FAILED',t.symbol,
-     ticket=t.ticket,result=str(res)
-    )
-    await self.notify(
-     f'⚠️ فشل إغلاق المركز — {t.symbol}\n'
-     f'🎫 المركز: {t.ticket}\n'
-     f'📡 MT5: {getattr(res,"comment","لا توجد استجابة")}\n'
-     f'⚠️ تحقق منه يدوياً في MT5.'
-    )
-
-  await self.db.log(
-   'BOT_STOPPED',
-   closed_positions=closed,
-   failed_positions=failed
-  )
-
-  if failed:
-   await self.notify(
-    f'⏹ تم إيقاف فتح الصفقات الجديدة.\n'
-    f'✅ أُغلق: {closed}\n'
-    f'⚠️ تعذر إغلاق: {failed}'
-   )
-  else:
-   await self.notify(f'⏹ تم إيقاف البوت | المراكز المغلقة: {closed}')
-
- async def loop(self):
-  while self.running:
-   started=time.monotonic()
-   try:
-    await self.step()
-    self.scan_count+=1
-    self.last_cycle_seconds=time.monotonic()-started
-    self.last_cycle_at=time.time()
-    if self.last_cycle_at-self.last_cycle_log_at>=60:
-     self.last_cycle_log_at=self.last_cycle_at
-     await self.db.log('ENGINE_CYCLE',duration_seconds=round(self.last_cycle_seconds,3),scan_count=self.scan_count)
-   except Exception as e:
-    self.running=False
-    try: await self.db.log('ENGINE_ERROR',self.symbol,error=repr(e),traceback=traceback.format_exc())
-    finally: await self.notify('🚨 توقف المحرك بسبب خطأ. افحص سجل ENGINE_ERROR ومراكز MT5 قبل إعادة التشغيل.')
-    return
-   await asyncio.sleep(settings.poll_interval_ms/1000)
-
- async def _daily_entry_allowed(self,account):
-  """Persist a local-day equity baseline across bot restarts."""
-  from datetime import date
-  import math
-  equity=float(getattr(account,'equity',0) or 0)
-  if not math.isfinite(equity) or equity<=0:
-   return False
-  if self.daily_loss_limit_pct<=0:
-   return True
-  today=date.today().isoformat()
-  day_key=await self._account_key('daily_equity_date')
-  baseline_key=await self._account_key('daily_equity_baseline')
-  saved_day=await self.db.get(day_key)
-  baseline=float(await self.db.get(baseline_key,0) or 0)
-  if saved_day!=today or not math.isfinite(baseline) or baseline<=0:
-   baseline=equity
-   await self.db.set(baseline_key,baseline)
-   await self.db.set(day_key,today)
-   self.daily_loss_notified=False
-  allowed=equity>baseline*(1-self.daily_loss_limit_pct/100.0)
-  if not allowed and not self.daily_loss_notified:
-   self.daily_loss_notified=True
-   await self.db.log('DAILY_EQUITY_LIMIT',equity=equity,baseline=baseline,limit_pct=self.daily_loss_limit_pct)
-   await self.notify('🛑 توقف الدخول: حد انخفاض Equity اليومي. تستمر إدارة المراكز المفتوحة.')
-  return allowed
-
- async def step(self):
-  account=self.gw.account()
-  if not account:
-   self.running=False; await self.notify('⚠️ انقطع حساب MT5؛ تم إيقاف المحرك.'); return
-  trade_mode=getattr(account,'trade_mode',None)
-  allowed_modes={mt5.ACCOUNT_TRADE_MODE_DEMO,getattr(mt5,'ACCOUNT_TRADE_MODE_REAL',2)}
-  if trade_mode not in allowed_modes:
-   self.running=False; await self.notify('⚠️ نوع حساب MT5 غير مدعوم؛ تم إيقاف المحرك.'); return
-  if trade_mode!=mt5.ACCOUNT_TRADE_MODE_DEMO and not self.real_trading_enabled:
-   self.running=False; await self.notify('🔒 قفل Real غير مفعّل لهذا الحساب؛ تم إيقاف المحرك.'); return
-
-  positions=self.gw.positions()
-  if positions is None:
-   self.running=False
-   await self.notify('⚠️ تعذر التحقق من مراكز MT5؛ أُوقف الدخول حتى استعادة الاتصال.')
-   return
-  unknown=[p for p in positions if getattr(p,'magic',0)==4009 and p.ticket not in self.trades]
-  if unknown:
-   self.running=False
-   await self.db.log('UNMANAGED_POSITION',tickets=[p.ticket for p in unknown])
-   await self.notify('🚨 يوجد مركز للبوت غير متتبع. أُوقف المحرك؛ افحص المراكز في MT5.')
-   return
-
-  # إدارة كل الصفقات المفتوحة أولاً
-  for t in list(self.trades.values()):
-   info=self.gw.info(t.symbol); tick=self.gw.tick(t.symbol)
-   if info and tick: await self.manage(t,tick,info)
-
-  await self._refresh_strategy_performance()
-
-  # Session profit uses realized Balance only; floating Equity/PnL is ignored.
-  if self.session_profit_limit>0 and self.session_start_balance>0:
-   balance=float(getattr(account,'balance',0) or 0)
-   realized=balance-self.session_start_balance
-   if realized>=self.session_profit_limit:
-    if not self.session_profit_hit:
-     self.session_profit_hit=True
-     await self.save_setting('session_profit_hit',1)
-     await self.db.log('SESSION_PROFIT_LIMIT',balance=balance,baseline=self.session_start_balance,profit=realized,limit=self.session_profit_limit)
-     await self.notify(f'🎯 تحقق حد ربح الجلسة: +${realized:.2f}. توقف التحليل والدخول الجديد.',event_type='session_profit_limit',trade_result=realized)
-    # Existing positions keep deterministic management; no analysis/new entries.
-    if not self.trades:
-     self.running=False
-     self.session_active=False
-     await self.save_setting('session_active',0)
-    return
-
-  # لا دخول جديد عند بلوغ الحدود
-  if not await self._daily_entry_allowed(account):
-   return
-  if len(self.trades)>=self.max_positions:return
-  if self.max_consecutive_losses > 0 and self.consecutive_losses>=self.max_consecutive_losses:
-   if not self.loss_limit_notified:
-    self.loss_limit_notified=True
-    await self.notify(f'🛑 توقف الدخول: {self.consecutive_losses} خسائر متتالية.')
-   return
-  self.loss_limit_notified=False
-  if not self.symbols:return
-
-  # فحص كل الرموز المختارة في كل دورة
-  for symbol in list(self.symbols):
-   if len(self.trades)>=self.max_positions:
-    break
-   await self._scan_symbol(symbol,account)
-
- async def _log_reject(self,event,symbol,**details):
-  # Keep diagnostics useful without writing the same rejection every scan.
-  key=(event,symbol,details.get('reason',''))
-  now=time.time()
-  if now-self.reject_log_at.get(key,0)<self.reject_log_interval:
-   return
-  self.reject_log_at[key]=now
-  await self.db.log(event,symbol,**details)
-
- def _native_snapshot(self,symbol,account,info,tick,ticks,m1,m5,m15,h1):
-  snap=self.ai_native.snapshot(symbol,tick,info,ticks,m1,m5,m15,h1,self.strategy_performance)
-  snap['account_context']={
-   'balance':float(getattr(account,'balance',0) or 0),'equity':float(getattr(account,'equity',0) or 0),
-   'used_margin':float(getattr(account,'margin',0) or 0),'free_margin':float(getattr(account,'margin_free',0) or 0),
-   'margin_level_pct':float(getattr(account,'margin_level',0) or 0),'leverage':int(getattr(account,'leverage',0) or 0),
-   'currency':str(getattr(account,'currency','') or ''),'open_bot_positions':len(self.trades),
-  }
-  snap['telegram_settings']={
-   'risk_pct':float(self.risk_pct),'rr':float(self.rr),'min_confidence_pct':float(self.min_confidence),
-   'protection_pct':float(self.protection_pct),'trailing_gap_pct':float(self.trailing_gap_pct),
-   'max_trade_minutes':float(self.max_trade_minutes),'max_positions':int(self.max_positions),
-   'max_consecutive_losses':int(self.max_consecutive_losses),'consecutive_losses':int(self.consecutive_losses),
-   'daily_loss_limit_pct':float(self.daily_loss_limit_pct),'session_profit_limit':float(self.session_profit_limit),
-   'manual_overrides':{'rr':float(self.ai_rr_override),'sl_points':float(self.ai_sl_points_override),
-    'tp_points':float(self.ai_tp_points_override),'protection_pct':float(self.ai_protection_override),
-    'trailing_gap_pct':float(self.ai_trailing_override),'duration_minutes':float(self.ai_duration_override),
-    'rule':'0 means AI decides; positive value is a hard user override'},
-  }
-  return snap
-
- async def analyze_symbol(self,symbol):
-  account=self.gw.account();info=self.gw.info(symbol);tick=self.gw.tick(symbol)
-  if not account or not info or not tick or not info.point or tick.bid<=0 or tick.ask<=tick.bid:return None,'INVALID_MARKET_DATA'
-  ticks=self.gw.ticks(symbol)
-  if ticks is None or len(ticks)<40:return None,'INSUFFICIENT_TICKS'
-  latest=float(ticks['time_msc'][-1])/1000.0 if 'time_msc' in ticks.dtype.names else float(ticks['time'][-1])
-  live_epoch=float(getattr(tick,'time_msc',0) or 0)/1000.0 or float(getattr(tick,'time',0) or 0)
-  if live_epoch<=0 or abs(live_epoch-latest)>settings.max_tick_age_seconds:return None,'STALE_TICKS'
-  m5=self.gw.rates_m5(symbol,200);m1=self.gw.rates_m1(symbol,300);m15=self.gw.rates_m15(symbol,200);h1=self.gw.rates_h1(symbol,200)
-  snap=self._native_snapshot(symbol,account,info,tick,ticks,m1,m5,m15,h1)
-  decision=await self.ai_native.decide(symbol,snap,consume_signal=False,min_confidence=self.min_confidence)
-  if decision.get('decision')=='SIGNAL' and float(decision.get('confidence',0))<float(self.min_confidence):
-   decision=dict(decision);decision.update({'decision':'NO_TRADE','reason_code':'CONFIDENCE_REJECT','reason':'Signal confidence below account threshold'})
-  return decision,None
-
- async def _scan_symbol(self,symbol,account):
-   # صفقة واحدة كحد أقصى لكل رمز
-   if any(t.symbol==symbol for t in self.trades.values()):return
-   # Manual-signal experiment: when this flag exists, automatic AI entry
-   # generation is disabled. Existing positions continue through manage().
-   manual_mode_path='storage/manual_signal_mode'
-   manual_signal_path='storage/manual_signal.json'
-   manual_mode=__import__('os').path.exists(manual_mode_path)
-   manual_decision=None
-   if manual_mode:
-    if not __import__('os').path.exists(manual_signal_path):
-     return
-    try:
-     with open(manual_signal_path,'r',encoding='utf-8') as f:
-      candidate=json.load(f)
-     if str(candidate.get('symbol','')).upper()!=str(symbol).upper():
-      return
-     manual_decision=dict(candidate.get('decision') or {})
-    except Exception as e:
-     await self._log_reject('MANUAL_SIGNAL_REJECT',symbol,reason='INVALID_MANUAL_SIGNAL',error=repr(e))
-     return
-   # Avoid stacking the same USD directional exposure across correlated FX pairs.
-   usd_group={'EURUSD','GBPUSD','AUDUSD','NZDUSD'}
-   info=self.gw.info(symbol); tick=self.gw.tick(symbol)
-   if not info or not tick or not info.point or tick.bid<=0 or tick.ask<=tick.bid:
-    # A transient Wine/MT5 quote can briefly expose bid==ask. Retry once,
-    # but never weaken the strict quote validity rule.
-    await asyncio.sleep(.2)
-    info=self.gw.info(symbol); tick=self.gw.tick(symbol)
-    if not info or not tick or not info.point or tick.bid<=0 or tick.ask<=tick.bid:
-     await self._log_reject(
-      'SCAN_REJECT',symbol,reason='INVALID_MARKET_DATA',
-      info=bool(info),tick=bool(tick),
-      point=float(getattr(info,'point',0) or 0) if info else 0,
-      bid=float(getattr(tick,'bid',0) or 0) if tick else 0,
-      ask=float(getattr(tick,'ask',0) or 0) if tick else 0,
-      last_error=repr(mt5.last_error()),
-     )
-     return
-
-   # Compare history freshness against the current MT5 quote clock.
-   # This keeps the check broker-relative across account/server switches and
-   # avoids assuming that the host clock and every broker encode time identically.
-   ticks=self.gw.ticks(symbol)
-   if ticks is None or len(ticks)<40:
-    await self._log_reject('SCAN_REJECT',symbol,reason='INSUFFICIENT_TICKS')
-    return
-   latest=float(ticks['time_msc'][-1])/1000.0 if 'time_msc' in ticks.dtype.names else float(ticks['time'][-1])
-   live_epoch=float(getattr(tick,'time_msc',0) or 0)/1000.0 or float(getattr(tick,'time',0) or 0)
-   tick_age=live_epoch-latest
-   if abs(tick_age)>settings.max_tick_age_seconds:
-    await self._log_reject('SCAN_REJECT',symbol,reason='STALE_TICKS',age_seconds=tick_age)
-    return
-
-   ok,sp,avg,lim=self.risk.spread_ok(tick,info)
-   if not ok:
-    await self._log_reject('SPREAD_REJECT',symbol,spread=sp,average=avg,limit=lim)
-    return
-   m5=self.gw.rates_m5(symbol,200)
-   m1=self.gw.rates_m1(symbol,300)
-   m15=self.gw.rates_m15(symbol,200)
-   h1=self.gw.rates_h1(symbol,200)
-   if self.ai_native_only:
-    # Fresh-candle discipline: AI may evaluate only the latest fully closed M1
-    # candle and execution is allowed only at the beginning of its next candle.
-    # Use the broker/MT5 quote clock, never the host clock.
-    if m1 is None or not len(m1):
-     await self._log_reject('SCAN_REJECT',symbol,reason='NO_CLOSED_M1_FOR_FRESH_CANDLE')
-     return
-    last_closed_m1=int(m1['time'][-1])
-    next_m1_open=last_closed_m1+60
-    seconds_into_m1=live_epoch-next_m1_open
-    # The signal belongs to the M1 candle immediately following the evidence
-    # candle. Allow that candle to form for execution, but never carry the
-    # decision into a later M1 candle.
-    if seconds_into_m1 < 0 or seconds_into_m1 >= 60.0:
-     await self._log_reject(
-      'SCAN_REJECT',symbol,reason='NOT_CURRENT_M1_AFTER_CLOSED_SIGNAL',
-      last_closed_m1=last_closed_m1,seconds_into_m1=round(seconds_into_m1,3),
-     )
-     return
-    # Experimental isolation: old executable strategies/ranker are disabled.
-    # AI creates the bounded signal directly from raw market context.
-    # Preview and executable scans share this exact market/account/settings snapshot.
-    native_snapshot=self._native_snapshot(symbol,account,info,tick,ticks,m1,m5,m15,h1)
-    if manual_mode:
-     native_decision=manual_decision
-     try:
-      __import__('os').remove(manual_signal_path)
-     except FileNotFoundError:
-      pass
-     await self.db.log('MANUAL_SIGNAL_CONSUMED',symbol,decision=native_decision)
-    else:
-     native_decision=await self.ai_native.decide(symbol,native_snapshot,min_confidence=self.min_confidence)
-    if native_decision.get('research_required'):
-     research=await self.web_research.search(
-      symbol,native_decision.get('research_query','')
-     )
-     if not research.get('ok'):
-      await self._log_reject(
-       'AI_RESEARCH_REJECT',symbol,reason='WEB_RESEARCH_FAILED'
-      )
-      return
-     if research.get('high_impact_recent'):
-      await self._log_reject(
-       'AI_NEWS_GUARD_REJECT',symbol,reason='RECENT_HIGH_IMPACT_NEWS',
-       articles=research.get('articles',[]),
-      )
-      return
-     # Re-ask the AI once with fresh trusted-source research attached.
-     native_snapshot=dict(native_snapshot)
-     native_snapshot['news']=research
-     native_decision=await self.ai_native.decide(symbol,native_snapshot,min_confidence=self.min_confidence)
-     if native_decision.get('research_required'):
-      await self._log_reject(
-       'AI_RESEARCH_REJECT',symbol,reason='REPEATED_RESEARCH_REQUEST'
-      )
-      return
-    sig,reg=self.ai_native.to_signal(native_decision,native_snapshot)
-    meta={
-     'decision':'ai_native',
-     'strategy_selection':[],
-     'opportunity_candidates':[],
-     'opportunity_diagnostics':[],
-     'market_mode':native_decision.get('regime','UNKNOWN'),
-     'ai_native':native_decision,
+    SETTING_DEFAULTS = {
+        'rr': 3.0,
+        'risk_pct': 0.5,
+        'min_confidence': 65.0,
+        'min_entry_confidence': 65.0,
+        'protection_pct': 40.0,
+        'trailing_gap_pct': 8.0,
+        'max_positions': 2,
+        'max_consecutive_losses': 4,
+        'daily_loss_limit_pct': 3.0,
+        'max_daily_trades': 20,
+        'max_correlated_positions': 1,
+        'session_profit_limit': 0.0,
+        'real_trading_enabled': 0,
+        'session_start_balance': 0.0,
+        'session_profit_hit': 0,
+        'session_active': 0,
+        'consecutive_losses': 0,
     }
-   else:
-    reg,sig,meta=self.an.analyze(
-     ticks,info.point,m5,symbol=symbol,
-     rates_m15=m15,
-     rates_h1=h1,
-     rates_m1=m1,
-     strategy_performance=self.strategy_performance,
-     min_confidence=self.min_confidence,
-    )
-   for diagnostic in meta.get('opportunity_diagnostics',[]) or []:
-    await self._log_reject(
-     'OPPORTUNITY_DIAGNOSTIC',symbol,
-     reason=diagnostic.get('strategy',''),
-     **diagnostic,
-    )
-   selection=meta.get('strategy_selection',[]) or []
-   if selection:
-    winner=next((row for row in selection if row.get('selected')),None)
-    await self._log_reject(
-     'STRATEGY_SELECTION',symbol,
-     reason=(winner or {}).get('strategy','none'),
-     winner=(winner or {}).get('strategy'),
-     winner_score=(winner or {}).get('final_score'),
-     candidates=selection,
-    )
-   for candidate in meta.get('opportunity_candidates',[]) or []:
-    await self._log_reject(
-     'OPPORTUNITY_CANDIDATE',symbol,
-     reason=candidate.get('strategy',''),
-     strategy=candidate.get('strategy'),
-     side=candidate.get('side'),
-     confidence=candidate.get('confidence'),
-     selected=bool(candidate.get('selected')),
-     preempted_by=candidate.get('preempted_by'),
-     final_signal=sig.strategy if sig is not None else None,
-    )
-   if not sig:
-    await self._log_reject('NO_SIGNAL',symbol,regime=reg.value)
-    return
-   # Temporary experiment isolation: keep MACD enabled elsewhere, but do not
-   # allow it to open XAUUSD positions while protection management is measured.
-   if symbol.upper()=='XAUUSD' and sig.strategy=='macd_momentum':
-    await self._log_reject(
-     'STRATEGY_SYMBOL_REJECT',symbol,
-     reason='EXPERIMENT_MACD_XAUUSD_SUSPENDED',
-     strategy=sig.strategy,side=sig.side.value,
-    )
-    return
-   confidence_score=float(sig.confidence)*100.0
-   # Telegram confidence setting is a real hard entry filter.
-   if confidence_score < self.min_confidence:
-    await self._log_reject('CONFIDENCE_REJECT',symbol,strategy=sig.strategy,confidence=confidence_score,min_confidence=self.min_confidence)
-    return
-   # In AI-native-only mode the selector above is already the entry decision.
-   # Keep the old advisor gate only for the legacy fallback mode.
-   ai_decision=meta.get('ai_native')
-   if not self.ai_native_only:
-    ai_snapshot=self.ai.snapshot(symbol,sig,reg,tick,info,m1,m5,meta,self.strategy_performance)
-    ai_decision=await self.ai.decide(symbol,ai_snapshot)
-   await self.db.log(
-    'AI_GATE',symbol,
-    strategy=sig.strategy,side=sig.side.value,
-    decision=ai_decision.get('decision'),
-    ai_confidence=ai_decision.get('confidence'),
-    ai_model=ai_decision.get('model'),
-    reason_code=ai_decision.get('reason_code'),
-    reason=ai_decision.get('reason'),
-    latency_ms=ai_decision.get('latency_ms'),
-    prompt_hash=ai_decision.get('prompt_hash'),
-   )
-   if (self.ai_native_only and ai_decision.get('decision')!='SIGNAL') or (not self.ai_native_only and ai_decision.get('decision')!='ALLOW'):
-    await self._log_reject(
-     'AI_ENTRY_REJECT',symbol,
-     reason=ai_decision.get('reason_code','AI_REJECT'),
-     strategy=sig.strategy,side=sig.side.value,
-     ai_confidence=ai_decision.get('confidence'),
-     ai_model=ai_decision.get('model'),
-    )
-    return
-   if symbol in usd_group:
-    conflicts=[
-     t for t in self.trades.values()
-     if t.symbol in usd_group and t.side==sig.side
-    ]
-    if conflicts:
-     await self._log_reject(
-      'CORRELATION_REJECT',symbol,side=sig.side.value,strategy=sig.strategy,
-      conflicting_positions=[
-       {'ticket':t.ticket,'symbol':t.symbol,'side':t.side.value,'strategy':t.strategy}
-       for t in conflicts
-      ],
-      rule='same_direction_usd_group',
-     )
-     return
-
-   # بعد الإغلاق: مهلة قصيرة، ثم يجب أن تتجدد الإشارة قبل تكرار نفس الاستراتيجية/الاتجاه.
-   signal_bar=int(m1['time'][-1]) if m1 is not None and len(m1) and sig.strategy=='ema_cross_scalp' else (int(m5['time'][-1]) if m5 is not None and len(m5) else int(ticks['time'][-1]//60*60))
-   signal_key=_signal_key(sig.strategy,sig.side.value,signal_bar)
-   last_close=self.last_close_by_symbol.get(symbol,0)
-   if last_close and time.time()-last_close<self.reentry_cooldown_seconds:
-    await self._log_reject('REENTRY_REJECT',symbol,reason='COOLDOWN',strategy=sig.strategy,side=sig.side.value)
-    return
-   if self.blocked_signal_by_symbol.get(symbol)==signal_key:
-    await self._log_reject('REENTRY_REJECT',symbol,reason='SAME_SIGNAL_BLOCKED',strategy=sig.strategy,side=sig.side.value)
-    return
-
-   last=self.last_entry_by_symbol.get(symbol,0)
-   if time.time()-last<3:
-    await self._log_reject('REENTRY_REJECT',symbol,reason='ENTRY_THROTTLE',strategy=sig.strategy,side=sig.side.value)
-    return
-
-   # Analysis and history calls may take time. Size and price the order from
-   # a fresh quote, not from the quote captured before analysis.
-   tick=self.gw.tick(symbol)
-   if not tick or tick.bid<=0 or tick.ask<=tick.bid:
-    await self._log_reject(
-     'SCAN_REJECT',symbol,reason='INVALID_ENTRY_QUOTE',
-     bid=float(getattr(tick,'bid',0) or 0) if tick else 0,
-     ask=float(getattr(tick,'ask',0) or 0) if tick else 0,
-    )
-    return
-   # Analysis/provider latency must not turn a fresh-candle setup into a late entry.
-   fresh_live_epoch=float(getattr(tick,'time_msc',0) or 0)/1000.0 or float(getattr(tick,'time',0) or 0)
-   fresh_seconds_into_m1=fresh_live_epoch-(int(m1['time'][-1])+60)
-   if fresh_seconds_into_m1 < 0 or fresh_seconds_into_m1 >= 60.0:
-    await self._log_reject(
-     'SCAN_REJECT',symbol,reason='M1_SIGNAL_EXPIRED_AFTER_ANALYSIS',
-     seconds_into_m1=round(fresh_seconds_into_m1,3),
-     strategy=sig.strategy,side=sig.side.value,
-    )
-    return
-   # Re-check freshness against the current MT5 quote clock immediately
-   # before entry; this uses the same broker-relative basis as the scan above.
-   entry_ticks=self.gw.ticks(symbol,80,minimum=40)
-   if entry_ticks is None or len(entry_ticks)<40:
-    await self._log_reject('SCAN_REJECT',symbol,reason='INSUFFICIENT_ENTRY_TICKS')
-    return
-   entry_latest=(float(entry_ticks['time_msc'][-1])/1000.0
-                 if 'time_msc' in entry_ticks.dtype.names
-                 else float(entry_ticks['time'][-1]))
-   entry_live_epoch=float(getattr(tick,'time_msc',0) or 0)/1000.0 or float(getattr(tick,'time',0) or 0)
-   entry_age=entry_live_epoch-entry_latest
-   if abs(entry_age)>settings.max_tick_age_seconds:
-    await self._log_reject('SCAN_REJECT',symbol,reason='STALE_ENTRY_QUOTE',age_seconds=entry_age)
-    return
-   spread_ok,_,_,_=self.risk.spread_ok(tick,info)
-   if not spread_ok:
-    await self._log_reject('SPREAD_REJECT',symbol,reason='ENTRY_SPREAD')
-    return
-
-   # AI-native mode owns SL/TP/protection/trailing/duration. The engine only
-   # validates the plan against live broker constraints; Telegram risk remains immutable.
-   broker_stop_points=max(
-    float(getattr(info,'trade_stops_level',0) or 0),
-    float(getattr(info,'trade_freeze_level',0) or 0)
-   )
-   price=tick.ask if sig.side==Side.BUY else tick.bid
-   typ=mt5.ORDER_TYPE_BUY if sig.side==Side.BUY else mt5.ORDER_TYPE_SELL
-   if self.ai_native_only:
-    sl=float(ai_decision.get('sl_price',0) or 0)
-    tp=float(ai_decision.get('tp_price',0) or 0)
-    protection_pct=float(ai_decision.get('protection_pct',0) or 0)
-    trailing_gap_pct=float(ai_decision.get('trailing_gap_pct',0) or 0)
-    expected_duration=float(ai_decision.get('expected_duration_minutes',0) or 0)
-
-    # Telegram manual controls. Zero keeps that field under AI control.
-    point=float(info.point)
-    if self.ai_sl_points_override>0:
-     dist=self.ai_sl_points_override*point
-     sl=(float(tick.bid)-dist) if sig.side==Side.BUY else (float(tick.ask)+dist)
-    if self.ai_tp_points_override>0:
-     dist=self.ai_tp_points_override*point
-     tp=(price+dist) if sig.side==Side.BUY else (price-dist)
-    elif self.ai_rr_override>0:
-     stop_distance=abs(price-sl)
-     tp=(price+stop_distance*self.ai_rr_override) if sig.side==Side.BUY else (price-stop_distance*self.ai_rr_override)
-    if self.ai_protection_override>0:
-     protection_pct=self.ai_protection_override
-    if self.ai_trailing_override>0:
-     trailing_gap_pct=self.ai_trailing_override
-    if self.ai_duration_override>0:
-     expected_duration=self.ai_duration_override
-
-    min_distance=(broker_stop_points+2.0)*point
-    correct_side=(
-     (sig.side==Side.BUY and sl < float(tick.bid)-min_distance and tp > price+min_distance)
-     or
-     (sig.side==Side.SELL and sl > float(tick.ask)+min_distance and tp < price-min_distance)
-    )
-    if not correct_side:
-     await self._log_reject(
-      'AI_PLAN_REJECT',symbol,reason='INVALID_AI_SL_TP',
-      side=sig.side.value,entry=price,sl=sl,tp=tp,
-      broker_stop_points=broker_stop_points,
-     )
-     return
-    if not (15.0<=protection_pct<=80.0 and 2.0<=trailing_gap_pct<=25.0 and 2.0<=expected_duration<=10.0):
-     await self._log_reject('AI_PLAN_REJECT',symbol,reason='INVALID_AI_MANAGEMENT')
-     return
-    sl=round(sl,int(info.digits));tp=round(tp,int(info.digits))
-
-    # Shadow validator: observe plan quality against the fresh MT5 quote without
-    # reducing opportunity count yet. This is telemetry only, not an entry gate.
-    sl_distance=abs(float(price)-float(sl))
-    tp_distance=abs(float(tp)-float(price))
-    shadow_rr=(tp_distance/sl_distance) if sl_distance>0 else 0.0
-    atr_points=float(native_snapshot.get('atr_m5_points',0) or 0)
-    atr_price=atr_points*point
-    shadow_reasons=[]
-    if shadow_rr < 1.50:
-     shadow_reasons.append('POOR_RR')
-    if atr_price>0:
-     if sl_distance < atr_price*0.5: shadow_reasons.append('SL_TIGHT_VS_ATR')
-     if sl_distance > atr_price*5.0: shadow_reasons.append('SL_WIDE_VS_ATR')
-     if tp_distance < atr_price: shadow_reasons.append('TP_CLOSE_VS_ATR')
-     if tp_distance > atr_price*10.0: shadow_reasons.append('TP_FAR_VS_ATR')
-    await self.db.log(
-     'AI_PLAN_SHADOW',symbol,
-     strategy=sig.strategy,side=sig.side.value,
-     snapshot_entry=float(native_snapshot.get('ask') if sig.side==Side.BUY else native_snapshot.get('bid')),
-     fresh_entry=float(price),sl=float(sl),tp=float(tp),
-     actual_rr=float(shadow_rr),atr_m5_points=atr_points,
-     spread_points=float((tick.ask-tick.bid)/point),
-     would_reject=bool(shadow_reasons),reasons=shadow_reasons,
-     mode='observe_only',
-    )
-   else:
-    sl_points=max(float(sig.sl_points),float(settings.min_sl_points),broker_stop_points+2.0)
-    spread_points=max(0.0,(float(tick.ask)-float(tick.bid))/float(info.point))
-    valid_distance_points=max(sl_points,broker_stop_points+2.0,spread_points+2.0)
-    d=valid_distance_points*info.point
-    if sig.side==Side.BUY:
-     sl=float(tick.bid)-d
-     tp=price+abs(price-sl)*self.rr
-    else:
-     sl=float(tick.ask)+d
-     tp=price-abs(sl-price)*self.rr
-    sl=round(sl,int(info.digits));tp=round(tp,int(info.digits))
-    protection_pct=float(self.protection_pct)
-    trailing_gap_pct=float(self.trailing_gap_pct)
-    expected_duration=float(self.max_trade_minutes)
-
-   # المخاطرة النقدية المستهدفة من Equity
-   risk_cash=float(account.equity)*(self.risk_pct/100.0)
-
-   # خسارة 1 لوت عند الوصول إلى SL - MT5 يحسبها حسب خصائص كل سوق
-   loss_1lot=mt5.order_calc_profit(typ,symbol,1.0,price,sl)
-   if loss_1lot is None or abs(loss_1lot)<=0:
-    await self.notify(f'❌ تعذر حساب المخاطرة — {symbol}')
-    return
-   loss_1lot=abs(float(loss_1lot))
-
-   vmin=float(info.volume_min)
-   vmax=float(info.volume_max)
-   vstep=float(info.volume_step)
-
-   # إذا أقل لوت يتجاوز الحد المالي، لا ندخل
-   min_risk=loss_1lot*vmin
-   if min_risk > risk_cash+0.01:
-    await self.notify(
-     f'⛔ لم تنفذ {symbol}\n'
-     f'أقل لوت يخاطر بـ ${min_risk:.2f}\n'
-     f'حدك المسموح: ${risk_cash:.2f} ({self.risk_pct:g}%)'
-    )
-    return
-
-   # أكبر لوت لا يتجاوز مبلغ المخاطرة
-   import math
-   raw_vol=risk_cash/loss_1lot
-   steps=math.floor((raw_vol-vmin)/vstep+1e-9)
-   vol=vmin+max(0,steps)*vstep
-   vol=min(vol,vmax)
-
-   # The Telegram risk setting is the per-trade target. Never silently reduce
-   # the risk-sized volume because of margin constraints.
-   margin_required=mt5.order_calc_margin(typ,symbol,vol,price)
-   free_margin=float(getattr(account,'margin_free',0) or 0)
-   if margin_required is None or float(margin_required) > free_margin*0.95:
-    await self._log_reject(
-     'MARGIN_REJECT',symbol,reason='PLANNED_RISK_VOLUME_UNAVAILABLE',
-     planned_volume=vol,margin_required=margin_required,free_margin=free_margin,
-     risk_cash=risk_cash,risk_pct=self.risk_pct,
-    )
-    return
-
-   # Preserve the existing 200% projected margin-level safety floor, but reject
-   # the trade rather than changing its requested risk.
-   current_margin=float(getattr(account,'margin',0) or 0)
-   equity=float(getattr(account,'equity',0) or 0)
-   projected_margin=current_margin+float(margin_required)
-   projected_level=(equity/projected_margin*100.0) if projected_margin>0 else float('inf')
-   if projected_level < 200.0:
-    await self._log_reject(
-     'MARGIN_REJECT',symbol,reason='PLANNED_VOLUME_BELOW_200_PERCENT_MARGIN_LEVEL',
-     planned_volume=vol,margin_required=margin_required,free_margin=free_margin,
-     projected_margin_level_pct=projected_level,risk_cash=risk_cash,risk_pct=self.risk_pct,
-    )
-    return
-   # تثبيت الحجم على خطوة الوسيط وإعادة التحقق النهائي
-   steps=math.floor((vol-vmin)/vstep+1e-9)
-   vol=vmin+max(0,steps)*vstep
-   vol=max(vmin,min(vmax,vol))
-
-   actual_risk=loss_1lot*vol
-
-   # حاجز أمان: لا يسمح بتجاوز المخاطرة المحددة
-   while actual_risk > risk_cash+0.01 and vol-vstep >= vmin-1e-9:
-    vol=round(vol-vstep,8)
-    actual_risk=loss_1lot*vol
-
-   if actual_risk > risk_cash+0.01:
-    await self.notify(
-     f'⛔ لم تنفذ {symbol}\n'
-     f'المخاطرة المحسوبة ${actual_risk:.2f} تتجاوز حدك ${risk_cash:.2f}'
-    )
-    return
-
-   actual_risk_pct=(actual_risk/float(account.equity)*100.0) if account.equity else 0.0
-
-   existing=self.gw.positions(symbol)
-   if existing is None:
-    await self._log_reject('ORDER_REJECT',symbol,reason='POSITIONS_UNAVAILABLE')
-    return
-   before={p.ticket for p in existing}
-   filling=self.gw.filling_for(info)
-   if filling is None:
-    await self._log_reject('ORDER_REJECT',symbol,reason='NO_SUPPORTED_FILLING_MODE')
-    return
-   req={'action':mt5.TRADE_ACTION_DEAL,'symbol':symbol,'volume':vol,'type':typ,
-        'price':price,'sl':sl,'tp':tp,'deviation':settings.max_slippage_points,
-        'magic':4009,'comment':('TGSCALP_MANUAL' if manual_mode else f'TGSCALP_{sig.strategy}'),
-        'type_time':mt5.ORDER_TIME_GTC,'type_filling':filling}
-
-   chk=self.gw.order_check(req)
-   if not chk:
-    notice_key=('order_check_none',symbol,signal_key)
-    if notice_key not in self.execution_notice_once:
-     self.execution_notice_once.add(notice_key)
-     await self.notify(f'❌ لم تنفذ {symbol}\norder_check لم يرجع نتيجة\nMT5: {mt5.last_error()}')
-    await self._log_reject(
-     'ORDER_CHECK_REJECT',symbol,reason='NO_RESULT',volume=vol,
-     last_error=repr(mt5.last_error()),
-     order_type=int(typ),price=float(price),sl=float(sl),tp=float(tp),
-     filling=int(filling),deviation=int(settings.max_slippage_points),
-    )
-    return
-
-   # Never rescue insufficient margin by shrinking volume: configured risk is the target.
-   no_money=getattr(mt5,'TRADE_RETCODE_NO_MONEY',10019)
-   if chk.retcode==no_money:
-    await self._log_reject(
-     'MARGIN_REJECT',symbol,reason='ORDER_CHECK_NO_MONEY',
-     planned_volume=vol,risk_cash=risk_cash,risk_pct=self.risk_pct,
-     retcode=chk.retcode,comment=getattr(chk,'comment','No money'),
-    )
-    return
-
-   if chk.retcode!=0:
-    await self._log_reject(
-     'ORDER_CHECK_REJECT',symbol,reason='BROKER_REJECT',
-     retcode=chk.retcode,comment=getattr(chk,'comment','غير معروف'),
-     volume=vol,risk_pct=actual_risk_pct,
-    )
-    notice_key=('order_check_reject',symbol,signal_key,chk.retcode)
-    if notice_key not in self.execution_notice_once:
-     self.execution_notice_once.add(notice_key)
-     await self.notify(
-      f'❌ رفض فحص الصفقة — {symbol}\n'
-      f'الكود: {chk.retcode}\n'
-      f'السبب: {getattr(chk,"comment","غير معروف")}\n'
-      f'اللوت: {vol:g} | المخاطرة: {actual_risk_pct:.2f}%'
-     )
-    return
-
-   res=self.gw.send(req)
-   self.last_entry_by_symbol[symbol]=time.time()
-   if not res or res.retcode not in (mt5.TRADE_RETCODE_DONE,mt5.TRADE_RETCODE_DONE_PARTIAL):
-    await self.notify(
-     f'❌ فشل تنفيذ الصفقة — {symbol}\n'
-     f'الكود: {getattr(res,"retcode","لا يوجد")}\n'
-     f'السبب: {getattr(res,"comment",mt5.last_error())}\n'
-     f'اللوت: {vol:g} | المخاطرة: {actual_risk_pct:.2f}%'
-    )
-    return
-
-   # MT5 قد يتأخر في إظهار المركز بعد نجاح التنفيذ. Verify directly for
-   # up to 15 seconds before declaring the successfully-sent trade unmanaged.
-   pos=None
-   for _ in range(150):
-    await asyncio.sleep(.1)
-    pos=self.gw.find_new_bot_position(symbol,before)
-    if pos:
-     break
-
-   if not pos:
-    self.running=False
-    await self.db.log(
-     'POSITION_LINK_FAILED',symbol,result=str(res),
-     order=getattr(res,'order',None),deal=getattr(res,'deal',None),
-     retcode=getattr(res,'retcode',None),last_error=repr(mt5.last_error()),
-     before_tickets=sorted(before),
-    )
-    try:
-     await self.notify(
-      f'🚨 نُفذت صفقة {symbol} لكن تعذر ربطها آلياً. '
-      f'أُوقف المحرك بالكامل؛ افحص المركز في MT5 قبل إعادة التشغيل.'
-     )
-    except Exception:
-     pass
-    return
-
-   # نعتمد القيم الفعلية التي سجلها MT5 بعد التنفيذ
-   fill=float(pos.price_open or res.price or price)
-   actual_sl=float(pos.sl or sl)
-   actual_tp=float(pos.tp or tp)
-   initial_r=abs(fill-actual_sl)
-
-   if initial_r<=0:
-    await self._handle_invalid_initial_r(symbol,pos,fill,actual_sl)
-    return
-
-   t=TradeState(
-    pos.ticket,symbol,sig.side,fill,actual_sl,actual_tp,initial_r,time.time(),
-    strategy=sig.strategy,regime=reg.value,confidence=sig.confidence,
-    reason=sig.reason,volume=float(pos.volume or vol),signal_bar=signal_bar,
-    protection_pct=protection_pct,trailing_gap_pct=trailing_gap_pct,
-    expected_duration_minutes=expected_duration
-   )
-
-   sl=actual_sl
-   tp=actual_tp
-   vol=float(pos.volume or vol)
-
-   # Recalculate risk and R:R from the broker-confirmed fill/SL/TP/volume.
-   # Pre-send values can drift slightly because the actual fill may differ.
-   post_fill_loss=mt5.order_calc_profit(typ,symbol,vol,fill,actual_sl)
-   post_fill_reward=mt5.order_calc_profit(typ,symbol,vol,fill,actual_tp)
-   if post_fill_loss is not None and abs(float(post_fill_loss))>0:
-    actual_risk=abs(float(post_fill_loss))
-   else:
-    # Defensive fallback: preserve the already-validated pre-send estimate.
-    actual_risk=float(actual_risk)
-   actual_risk_pct=(actual_risk/float(account.equity)*100.0) if account.equity else 0.0
-   actual_rr=(
-    abs(float(post_fill_reward))/actual_risk
-    if post_fill_reward is not None and actual_risk>0
-    else self.rr
-   )
-   if not math.isfinite(actual_rr) or actual_rr<=0:
-    actual_rr=self.rr
-
-   risk_drift_cash=actual_risk-risk_cash
-   risk_drift_pct=((actual_risk/risk_cash)-1.0)*100.0 if risk_cash>0 else 0.0
-   if abs(risk_drift_cash)>0.01:
-    await self.db.log(
-     'POST_FILL_RISK_DRIFT',symbol,
-     ticket=pos.ticket,planned_risk_cash=risk_cash,actual_risk_cash=actual_risk,
-     drift_cash=risk_drift_cash,drift_pct=risk_drift_pct,
-     planned_entry=price,actual_entry=fill,actual_sl=actual_sl,
-     volume=vol,actual_rr=actual_rr,
-    )
-
-   # Broker-confirmed risk must remain within +/-5% of the Telegram target.
-   if risk_drift_pct>5.0:
-    await self.db.log(
-     'POST_FILL_RISK_DRIFT_REJECT',symbol,
-     ticket=pos.ticket,planned_risk_cash=risk_cash,actual_risk_cash=actual_risk,
-     drift_cash=risk_drift_cash,drift_pct=risk_drift_pct,
-     planned_entry=price,actual_entry=fill,actual_sl=actual_sl,
-     volume=vol,risk_pct=self.risk_pct,
-    )
-    await self._close_untrackable_position(symbol,pos,reason='POST_FILL_RISK_DRIFT_REJECT',entry=fill,sl=actual_sl)
-    return
-
-   # Post-fill shadow check uses the real fill. It never closes/rejects a trade
-   # in observe-only mode; it measures execution drift and realized geometry.
-   post_tp_distance=abs(float(tp)-float(fill))
-   post_rr=(post_tp_distance/initial_r) if initial_r>0 else 0.0
-   await self.db.log(
-    'AI_POST_FILL_SHADOW',symbol,ticket=pos.ticket,
-    strategy=sig.strategy,side=sig.side.value,
-    fill=float(fill),sl=float(actual_sl),tp=float(tp),
-    actual_rr=float(post_rr),
-    would_reject=bool(post_rr<1.50),
-    reasons=(['POOR_RR'] if post_rr<1.50 else []),
-    mode='observe_only',
-   )
-
-   self.trades[pos.ticket]=t
-   self.trade_alert_meta[pos.ticket]={
-    'risk_cash':actual_risk,
-    'risk_pct':actual_risk_pct,
-    'rr_actual':actual_rr,
-    'planned_risk_cash':risk_cash,
-    'risk_drift_cash':risk_drift_cash,
-    'risk_drift_pct':risk_drift_pct,
-   }
-   self.execution_notice_once.discard(('margin_min',symbol))
-   # A successful trade resets this symbol to the normal spread baseline.
-   self.risk.reset_spread_relaxation(symbol)
-
-   await self.db.log(
-    'OPEN',symbol,ticket=pos.ticket,entry=fill,sl=sl,tp=tp,volume=vol,
-    account_login=int(getattr(account,'login',0) or 0),
-    side=sig.side.value,strategy=sig.strategy,regime=reg.value,
-    confidence=float(sig.confidence),reason=sig.reason,
-    risk_cash=actual_risk,risk_pct=actual_risk_pct,rr_actual=actual_rr,
-    ai_protection_pct=protection_pct,ai_trailing_gap_pct=trailing_gap_pct,
-    ai_expected_duration_minutes=expected_duration,
-    management_overrides={'rr':self.ai_rr_override,'sl_points':self.ai_sl_points_override,'tp_points':self.ai_tp_points_override,'protection_pct':self.ai_protection_override,'trailing_gap_pct':self.ai_trailing_override,'duration_minutes':self.ai_duration_override},
-   )
-   asyncio.create_task(self._send_trade_chart(t,actual_risk,actual_risk_pct))
-
- async def _handle_invalid_initial_r(self,symbol,pos,fill,actual_sl):
-  await self.db.log(
-   'INVALID_INITIAL_R',symbol,
-   ticket=pos.ticket,entry=fill,sl=actual_sl
-  )
-  return await self._close_untrackable_position(
-   symbol,pos,reason='INVALID_INITIAL_R',entry=fill,sl=actual_sl
-  )
-
- async def _close_untrackable_position(self,symbol,pos,reason,entry=None,sl=None):
-  close_res=self.gw.close(pos)
-  close_ok=(
-   close_res is not None
-   and getattr(close_res,'retcode',None) in (
-    mt5.TRADE_RETCODE_DONE,mt5.TRADE_RETCODE_DONE_PARTIAL
-   )
-  )
-  # A successful market-close response can arrive before MT5 removes the
-  # position from positions_get(). Give the terminal time to converge before
-  # declaring an unmanaged remainder and stopping the engine.
-  remaining=self.gw.position_by_ticket(pos.ticket)
-  if close_ok:
-   for _ in range(50):
-    if remaining is None:
-     break
-    await asyncio.sleep(.1)
-    remaining=self.gw.position_by_ticket(pos.ticket)
-  exit_event=f'{reason}_EXIT'
-  await self.db.log(
-   exit_event,symbol,ticket=pos.ticket,
-   retcode=getattr(close_res,'retcode',None),
-   comment=getattr(close_res,'comment','') if close_res is not None else '',
-   remaining_volume=(float(getattr(remaining,'volume',0) or 0) if remaining is not None else 0.0),
-   entry=entry,sl=sl,
-  )
-  if not close_ok or remaining is not None:
-   self.running=False
-   await self.notify(
-    f'🚨 {symbol}: تعذر تأكيد الإغلاق الوقائي الكامل للمركز {pos.ticket} '
-    f'({reason})؛ تم إيقاف المحرك لمنع مركز غير متتبع.'
-   )
-   return False
-  if reason=='INVALID_INITIAL_R':
-   await self.notify(
-    f'⚠️ {symbol}: أُغلقت الصفقة {pos.ticket} حمايةً لأن '
-    'المسافة الابتدائية إلى وقف الخسارة غير صالحة.'
-   )
-  else:
-   await self.notify(
-    f'⚠️ {symbol}: أُغلقت الصفقة {pos.ticket} حمايةً ({reason}).'
-   )
-  return True
-
- async def _trade_caption(self,t,current_price=None,pnl=None,closed=False):
-  info=self.gw.info(t.symbol)
-  digits=int(getattr(info,'digits',5) or 5)
-  side='شراء 🟢' if t.side==Side.BUY else 'بيع 🔴'
-  meta=self.trade_alert_meta.get(t.ticket,{})
-  risk_cash=float(meta.get('risk_cash',0) or 0)
-  risk_pct=float(meta.get('risk_pct',self.risk_pct) or self.risk_pct)
-  rr_actual=float(meta.get('rr_actual',self.rr) or self.rr)
-
-  if closed:
-   if pnl is None:
-    live_line='🏁 النتيجة: مغلقة'
-   elif pnl>=0:
-    live_line=f'🏁 النتيجة: +${pnl:.2f} 🟢'
-   else:
-    live_line=f'🏁 النتيجة: ${pnl:.2f} 🔴'
-  else:
-   pos=self.gw.position_by_ticket(t.ticket)
-   live_pnl=float(getattr(pos,'profit',0) or 0) if pos else 0.0
-   pnl_icon='🟢' if live_pnl>=0 else '🔴'
-   pnl_sign='+' if live_pnl>0 else ''
-   price_text=f'{current_price:.{digits}f}' if current_price is not None else 'جاري التحديث'
-   live_line=f'💹 السعر الآن: {price_text} ({pnl_sign}${live_pnl:.2f} {pnl_icon})'
-
-  return (
-   f'📊 {t.symbol} — {side}\n'
-   f'🧠 الاستراتيجية: {t.strategy}\n'
-   f'🎯 الثقة: {t.confidence*100:.0f}%\n'
-   f'🎫 الصفقة: {t.ticket}\n'
-   f'📦 اللوت: {t.volume:g}\n'
-   f'⚠️ المخاطرة: {risk_pct:.2f}% (${risk_cash:.2f})\n'
-   f'➡️ الدخول: {t.entry:.{digits}f}\n'
-   f'🛑 الوقف: {t.sl:.{digits}f}\n'
-   f'💰 الهدف: {t.tp:.{digits}f}\n'
-   f'{live_line}\n'
-   f'🛡 الحماية: {t.protection_pct:g}% | ⚖️ R:R 1:{rr_actual:.2f}\n'
-   f'⏱ مدة AI: {t.expected_duration_minutes:g} دقيقة'
-  )
-
- async def _send_trade_chart(self,t,actual_risk,actual_risk_pct):
-  try:
-   import os,tempfile
-   import matplotlib
-   matplotlib.use('Agg')
-   import matplotlib.pyplot as plt
-   import matplotlib.dates as mdates
-   from datetime import datetime
-
-   rates=self.gw.rates_m5(t.symbol,18)
-   if rates is None or len(rates)<10:
-    await self.db.log('TRADE_CHART_FAILED',t.symbol,ticket=t.ticket,error='not enough M5 candles')
-    return
-
-   xs=[datetime.fromtimestamp(int(r['time'])) for r in rates]
-   opens=[float(r['open']) for r in rates]
-   highs=[float(r['high']) for r in rates]
-   lows=[float(r['low']) for r in rates]
-   closes=[float(r['close']) for r in rates]
-   xnum=mdates.date2num(xs)
-
-   fig,ax=plt.subplots(figsize=(11,6.2),dpi=130)
-   width=(5/(24*60))*0.68
-   for x,o,h,l,cl in zip(xnum,opens,highs,lows,closes):
-    up=cl>=o
-    color='#16a34a' if up else '#dc2626'
-    ax.vlines(x,l,h,color=color,linewidth=1)
-    body_low=min(o,cl)
-    body_h=max(abs(cl-o),max(highs)*1e-7)
-    ax.add_patch(plt.Rectangle((x-width/2,body_low),width,body_h,facecolor=color,edgecolor=color,linewidth=.8))
-
-   ax.axhline(t.entry,color='#2563eb',linewidth=1.5,label=f'ENTRY {t.entry:g}')
-   ax.axhline(t.sl,color='#dc2626',linewidth=1.3,linestyle='--',label=f'SL {t.sl:g}')
-   ax.axhline(t.tp,color='#16a34a',linewidth=1.3,linestyle='--',label=f'TP {t.tp:g}')
-   protection=t.entry+(t.tp-t.entry)*(t.protection_pct/100.0)
-   ax.axhline(protection,color='#f59e0b',linewidth=1.2,linestyle=':',label=f'PROTECTION {t.protection_pct:g}%')
-
-   side='BUY' if t.side==Side.BUY else 'SELL'
-   # MT5 rates and position time are Unix timestamps. Use the broker position
-   # timestamp directly so the marker is not affected by the Linux timezone.
-   pos=self.gw.position_by_ticket(t.ticket)
-   mt5_open_ts=int(getattr(pos,'time',0) or 0) if pos else 0
-   if not mt5_open_ts:
-    mt5_open_ts=int(t.opened_at)
-   rate_ts=[int(r['time']) for r in rates]
-   entry_idx=min(range(len(rate_ts)),key=lambda i:abs(rate_ts[i]-mt5_open_ts))
-   entry_x=xnum[entry_idx]
-   marker='^' if side=='BUY' else 'v'
-   ax.scatter([entry_x],[t.entry],marker=marker,s=150,color='#111827',zorder=6)
-   ax.annotate(f'{side} ENTRY',xy=(entry_x,t.entry),xytext=(0,18 if side=='BUY' else -28),
-    textcoords='offset points',ha='center',fontsize=9,fontweight='bold',
-    arrowprops=dict(arrowstyle='->',linewidth=1))
-
-   ax.axvline(entry_x,color='#6b7280',linewidth=1,linestyle=':',alpha=.7)
-   ax.set_title(f'{t.symbol}  {side}  |  {t.strategy}  |  Confidence {t.confidence*100:.0f}%')
-   ax.set_ylabel('Price')
-   ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
-   ax.grid(alpha=.18)
-   ax.legend(loc='best',fontsize=8)
-   fig.autofmt_xdate()
-   fig.tight_layout()
-
-   fd,path=tempfile.mkstemp(prefix=f'mtbot_{t.symbol}_',suffix='.png')
-   os.close(fd)
-   fig.savefig(path,bbox_inches='tight')
-   plt.close(fig)
-
-   tick=self.gw.tick(t.symbol)
-   current=float(tick.bid if t.side==Side.BUY else tick.ask) if tick else t.entry
-   caption=await self._trade_caption(t,current_price=current)
-   await self.notify(caption,photo_path=path,caption=caption,trade_ticket=t.ticket,pin=True,event_type='trade_opened',symbol=t.symbol,side=t.side.value)
-   await self.db.log('TRADE_CHART_SENT',t.symbol,ticket=t.ticket)
-  except Exception as ex:
-   await self.db.log('TRADE_CHART_FAILED',t.symbol,ticket=t.ticket,error=str(ex))
-
- async def live_dashboard(self):
-  lines=[]
-
-  for t in self.trades.values():
-   pos=self.gw.position_by_ticket(t.ticket)
-   tick=self.gw.tick(t.symbol)
-   if not pos or not tick:
-    continue
-
-   price=float(tick.bid if t.side==Side.BUY else tick.ask)
-   pnl=float(getattr(pos,'profit',0) or 0)
-
-   tp_distance=abs(float(t.tp)-float(t.entry))
-   sl_distance=abs(float(t.entry)-float(t.sl))
-
-   favorable=(price-float(t.entry)) if t.side==Side.BUY else (float(t.entry)-price)
-   adverse=(float(t.entry)-price) if t.side==Side.BUY else (price-float(t.entry))
-
-   tp_pct=max(0.0,min(100.0,(favorable/tp_distance)*100.0)) if tp_distance else 0.0
-   sl_pct=max(0.0,min(100.0,(adverse/sl_distance)*100.0)) if sl_distance else 0.0
-
-   money=f'+{pnl:.2f}$ 🟢' if pnl>=0 else f'{pnl:.2f}$ 🔻'
-
-   lines.append(f'➤ {t.symbol} | {money}')
-   lines.append(f'           𖤹 ~ TP={tp_pct:.0f}% | SL={sl_pct:.0f}%')
-
-  if not lines:
-   lines.append('لا توجد صفقات مفتوحة')
-
-  lines.append('↺ الصفقات المباشرة')
-  await self.notify('\n'.join(lines))
-
- async def live_trade_panel(self,t,price,r,age,pos):
-  a=self.gw.account()
-  balance=float(getattr(a,'balance',0) or 0)
-  currency=getattr(a,'currency','') or ''
-  pnl=float(getattr(pos,'profit',0) or 0)
-
-  info=self.gw.info(t.symbol)
-  digits=int(getattr(info,'digits',5) or 5)
-
-  side='شراء' if t.side==Side.BUY else 'بيع'
-  sign='+' if pnl>0 else ''
-  rsign='+' if r>0 else ''
-
-  target_distance=abs(t.tp-t.entry)
-  favorable=(price-t.entry) if t.side==Side.BUY else (t.entry-price)
-  target_progress=max(0.0,(favorable/target_distance)*100) if target_distance>0 else 0.0
-
-  if t.protection_45_active:
-   protection='مفعلة 🔐 | تتبع الربح مستمر'
-  else:
-   protection=f'انتظار {t.protection_pct:g}% | التقدم: {target_progress:.0f}%'
-
-  return (
-   f'🤖 {t.symbol} | {side}\n'
-   f'💰 الرصيد الحالي: {balance:.2f} {currency}\n'
-   f'💵 الصفقة: {sign}{pnl:.2f} {currency} | {rsign}{r:.2f}R\n'
-   f'💹 السعر: {price:.{digits}f}\n'
-   f'🛑 الوقف: {t.sl:.{digits}f}\n'
-   f'🎯 الهدف: {t.tp:.{digits}f}\n'
-   f'🛡 {protection}'
-  )
-
- async def manage(self,t,tick,info):
-  account=self.gw.account()
-  account_login=int(getattr(account,'login',0) or 0) if account else 0
-  price=tick.bid if t.side==Side.BUY else tick.ask
-  # Time-based exits are intentionally disabled. AI expected duration is advisory only;
-  # open trades remain managed by broker SL/TP and the protection/trailing logic below.
-
-  # Capture favorable intracycle spikes from MT5 tick history instead of relying
-  # only on the single quote visible when this management cycle runs.
-  best_observed_price=float(price)
-  try:
-   recent_ticks=self.gw.ticks(t.symbol,n=10000,minimum=10000)
-  except Exception as ex:
-   recent_ticks=None
-   await self.db.log('MANAGEMENT_TICKS_UNAVAILABLE',t.symbol,ticket=t.ticket,error=repr(ex))
-  if recent_ticks is not None and len(recent_ticks):
-   opened_msc=int(float(t.opened_at)*1000.0)
-   cursor_msc=int(getattr(t,'last_management_tick_msc',opened_msc) or opened_msc)
-   if 'time_msc' in recent_ticks.dtype.names:
-    window=recent_ticks[recent_ticks['time_msc']>=cursor_msc]
-   else:
-    window=recent_ticks[recent_ticks['time']>=int(cursor_msc/1000)]
-   if len(window):
-    field='bid' if t.side==Side.BUY else 'ask'
-    values=window[field]
-    best_observed_price=float(max(values) if t.side==Side.BUY else min(values))
-    if 'time_msc' in window.dtype.names:
-     t.last_management_tick_msc=int(window['time_msc'][-1])
-    else:
-     t.last_management_tick_msc=int(window['time'][-1])*1000
-
-  favorable=(best_observed_price-t.entry) if t.side==Side.BUY else (t.entry-best_observed_price)
-  r=((price-t.entry) if t.side==Side.BUY else (t.entry-price))/t.initial_r
-  age=time.time()-t.opened_at
-  pos=self.gw.position_by_ticket(t.ticket)
-
-  # Position disappeared: determine the real MT5 close reason.
-  if not pos:
-   deals=self.gw.history_deals_by_position(t.ticket)
-   exit_deals=[
-    d for d in deals
-    if getattr(d,'entry',None) in (getattr(mt5,'DEAL_ENTRY_OUT',1),getattr(mt5,'DEAL_ENTRY_OUT_BY',3))
-   ]
-   exit_deal=exit_deals[-1] if exit_deals else None
-
-   if exit_deal:
-    reason=getattr(exit_deal,'reason',None)
-    # MT5 is the source of truth. Sum every closing fill/deal.
-    pnl=sum(
-     float(getattr(d,'profit',0) or 0)
-     +float(getattr(d,'swap',0) or 0)
-     +float(getattr(d,'commission',0) or 0)
-     +float(getattr(d,'fee',0) or 0)
-     for d in exit_deals
-    )
-    exit_price=float(getattr(exit_deal,'price',0) or 0)
-
-    if reason==mt5.DEAL_REASON_TP:
-     event='TP'
-     result_reason='TP 🎯'
-    elif reason==mt5.DEAL_REASON_SL:
-     # MT5 labels every stop-triggered close as SL. Classify it by the
-     # bot state so protected/trailing/breakeven exits stay out of SL stats.
-     be_tolerance=max(float(getattr(info,'point',0) or 0)*5.0,t.initial_r*0.05)
-     near_entry=abs(exit_price-t.entry)<=be_tolerance
-     if t.protection_45_active and t.trailing_moved:
-      event='TRAILING_EXIT'
-      result_reason='خروج بالتتبع 🛡️'
-     elif t.protection_45_active and near_entry:
-      event='BREAKEVEN_EXIT'
-      result_reason='خروج قرب التعادل ⚖️'
-     elif t.protection_45_active:
-      event='PROTECTED_EXIT'
-      result_reason='خروج بالحماية 🛡️'
-     else:
-      event='SL'
-      result_reason='SL 🛑'
-    else:
-     event='POSITION_CLOSED'
-     result_reason='حماية ربح 🛡️' if pnl>0 and t.protection_45_active else 'إغلاق 🏁'
-
-    if pnl < 0:
-     self.consecutive_losses+=1
-    elif pnl > 0:
-     self.consecutive_losses=0
-    await self.save_setting("consecutive_losses",self.consecutive_losses)
-
-    await self.db.log(
-     event,t.symbol,ticket=t.ticket,strategy=t.strategy,
-     account_login=account_login,
-     exit_price=exit_price,pnl=pnl,reason=reason
-    )
-    await self._refresh_strategy_performance(force=True)
-    caption=await self._trade_caption(t,pnl=pnl,closed=True)
-    await self.notify(caption,trade_ticket=t.ticket,trade_update=True,trade_result=pnl,trade_result_reason=result_reason,event_type='trade_closed',symbol=t.symbol,side=t.side.value)
-   else:
-    await self.db.log('POSITION_CLOSED',t.symbol,reason='history_not_found')
-    caption=await self._trade_caption(t,pnl=None,closed=True)
-    await self.notify(caption,trade_ticket=t.ticket,trade_update=True,event_type='trade_closed',symbol=t.symbol,side=t.side.value)
-
-   self.last_close_by_symbol[t.symbol]=time.time()
-   self.blocked_signal_by_symbol[t.symbol]=_signal_key(
-    t.strategy,t.side.value,t.signal_bar
-   )
-   self.trades.pop(t.ticket,None)
-   self.trade_alert_meta.pop(t.ticket,None)
-   return
-
-  # تحديث نفس رسالة صورة الصفقة بالسعر والوقف الحاليين.
-  caption=await self._trade_caption(t,current_price=float(price))
-  await self.notify(caption,trade_ticket=t.ticket,trade_update=True)
-
-  # حماية الربح: نسبة التفعيل تبقى من إعداد Telegram.
-  target_distance=abs(t.tp-t.entry)
-  target_progress=(favorable/target_distance) if target_distance>0 else 0.0
-  now=time.time()
-
-  # عند التفعيل نعطي نقطة الدخول مساحة ضجيج ديناميكية مبنية على
-  # وسيط السبريد الحديث (أو السبريد الحالي عند عدم توفر عينة).
-  trigger=t.protection_pct/100.0
-  if target_progress>=trigger and not t.protection_45_active:
-   spread_points=max(0.0,(float(tick.ask)-float(tick.bid))/float(info.point))
-   spread_history=list(self.risk.spreads.get(str(t.symbol),()) or ())
-   if spread_history:
-    ordered=sorted(float(x) for x in spread_history)
-    mid=len(ordered)//2
-    spread_reference=(
-     ordered[mid] if len(ordered)%2
-     else (ordered[mid-1]+ordered[mid])/2.0
-    )
-   else:
-    spread_reference=spread_points
-   buffer_points=max(3.0,spread_reference*1.5)
-   protected_sl=(
-    t.entry-buffer_points*info.point
-    if t.side==Side.BUY
-    else t.entry+buffer_points*info.point
-   )
-   protected_sl=round(protected_sl,int(info.digits))
-   min_dist=max(int(getattr(info,'trade_stops_level',0) or 0),int(getattr(info,'trade_freeze_level',0) or 0))*info.point
-   valid=(protected_sl <= tick.bid-min_dist) if t.side==Side.BUY else (protected_sl >= tick.ask+min_dist)
-   res=self.gw.modify(pos.ticket,t.symbol,protected_sl,t.tp) if valid else None
-
-   if res and res.retcode==mt5.TRADE_RETCODE_DONE:
-    t.sl=protected_sl
-    t.protection_45_active=True
-    t.trailing=True
-    t.best_favorable_price=best_observed_price
-    t.last_progress_at=now
-
-    await self.db.log(
-     'PROTECTION_ACTIVATED',t.symbol,
-     ticket=t.ticket,sl=protected_sl,price=price,
-     protection_pct=t.protection_pct,
-     buffer_points=buffer_points,
-     spread_reference_points=spread_reference,
-     current_spread_points=spread_points,
-     target_progress=target_progress,target_progress_pct=target_progress*100.0
-    )
-    await self.notify(
-     f'🛡️ تم تفعيل حماية الربح • {t.symbol}',
-     trade_ticket=t.ticket,event_type='profit_protection',
-     symbol=t.symbol,side=t.side.value,t4bot_only=True
-    )
-
-   else:
-    await self.db.log(
-     'PROTECTION_FAILED',t.symbol,ticket=t.ticket,result=str(res),
-     retcode=getattr(res,'retcode',None),
-     comment=getattr(res,'comment',None),
-     last_error=repr(mt5.last_error()),
-     requested_sl=protected_sl,current_sl=t.sl,tp=t.tp,
-     protection_pct=t.protection_pct,
-     buffer_points=buffer_points,
-     spread_reference_points=spread_reference,
-     current_spread_points=spread_points,
-     bid=float(tick.bid),ask=float(tick.ask),
-     stops_level=int(getattr(info,'trade_stops_level',0) or 0),
-     freeze_level=int(getattr(info,'trade_freeze_level',0) or 0),
-     valid_distance=bool(valid),
-    )
-
-  # بعد التفعيل: أفضل سعر جديد يحرك SL للأمام. لا يوجد إغلاق بسبب خمول زمني.
-  if t.protection_45_active:
-   progress=(
-    (t.side==Side.BUY and best_observed_price>t.best_favorable_price)
-    or
-    (t.side==Side.SELL and best_observed_price<t.best_favorable_price)
-   )
-
-   # On the activation cycle, place the trailing stop from the best observed
-   # tick immediately; afterwards move it only when a new favorable extreme appears.
-   if progress or not t.trailing_moved:
-    if progress:
-     t.best_favorable_price=best_observed_price
-     t.last_progress_at=now
-
-    # فجوة التتبع = 5% من كامل مسافة الدخول إلى TP.
-    gap=target_distance*(t.trailing_gap_pct/100.0)
-    cand=(
-     t.best_favorable_price-gap
-     if t.side==Side.BUY
-     else t.best_favorable_price+gap
-    )
-
-    # لا يرجع SL خلف مستوى الحماية الذي تم تفعيله فعلياً.
-    # هذا يحافظ على BE buffer الديناميكي بدلاً من القفز إلى مستوى trigger.
-    protection_level=t.sl
-
-    if t.side==Side.BUY:
-     cand=max(cand,protection_level)
-    else:
-     cand=min(cand,protection_level)
-
-    min_dist=max(int(getattr(info,'trade_stops_level',0) or 0),int(getattr(info,'trade_freeze_level',0) or 0))*info.point
-    valid=(cand <= tick.bid-min_dist) if t.side==Side.BUY else (cand >= tick.ask+min_dist)
-    better=cand>t.sl if t.side==Side.BUY else cand<t.sl
-
-    if better and valid:
-     res=self.gw.modify(pos.ticket,t.symbol,cand,t.tp)
-
-     if res and res.retcode==mt5.TRADE_RETCODE_DONE:
-      oldsl=t.sl
-      t.sl=cand
-      t.trailing_moved=True
-      trailing_progress=(
-       ((t.best_favorable_price-t.entry)/target_distance)
-       if t.side==Side.BUY
-       else ((t.entry-t.best_favorable_price)/target_distance)
-      ) if target_distance>0 else 0.0
-      await self.db.log(
-       'TRAILING_PROTECTION',t.symbol,
-       ticket=t.ticket,old_sl=oldsl,new_sl=cand,
-       best_price=t.best_favorable_price,
-       target_progress=trailing_progress,
-       target_progress_pct=trailing_progress*100.0
-      )
-
+    INT_SETTINGS = {'max_positions', 'max_consecutive_losses', 'consecutive_losses',
+                    'session_profit_hit', 'session_active', 'real_trading_enabled',
+                    'max_daily_trades', 'max_correlated_positions'}
+
+    async def load_settings(self, login=None, migrate_legacy=False):
+        if login is None and self.gw is not None:
+            account = self.gw.account()
+            raw_login = getattr(account, 'login', None) if account else None
+            login = int(raw_login) if raw_login is not None else None
+
+        if login is None:
+            # Isolated/unit use without an MT5 account: legacy global keys.
+            for key in self.SETTING_DEFAULTS:
+                raw = await self.db.get(key)
+                if raw is None:
+                    continue
+                setattr(self, key, self._cast_setting(key, raw))
+            await self._load_symbols(None, migrate_legacy=False)
+            return
+
+        self._settings_login = int(login)
+        for key, default in self.SETTING_DEFAULTS.items():
+            scoped = await self._account_key(key, login)
+            raw = await self.db.get(scoped)
+            if raw is None and migrate_legacy:
+                raw = await self.db.get(key)
+                if raw is not None:
+                    await self.db.set(scoped, raw)
+            if raw is None:
+                raw = default
+                await self.db.set(scoped, raw)
+            setattr(self, key, self._cast_setting(key, raw))
+        await self._load_symbols(login, migrate_legacy)
+        self.session_profit_hit = bool(self.session_profit_hit)
+        self.session_active = bool(self.session_active)
+        self.real_trading_enabled = bool(self.real_trading_enabled)
+        await self.registry.refresh(login=login, force=True)
+
+    def _cast_setting(self, key, raw):
+        default = self.SETTING_DEFAULTS[key]
+        try:
+            if key in self.INT_SETTINGS:
+                value = int(float(raw))
+            else:
+                value = float(raw)
+        except (TypeError, ValueError):
+            return default
+        if key == 'consecutive_losses':
+            value = max(0, value)
+        if not (isinstance(value, int) or math.isfinite(value)):
+            return default
+        return value
+
+    async def _load_symbols(self, login, migrate_legacy):
+        symbols_key = await self._account_key('symbols', login)
+        raw_symbols = await self.db.get(symbols_key)
+        if raw_symbols is None and migrate_legacy:
+            raw_symbols = await self.db.get('symbols')
+            if raw_symbols is not None:
+                await self.db.set(symbols_key, raw_symbols)
+        if raw_symbols:
+            try:
+                saved = json.loads(raw_symbols)
+                if isinstance(saved, list) and saved:
+                    self.symbols = [str(item) for item in saved]
+                    self.symbol = self.symbols[0]
+                    return
+            except (TypeError, ValueError):
+                pass
+        self.symbols = ['EURUSD']
+        self.symbol = 'EURUSD'
+        await self.db.set(symbols_key, json.dumps(self.symbols))
+
+    # ==================================================================
+    # status / lifecycle
+    # ==================================================================
+    async def status(self):
+        account = self.gw.account()
+        if not account:
+            return 'MT5 غير متصل'
+        symbols = ', '.join(self.symbols) if self.symbols else 'لا يوجد'
+        state = '🟢 يعمل' if self.running else '⚪ متوقف'
+        is_demo = getattr(account, 'trade_mode', None) == mt5.ACCOUNT_TRADE_MODE_DEMO
+        account_mode = 'تجريبي' if is_demo else 'حقيقي'
+        real_lock = '' if is_demo else (' | 🔓 Real مفعّل' if self.real_trading_enabled else ' | 🔒 Real مقفل')
+        regimes = self.last_regime_by_symbol or {}
+        regime_text = ' | '.join(f'{s}:{r}' for s, r in list(regimes.items())[:4]) or '—'
+        return (
+            f'{state} | {account_mode}{real_lock}\n'
+            f'🔄 دورات المحرك: {self.scan_count} | آخر مدة: {self.last_cycle_seconds:.2f}ث\n'
+            f'💱 الأسواق: {symbols}\n'
+            f'📂 المراكز: {len(self.trades)} / {self.max_positions}\n'
+            f'⚠️ المخاطرة: {self.risk_pct:g}% لكل صفقة\n'
+            f'🧠 الاستراتيجيات المفعّلة: {len(self.registry.strategies)}\n'
+            f'📊 الأنظمة: {regime_text}\n'
+            f'❌ الخسائر المتتالية: {self.consecutive_losses} / {self.max_consecutive_losses}\n'
+            f'📉 حد Equity اليومي: {self.daily_loss_limit_pct:g}%'
+            f'{" (معطل)" if self.daily_loss_limit_pct <= 0 else ""}\n'
+            f'💰 Equity: {account.equity:.2f} {account.currency}'
+        )
+
+    async def start(self):
+        if not (math.isfinite(self.risk_pct) and 0 < self.risk_pct <= 50
+                and math.isfinite(self.rr) and 0.5 <= self.rr <= 10
+                and 1 <= self.max_positions <= 10
+                and math.isfinite(self.daily_loss_limit_pct)
+                and 0 <= self.daily_loss_limit_pct <= 100):
+            await self.notify('⚠️ إعدادات المخاطرة أو حد المراكز غير صالحة.')
+            return False
+        account = self.gw.account()
+        if not account:
+            await self.notify('⚠️ يلزم اتصال بحساب MT5 قبل التشغيل.')
+            return False
+        trade_mode = getattr(account, 'trade_mode', None)
+        allowed_modes = {mt5.ACCOUNT_TRADE_MODE_DEMO, getattr(mt5, 'ACCOUNT_TRADE_MODE_REAL', 2)}
+        if trade_mode not in allowed_modes:
+            await self.notify('⚠️ نوع حساب MT5 غير مدعوم. المسموح Demo أو Real فقط.')
+            return False
+        if trade_mode != mt5.ACCOUNT_TRADE_MODE_DEMO and not self.real_trading_enabled:
+            await self.notify('🔒 الحساب Real متصل لكن التداول الحقيقي غير مفعّل لهذا الحساب.')
+            return False
+        if not await self._daily_entry_allowed(account):
+            return False
+        permissions = self.gw.algo_status()
+        if not all(permissions.get(key) for key in ('connected', 'trade_allowed',
+                                                    'account_trade_allowed', 'trade_expert')):
+            await self.notify('⚠️ اتصال MT5 أو صلاحية Algo Trading غير جاهزة. افحص الجاهزية أولاً.')
+            return False
+        positions = self.gw.positions()
+        if positions is None:
+            await self.notify('⚠️ تعذر قراءة مراكز MT5؛ لن يبدأ المحرك.')
+            return False
+        old = [p for p in positions if getattr(p, 'magic', 0) == MAGIC and p.ticket not in self.trades]
+        if old:
+            await self.notify('⚠️ توجد صفقة قديمة للبوت غير متتبعة. أغلقها يدويًا قبل التشغيل.')
+            return False
+        if self.running:
+            await self.notify('ℹ️ البوت يعمل بالفعل.')
+            return True
+
+        if not (self.session_active and self.session_start_balance > 0 and not self.session_profit_hit):
+            self.session_start_balance = float(getattr(account, 'balance', 0) or 0)
+            self.session_profit_hit = False
+            self.session_active = True
+            await self.save_setting('session_start_balance', self.session_start_balance)
+            await self.save_setting('session_profit_hit', 0)
+            await self.save_setting('session_active', 1)
+        if not self.symbols:
+            await self.notify('⚠️ اختر رمزاً واحداً على الأقل قبل التشغيل.')
+            return False
+        if not self.registry.strategies:
+            await self.notify('⚠️ لا توجد استراتيجيات مفعّلة؛ لن يبدأ المحرك.')
+            return False
+
+        self.running = True
+        self.last_analysis_by_symbol = {}
+        await self.registry.refresh(login=int(getattr(account, 'login', 0) or 0), force=True)
+        await self.db.log(
+            'BOT_STARTED', symbols=self.symbols, risk_pct=self.risk_pct,
+            max_positions=self.max_positions, max_consecutive_losses=self.max_consecutive_losses,
+            daily_loss_limit_pct=self.daily_loss_limit_pct,
+            max_daily_trades=self.max_daily_trades,
+            session_profit_limit=self.session_profit_limit,
+            session_start_balance=self.session_start_balance,
+            strategies=[s.spec.id for s in self.registry.strategies],
+        )
+        await self.notify(
+            f'▶️ تم تشغيل البوت\n'
+            f'💱 مراقبة: {", ".join(self.symbols)}\n'
+            f'📂 حد المراكز: {self.max_positions}\n'
+            f'⚠️ المخاطرة: {self.risk_pct:g}%\n'
+            f'🧠 الاستراتيجيات: {len(self.registry.strategies)}'
+        )
+        self.loop_task = asyncio.create_task(self.loop())
+        return True
+
+    async def stop(self):
+        self.running = False
+        self.session_active = False
+        await self.save_setting('session_active', 0)
+        managed = list(self.trades.values())
+        if self.trade and self.trade.ticket not in self.trades:
+            managed.append(self.trade)
+        failed = 0
+        closed = 0
+        for state in managed:
+            pos = self.gw.position_by_ticket(state.ticket)
+            if not pos:
+                self.trades.pop(state.ticket, None)
+                if self.trade and self.trade.ticket == state.ticket:
+                    self.trade = None
+                continue
+            res = self.gw.close(pos)
+            if res and res.retcode in (mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_DONE_PARTIAL):
+                remaining = self.gw.position_by_ticket(state.ticket)
+                if remaining:
+                    failed += 1
+                    await self.db.log('STOP_EXIT_PARTIAL', state.symbol, ticket=state.ticket,
+                                      remaining_volume=remaining.volume)
+                    await self.notify(
+                        f'⚠️ إغلاق جزئي للمركز {state.ticket} ({state.symbol}). '
+                        f'المتبقي {remaining.volume:g} لوت؛ افحصه في MT5.'
+                    )
+                    continue
+                closed += 1
+                await asyncio.sleep(.3)
+                exit_price = float(getattr(res, 'price', 0) or 0)
+                pnl = None
+                deals = self.gw.history_deals_by_position(state.ticket)
+                for deal in deals:
+                    if getattr(deal, 'entry', None) in (getattr(mt5, 'DEAL_ENTRY_OUT', 1),
+                                                        getattr(mt5, 'DEAL_ENTRY_OUT_BY', 3)):
+                        exit_price = float(getattr(deal, 'price', exit_price) or exit_price)
+                        pnl = (float(getattr(deal, 'profit', 0) or 0)
+                               + float(getattr(deal, 'swap', 0) or 0)
+                               + float(getattr(deal, 'commission', 0) or 0))
+                await self.db.log('STOP_EXIT', state.symbol, ticket=state.ticket,
+                                  exit_price=exit_price, pnl=pnl, strategy=state.strategy,
+                                  regime=state.regime)
+                if pnl is not None:
+                    await self._record_close_performance(state, pnl)
+                pnl_text = f'{pnl:.2f}' if pnl is not None else 'بانتظار سجل MT5'
+                await self.notify(
+                    f'⏹ إغلاق بسبب إيقاف البوت — {state.symbol}\n'
+                    f'🎫 المركز: {state.ticket}\n🚪 سعر الخروج: {exit_price}\n'
+                    f'💰 الربح/الخسارة: {pnl_text}'
+                )
+                self.trades.pop(state.ticket, None)
+                self.trade_alert_meta.pop(state.ticket, None)
+                if self.trade and self.trade.ticket == state.ticket:
+                    self.trade = None
+            else:
+                failed += 1
+                await self.db.log('STOP_EXIT_FAILED', state.symbol, ticket=state.ticket, result=str(res))
+                await self.notify(
+                    f'⚠️ فشل إغلاق المركز — {state.symbol}\n🎫 المركز: {state.ticket}\n'
+                    f'📡 MT5: {getattr(res, "comment", "لا توجد استجابة")}\n⚠️ تحقق منه يدويًا في MT5.'
+                )
+        await self.db.log('BOT_STOPPED', closed_positions=closed, failed_positions=failed)
+        await self.notify(f'⏹ تم إيقاف البوت | المراكز المغلقة: {closed}'
+                          + (f' | ⚠️ تعذر إغلاق: {failed}' if failed else ''))
+
+    async def loop(self):
+        while self.running:
+            started = time.monotonic()
+            try:
+                await self.step()
+                self.scan_count += 1
+                self.last_cycle_seconds = time.monotonic() - started
+                self.last_cycle_at = time.time()
+                if self.last_cycle_at - self.last_cycle_log_at >= 60:
+                    self.last_cycle_log_at = self.last_cycle_at
+                    await self.db.log('ENGINE_CYCLE', duration_seconds=round(self.last_cycle_seconds, 3),
+                                      scan_count=self.scan_count)
+            except Exception as exc:
+                self.running = False
+                try:
+                    await self.db.log('ENGINE_ERROR', self.symbol, error=repr(exc),
+                                      traceback=traceback.format_exc())
+                finally:
+                    await self.notify('🚨 توقف المحرك بسبب خطأ. افحص سجل ENGINE_ERROR ومراكز MT5.')
+                return
+            await asyncio.sleep(settings.poll_interval_ms / 1000)
+
+    # ==================================================================
+    # account-level guards
+    # ==================================================================
+    async def _daily_entry_allowed(self, account):
+        from datetime import date
+        equity = float(getattr(account, 'equity', 0) or 0)
+        if not math.isfinite(equity) or equity <= 0:
+            return False
+        if self.daily_loss_limit_pct <= 0:
+            return True
+        today = date.today().isoformat()
+        day_key = await self._account_key('daily_equity_date')
+        baseline_key = await self._account_key('daily_equity_baseline')
+        saved_day = await self.db.get(day_key)
+        baseline = float(await self.db.get(baseline_key, 0) or 0)
+        if saved_day != today or not math.isfinite(baseline) or baseline <= 0:
+            baseline = equity
+            await self.db.set(baseline_key, baseline)
+            await self.db.set(day_key, today)
+            self.daily_loss_notified = False
+            self.daily_trades = 0
+            self.daily_trades_date = today
+        allowed = equity > baseline * (1 - self.daily_loss_limit_pct / 100.0)
+        if not allowed and not self.daily_loss_notified:
+            self.daily_loss_notified = True
+            await self.db.log('DAILY_EQUITY_LIMIT', equity=equity, baseline=baseline,
+                              limit_pct=self.daily_loss_limit_pct)
+            await self.notify('🛑 توقف الدخول: حد انخفاض Equity اليومي. تستمر إدارة المراكز المفتوحة.')
+        return allowed
+
+    async def _daily_trade_guard(self):
+        from datetime import date
+        today = date.today().isoformat()
+        if self.daily_trades_date != today:
+            self.daily_trades_date = today
+            self.daily_trades = 0
+        if self.max_daily_trades <= 0:
+            return True
+        if self.daily_trades >= self.max_daily_trades:
+            if not getattr(self, '_daily_trades_notified', False):
+                self._daily_trades_notified = True
+                await self.notify(f'🛑 توقف الدخول: بلغت حد الصفقات اليومي ({self.max_daily_trades}).')
+                await self.db.log('DAILY_TRADE_LIMIT', trades=self.daily_trades,
+                                  limit=self.max_daily_trades)
+            return False
+        self._daily_trades_notified = False
+        return True
+
+    # ==================================================================
+    # market data
+    # ==================================================================
+    def _closed_frames(self, symbol):
+        """Fetch closed-bar history only.
+
+        ``gw.rates`` reads from MT5 position 1, which is already the most
+        recent *completed* bar (position 0 is the forming bar), so no extra
+        strip is applied here.  Every frame therefore ends on a closed bar.
+        """
+        counts = {'M1': 320, 'M5': 300, 'M15': 260, 'H1': 240, 'H4': 200, 'D1': 160, 'W1': 120}
+        frames = {}
+        for name, count in counts.items():
+            tf = {
+                'M1': mt5.TIMEFRAME_M1, 'M5': mt5.TIMEFRAME_M5, 'M15': mt5.TIMEFRAME_M15,
+                'H1': mt5.TIMEFRAME_H1, 'H4': mt5.TIMEFRAME_H4, 'D1': mt5.TIMEFRAME_D1,
+                'W1': mt5.TIMEFRAME_W1,
+            }[name]
+            frames[name] = to_rows(self.gw.rates(symbol, tf, count))
+        return frames
+
+    def _build_context(self, symbol, tick, info, frames):
+        epoch = float(getattr(tick, 'time_msc', 0) or 0) / 1000.0 or float(getattr(tick, 'time', 0) or 0)
+        session = session_of(epoch)
+        context = MarketContext(symbol, tick, info, frames, session, Regime.NO_TRADE, {})
+        result = self.regime_detector.detect(context)
+        context.regime = result.regime
+        context.regime_detail = {**result.detail, 'direction': result.direction,
+                                 'strength': result.strength, 'blocked': result.blocked}
+        return context, result
+
+    # ==================================================================
+    # main cycle
+    # ==================================================================
+    async def step(self):
+        account = self.gw.account()
+        if not account:
+            self.running = False
+            await self.notify('⚠️ انقطع حساب MT5؛ تم إيقاف المحرك.')
+            return
+        trade_mode = getattr(account, 'trade_mode', None)
+        allowed_modes = {mt5.ACCOUNT_TRADE_MODE_DEMO, getattr(mt5, 'ACCOUNT_TRADE_MODE_REAL', 2)}
+        if trade_mode not in allowed_modes:
+            self.running = False
+            await self.notify('⚠️ نوع حساب MT5 غير مدعوم؛ تم إيقاف المحرك.')
+            return
+        if trade_mode != mt5.ACCOUNT_TRADE_MODE_DEMO and not self.real_trading_enabled:
+            self.running = False
+            await self.notify('🔒 قفل Real غير مفعّل لهذا الحساب؛ تم إيقاف المحرك.')
+            return
+        # Approved A/B strategies run on real accounts; candidate strategies
+        # must first earn evidence (demo/backtest) before real money.
+        self.registry.allow_trials = (trade_mode == mt5.ACCOUNT_TRADE_MODE_DEMO)
+
+        positions = self.gw.positions()
+        if positions is None:
+            self.running = False
+            await self.notify('⚠️ تعذر التحقق من مراكز MT5؛ أُوقف الدخول حتى استعادة الاتصال.')
+            return
+        unknown = [p for p in positions if getattr(p, 'magic', 0) == MAGIC and p.ticket not in self.trades]
+        if unknown:
+            self.running = False
+            await self.db.log('UNMANAGED_POSITION', tickets=[p.ticket for p in unknown])
+            await self.notify('🚨 يوجد مركز للبوت غير متتبع. أُوقف المحرك؛ افحص المراكز في MT5.')
+            return
+
+        for state in list(self.trades.values()):
+            info = self.gw.info(state.symbol)
+            tick = self.gw.tick(state.symbol)
+            if info and tick:
+                await self.manage(state, tick, info)
+
+        # Session realized-profit limit (Balance based, floating ignored).
+        if self.session_profit_limit > 0 and self.session_start_balance > 0:
+            balance = float(getattr(account, 'balance', 0) or 0)
+            realized = balance - self.session_start_balance
+            if realized >= self.session_profit_limit:
+                if not self.session_profit_hit:
+                    self.session_profit_hit = True
+                    await self.save_setting('session_profit_hit', 1)
+                    await self.db.log('SESSION_PROFIT_LIMIT', balance=balance,
+                                      baseline=self.session_start_balance,
+                                      profit=realized, limit=self.session_profit_limit)
+                    await self.notify(f'🎯 تحقق حد ربح الجلسة: +${realized:.2f}. توقف التحليل والدخول الجديد.',
+                                      event_type='session_profit_limit', trade_result=realized)
+                if not self.trades:
+                    self.running = False
+                    self.session_active = False
+                    await self.save_setting('session_active', 0)
+                return
+
+        if not await self._daily_entry_allowed(account):
+            return
+        if not await self._daily_trade_guard():
+            return
+        if len(self.trades) >= self.max_positions:
+            return
+        if self.max_consecutive_losses > 0 and self.consecutive_losses >= self.max_consecutive_losses:
+            if not self.loss_limit_notified:
+                self.loss_limit_notified = True
+                await self.notify(f'🛑 توقف الدخول: {self.consecutive_losses} خسائر متتالية.')
+            return
+        self.loss_limit_notified = False
+        if not self.symbols:
+            return
+
+        await self.registry.refresh(login=int(getattr(account, 'login', 0) or 0))
+        for symbol in list(self.symbols):
+            if len(self.trades) >= self.max_positions:
+                break
+            await self._scan_symbol(symbol, account)
+
+    async def _log_reject(self, event, symbol, **details):
+        key = (event, symbol, details.get('reason', ''))
+        now = time.time()
+        if now - self.reject_log_at.get(key, 0) < self.reject_log_interval:
+            return
+        self.reject_log_at[key] = now
+        await self.db.log(event, symbol, **details)
+
+    async def _scan_symbol(self, symbol, account):
+        if any(state.symbol == symbol for state in self.trades.values()):
+            return
+        info = self.gw.info(symbol)
+        tick = self.gw.tick(symbol)
+        if not info or not tick or not info.point or tick.bid <= 0 or tick.ask <= tick.bid:
+            await self._log_reject(
+                'SCAN_REJECT', symbol, reason='INVALID_MARKET_DATA',
+                info_available=bool(info), point=float(getattr(info, 'point', 0) or 0) if info else 0.0,
+                tick_available=bool(tick),
+                bid=float(getattr(tick, 'bid', 0) or 0) if tick else 0.0,
+                ask=float(getattr(tick, 'ask', 0) or 0) if tick else 0.0,
+                mt5_error=repr(mt5.last_error()),
+            )
+            return
+
+        ticks = self.gw.ticks(symbol)
+        if ticks is None or len(ticks) < 40:
+            await self._log_reject('SCAN_REJECT', symbol, reason='INSUFFICIENT_TICKS')
+            return
+        latest = (float(ticks['time_msc'][-1]) / 1000.0 if 'time_msc' in ticks.dtype.names
+                  else float(ticks['time'][-1]))
+        live_epoch = float(getattr(tick, 'time_msc', 0) or 0) / 1000.0 or float(getattr(tick, 'time', 0) or 0)
+        if abs(live_epoch - latest) > settings.max_tick_age_seconds:
+            await self._log_reject('SCAN_REJECT', symbol, reason='STALE_TICKS',
+                                   age_seconds=live_epoch - latest)
+            return
+        ok, spread, avg, limit = self.risk.spread_ok(tick, info)
+        if not ok:
+            await self._log_reject('SPREAD_REJECT', symbol, spread=spread, average=avg, limit=limit)
+            return
+
+        frames = self._closed_frames(symbol)
+        context, regime_result = self._build_context(symbol, tick, info, frames)
+        self.last_regime_by_symbol[symbol] = regime_result.name
+        if regime_result.blocked:
+            self.last_candidates_by_symbol[symbol] = []
+            await self._log_reject('REGIME_REJECT', symbol, reason=regime_result.detail.get('reason'),
+                                   regime=regime_result.name,
+                                   detail=regime_result.detail)
+            return
+
+        try:
+            decision, evaluated = self.registry.evaluate(context)
+        except Exception as exc:
+            await self.db.log('STRATEGY_REGISTRY_ERROR', symbol, error=repr(exc))
+            return
+        self.last_candidates_by_symbol[symbol] = evaluated
+        await self._audit_strategies(symbol, regime_result, evaluated, decision)
+
+        if not decision:
+            return
+        if decision.get('decision') == 'WAIT' and decision.get('reason_code') == 'TOP_CONFIDENCE_DIRECTION_TIE':
+            await self._log_reject('STRATEGY_CONFLICT', symbol,
+                                   reason='TOP_CONFIDENCE_DIRECTION_TIE',
+                                   sources=decision.get('sources'))
+            return
+        if decision.get('decision') != 'SIGNAL':
+            return
+
+        confidence = float(decision.get('confidence', 0))
+        try:
+            bar_time = float(decision.get('bar_time') or 0)
+            if bar_time > 0 and live_epoch > 0 and (live_epoch - bar_time) > 300.0:
+                await self._log_reject('CONFIDENCE_REJECT', symbol,
+                                       reason='SIGNAL_TOO_OLD', strategy=decision.get('strategy_id'),
+                                       signal_age_seconds=live_epoch - bar_time)
+                return
+        except (TypeError, ValueError):
+            pass
+        threshold = max(float(self.min_confidence), float(self.min_entry_confidence))
+        if confidence < threshold:
+            await self._log_reject('CONFIDENCE_REJECT', symbol, strategy=decision.get('strategy_id'),
+                                   confidence=round(confidence, 2), min_confidence=threshold)
+            return
+        await self.db.log('STRATEGY_ENTRY_GATE', symbol, strategy=decision.get('strategy_id'),
+                          side=decision.get('side'), decision='SIGNAL',
+                          confidence=confidence, regime=decision.get('regime'),
+                          reason_code=decision.get('reason_code'))
+        # Optional, data-only AI cross-check. It may only veto; it can never
+        # create a trade or modify levels, and it fails open on provider issues.
+        if self.ai_advisor is not None and getattr(self.ai_advisor, 'active', False):
+            allowed, meta = await self.ai_advisor.review(context, decision)
+            if not allowed:
+                await self.db.log('AI_CROSSCHECK_VETO', symbol,
+                                  strategy=decision.get('strategy_id'),
+                                  side=decision.get('side'), **meta)
+                await self._log_reject('AI_VETO', symbol,
+                                       reason=meta.get('reason_code') or 'AI_VETO',
+                                       strategy=decision.get('strategy_id'))
+                return
+        await self._enter(symbol, decision, account)
+
+    async def _audit_strategies(self, symbol, regime_result, evaluated, decision):
+        summary = [
+            {'id': row.get('strategy_id') or row.get('strategy'),
+             'decision': row.get('decision'),
+             'reason_code': row.get('reason_code'),
+             'confidence': row.get('confidence'),
+             'side': row.get('side')}
+            for row in evaluated if isinstance(row, dict)
+        ]
+        payload = {
+            'symbol_class': symbol_class(symbol),
+            'regime': regime_result.name,
+            'direction': regime_result.direction,
+            'strength': round(float(regime_result.strength), 4),
+            'detail': {k: (round(v, 6) if isinstance(v, float) else v)
+                       for k, v in regime_result.detail.items()},
+            'selected': (decision or {}).get('strategy_id'),
+            'side': (decision or {}).get('side'),
+            'evaluated': summary,
+        }
+        key = json.dumps(payload, sort_keys=True, default=str)
+        previous = self.last_analysis_by_symbol.get(symbol)
+        if previous == key:
+            return
+        self.last_analysis_by_symbol[symbol] = key
+        await self.db.log('STRATEGY_SCAN', symbol, **payload)
+
+    async def analyze_symbol(self, symbol):
+        """Public analysis view used by Telegram/T4Bot (no order placement)."""
+        account = self.gw.account()
+        info = self.gw.info(symbol)
+        tick = self.gw.tick(symbol)
+        if not account or not info or not tick or not info.point or tick.bid <= 0 or tick.ask <= tick.bid:
+            return None, 'INVALID_MARKET_DATA'
+        ticks = self.gw.ticks(symbol)
+        if ticks is None or len(ticks) < 40:
+            return None, 'INSUFFICIENT_TICKS'
+        latest = (float(ticks['time_msc'][-1]) / 1000.0 if 'time_msc' in ticks.dtype.names
+                  else float(ticks['time'][-1]))
+        live_epoch = float(getattr(tick, 'time_msc', 0) or 0) / 1000.0 or float(getattr(tick, 'time', 0) or 0)
+        if live_epoch <= 0 or abs(live_epoch - latest) > settings.max_tick_age_seconds:
+            return None, 'STALE_TICKS'
+        frames = self._closed_frames(symbol)
+        context, regime_result = self._build_context(symbol, tick, info, frames)
+        if regime_result.blocked:
+            return {
+                'strategy_id': None, 'decision': 'WAIT',
+                'regime': regime_result.name, 'reason_code': regime_result.detail.get('reason', 'BLOCKED'),
+                'reason': 'Regime blocked (spread/ATR)', 'confidence': 0.0,
+                'detail': regime_result.detail,
+            }, None
+        decision, evaluated = self.registry.evaluate(context)
+        if decision and decision.get('decision') == 'SIGNAL':
+            return decision, None
+        top = None
+        for row in evaluated:
+            if isinstance(row, dict) and row.get('decision') in ('WAIT', 'REJECT'):
+                top = row
+                break
+        if decision and decision.get('decision') == 'WAIT':
+            return decision, None
+        if top:
+            top = dict(top)
+            top.setdefault('regime', regime_result.name)
+            return top, None
+        return {'strategy_id': None, 'decision': 'WAIT', 'regime': regime_result.name,
+                'reason_code': 'NO_CANDIDATE', 'reason': 'No eligible strategy for this regime',
+                'confidence': 0.0}, None
+
+    # ==================================================================
+    # execution
+    # ==================================================================
+    async def _enter(self, symbol, decision, account):
+        side = Side(str(decision['side']).upper())
+        info = self.gw.info(symbol)
+        if not info:
+            return
+        signal_bar = int(decision.get('signal_bar') or time.time() // 60)
+        signal_key = (decision.get('strategy_id'), side.value, signal_bar)
+        last_close = self.last_close_by_symbol.get(symbol, 0)
+        if last_close and time.time() - last_close < self.reentry_cooldown_seconds:
+            await self._log_reject('REENTRY_REJECT', symbol, reason='COOLDOWN',
+                                   strategy=decision.get('strategy_id'), side=side.value)
+            return
+        if self.blocked_signal_by_symbol.get(symbol) == signal_key:
+            await self._log_reject('REENTRY_REJECT', symbol, reason='SAME_SIGNAL_BLOCKED',
+                                   strategy=decision.get('strategy_id'), side=side.value)
+            return
+        last = self.last_entry_by_symbol.get(symbol, 0)
+        if time.time() - last < 5.0:
+            await self._log_reject('REENTRY_REJECT', symbol, reason='ENTRY_THROTTLE')
+            return
+        if not await self._correlation_allows(symbol, side):
+            detail = dict(getattr(self, '_last_correlation_detail', {}) or {})
+            await self._log_reject('CORRELATION_REJECT', symbol, side=side.value,
+                                   max_correlated=self.max_correlated_positions, **detail)
+            return
+
+        # Re-price from a fresh quote; re-validate the structural plan.
+        tick = self.gw.tick(symbol)
+        for _ in range(3):
+            if tick and tick.bid > 0 and tick.ask > tick.bid:
+                break
+            await asyncio.sleep(.12)
+            tick = self.gw.tick(symbol)
+        if not tick or tick.bid <= 0 or tick.ask <= tick.bid:
+            await self._log_reject('SCAN_REJECT', symbol, reason='INVALID_ENTRY_QUOTE')
+            return
+        ok, _, _, _ = self.risk.spread_ok(tick, info)
+        if not ok:
+            await self._log_reject('SPREAD_REJECT', symbol, reason='ENTRY_SPREAD')
+            return
+
+        point = float(info.point)
+        price = float(tick.ask if side == Side.BUY else tick.bid)
+        planned_entry = float(decision.get('entry') or 0)
+        stop = float(decision.get('sl_price') or 0)
+        target = float(decision.get('tp_price') or 0)
+        if stop <= 0 or target <= 0:
+            await self._log_reject('STRATEGY_PLAN_REJECT', symbol, reason='MISSING_SL_TP')
+            return
+        # Anti-chasing: the plan was built on the signal bar close.  If the live
+        # quote has already run away from it, the setup is gone.
+        if planned_entry > 0:
+            drift = abs(price - planned_entry)
+            if drift > max(ctx_spread_buffer(None, tick, info) * 4.0, abs(price - stop) * 0.35):
+                await self._log_reject('ANTI_CHASE_REJECT', symbol,
+                                       reason='ENTRY_DRIFT_TOO_LARGE',
+                                       planned_entry=planned_entry, live_price=price,
+                                       drift=drift, strategy=decision.get('strategy_id'))
+                return
+        broker_stop_points = max(float(getattr(info, 'trade_stops_level', 0) or 0),
+                                 float(getattr(info, 'trade_freeze_level', 0) or 0))
+        min_distance = (broker_stop_points + 2.0) * point
+        geometry_ok = (
+            (side == Side.BUY and stop < price - min_distance and target > price + min_distance)
+            or (side == Side.SELL and stop > price + min_distance and target < price - min_distance)
+        )
+        if not geometry_ok:
+            await self._log_reject('STRATEGY_PLAN_REJECT', symbol, reason='INVALID_STRUCTURAL_SL_TP',
+                                   side=side.value, entry=price, sl=stop, tp=target,
+                                   broker_stop_points=broker_stop_points)
+            return
+        # SL and TP are structural; only round to broker digits.
+        stop = round(stop, int(info.digits))
+        target = round(target, int(info.digits))
+        risk_distance = abs(price - stop)
+        if risk_distance <= 0:
+            await self._log_reject('STRATEGY_PLAN_REJECT', symbol, reason='ZERO_RISK_DISTANCE')
+            return
+        # A structural stop that sits inside the spread/noise band would be
+        # hit by normal quoting, so refuse rather than silently widening it.
+        noise_floor = ctx_spread_buffer(None, tick, info) * 2.0
+        if risk_distance < noise_floor:
+            await self._log_reject('STRATEGY_PLAN_REJECT', symbol, reason='STOP_INSIDE_SPREAD_NOISE',
+                                   risk_distance=risk_distance, noise_floor=noise_floor,
+                                   sl=stop, entry=price, strategy=decision.get('strategy_id'))
+            return
+
+        ok, reason = await self._size_and_send(symbol, account, info, tick, decision, side,
+                                               price, stop, target, signal_bar, signal_key)
+        return ok
+
+    async def _size_and_send(self, symbol, account, info, tick, decision, side,
+                             price, stop, target, signal_bar, signal_key):
+        typ = mt5.ORDER_TYPE_BUY if side == Side.BUY else mt5.ORDER_TYPE_SELL
+        equity = float(getattr(account, 'equity', 0) or 0)
+        risk_cash = equity * (self.risk_pct / 100.0)
+        loss_1lot = mt5.order_calc_profit(typ, symbol, 1.0, price, stop)
+        if loss_1lot is None or abs(loss_1lot) <= 0:
+            await self._log_reject('RISK_EXACT_REJECT', symbol, reason='LOSS_CALC_UNAVAILABLE')
+            return False, 'LOSS_CALC'
+        loss_1lot = abs(float(loss_1lot))
+        vmin = float(info.volume_min)
+        vmax = float(info.volume_max)
+        vstep = float(info.volume_step)
+        min_risk = loss_1lot * vmin
+        if min_risk > risk_cash + 0.01:
+            self.blocked_signal_by_symbol[symbol] = signal_key
+            notice_key = ('min_risk', symbol)
+            if notice_key not in self.execution_notice_once:
+                self.execution_notice_once.add(notice_key)
+                await self.notify(
+                    f'⛔ لم تنفذ {symbol}\nأقل لوت يخاطر بـ ${min_risk:.2f}\n'
+                    f'حدك المسموح: ${risk_cash:.2f} ({self.risk_pct:g}%)'
+                )
+            await self._log_reject('RISK_EXACT_REJECT', symbol, reason='MIN_LOT_EXCEEDS_RISK_BUDGET',
+                                   min_risk=min_risk, risk_cash=risk_cash)
+            return False, 'MIN_RISK'
+        raw_vol = risk_cash / loss_1lot
+        nearest_steps = round((raw_vol - vmin) / vstep)
+        vol = round(max(vmin, min(vmax, vmin + max(0, nearest_steps) * vstep)), 8)
+        planned_risk = loss_1lot * vol
+        tolerance = max(0.01, loss_1lot * vstep / 2.0 + 0.01)
+        if planned_risk > risk_cash + tolerance:
+            self.blocked_signal_by_symbol[symbol] = signal_key
+            await self._log_reject('RISK_CAP_REJECT', symbol,
+                                   reason='BROKER_VOLUME_STEP_EXCEEDS_RISK_CAP',
+                                   requested_risk_cash=risk_cash, nearest_risk_cash=planned_risk,
+                                   nearest_volume=vol, volume_step=vstep, tolerance_cash=tolerance)
+            return False, 'VOLUME_STEP'
+        free_margin = float(getattr(account, 'margin_free', 0) or 0)
+        current_margin = float(getattr(account, 'margin', 0) or 0)
+        margin_1lot = mt5.order_calc_margin(typ, symbol, 1.0, price)
+        margin_budget = max(0.0, equity / 2.0 - current_margin)
+        if margin_1lot is None or float(margin_1lot) <= 0 or margin_budget <= 0:
+            self.blocked_signal_by_symbol[symbol] = signal_key
+            await self._log_reject('MARGIN_REJECT', symbol, reason='NO_SAFE_MARGIN_BUDGET',
+                                   planned_volume=vol, free_margin=free_margin, risk_cash=risk_cash)
+            return False, 'MARGIN_BUDGET'
+        margin_cap_raw = margin_budget / float(margin_1lot)
+        margin_cap_steps = math.floor((margin_cap_raw - vmin) / vstep + 1e-9)
+        margin_cap_vol = vmin + max(0, margin_cap_steps) * vstep if margin_cap_raw >= vmin else 0.0
+        margin_cap_vol = min(vmax, margin_cap_vol)
+        if vol > margin_cap_vol + 1e-9:
+            # risk_pct is a hard maximum, not a target that must be consumed.
+            # Use the largest broker-valid volume that satisfies the margin
+            # safety budget; never increase volume above the requested risk.
+            if margin_cap_vol < vmin:
+                self.blocked_signal_by_symbol[symbol] = signal_key
+                await self._log_reject('MARGIN_REJECT', symbol, reason='NO_EXECUTABLE_SAFE_VOLUME',
+                                       planned_volume=vol, max_safe_volume=margin_cap_vol,
+                                       requested_risk_cash=risk_cash)
+                return False, 'MARGIN_CAP'
+            requested_volume = vol
+            vol = round(margin_cap_vol, 8)
+            planned_risk = loss_1lot * vol
+            await self.db.log('RISK_VOLUME_CAPPED', symbol,
+                              strategy=decision.get('strategy_id'),
+                              requested_volume=requested_volume, executed_volume=vol,
+                              requested_risk_cash=risk_cash,
+                              capped_risk_cash=planned_risk,
+                              capped_risk_pct=(planned_risk / equity * 100.0) if equity else 0.0,
+                              reason='SAFE_MARGIN_CAP')
+        margin_required = mt5.order_calc_margin(typ, symbol, vol, price)
+        if margin_required is None or float(margin_required) > free_margin * 0.95:
+            self.blocked_signal_by_symbol[symbol] = signal_key
+            await self._log_reject('MARGIN_REJECT', symbol, reason='PLANNED_RISK_VOLUME_UNAVAILABLE',
+                                   planned_volume=vol, margin_required=margin_required,
+                                   free_margin=free_margin)
+            return False, 'MARGIN_UNAVAILABLE'
+        projected_margin = current_margin + float(margin_required)
+        projected_level = (equity / projected_margin * 100.0) if projected_margin > 0 else float('inf')
+        if projected_level < 200.0:
+            self.blocked_signal_by_symbol[symbol] = signal_key
+            await self._log_reject('MARGIN_REJECT', symbol, reason='PLANNED_VOLUME_BELOW_200_PERCENT_MARGIN_LEVEL',
+                                   planned_volume=vol, projected_margin_level_pct=projected_level)
+            return False, 'MARGIN_LEVEL'
+        actual_risk = loss_1lot * vol
+        # risk_pct is a ceiling. Lower realised risk is valid when broker
+        # volume/margin constraints require it; exceeding the ceiling is not.
+        if actual_risk > risk_cash + tolerance:
+            self.blocked_signal_by_symbol[symbol] = signal_key
+            await self._log_reject('RISK_CAP_REJECT', symbol, reason='FINAL_RISK_EXCEEDS_CAP',
+                                   requested_risk_cash=risk_cash, actual_risk_cash=actual_risk,
+                                   volume=vol, tolerance_cash=tolerance)
+            return False, 'RISK_CAP'
+        actual_risk_pct = (actual_risk / equity * 100.0) if equity else 0.0
+
+        existing = self.gw.positions(symbol)
+        if existing is None:
+            await self._log_reject('ORDER_REJECT', symbol, reason='POSITIONS_UNAVAILABLE')
+            return False, 'POSITIONS'
+        before = {p.ticket for p in existing}
+        filling = self.gw.filling_for(info)
+        if filling is None:
+            await self._log_reject('ORDER_REJECT', symbol, reason='NO_SUPPORTED_FILLING_MODE')
+            return False, 'FILLING'
+        strategy_id = decision.get('strategy_id')
+        if not self.registry.by_id.get(strategy_id):
+            await self._log_reject('STRATEGY_PLAN_REJECT', symbol, reason='UNKNOWN_STRATEGY_ID',
+                                   strategy=strategy_id)
+            return
+        comment = f'MTBOT_{strategy_id[:11].upper()}'
+        request = {
+            'action': mt5.TRADE_ACTION_DEAL, 'symbol': symbol, 'volume': vol, 'type': typ,
+            'price': price, 'sl': stop, 'tp': target, 'deviation': settings.max_slippage_points,
+            'magic': MAGIC, 'comment': comment, 'type_time': mt5.ORDER_TIME_GTC,
+            'type_filling': filling,
+        }
+        check = self.gw.order_check(request)
+        if not check:
+            await self._log_reject('ORDER_CHECK_REJECT', symbol, reason='NO_RESULT',
+                                   volume=vol, last_error=repr(mt5.last_error()))
+            return False, 'ORDER_CHECK'
+        no_money = getattr(mt5, 'TRADE_RETCODE_NO_MONEY', 10019)
+        if check.retcode == no_money:
+            self.blocked_signal_by_symbol[symbol] = signal_key
+            await self._log_reject('MARGIN_REJECT', symbol, reason='ORDER_CHECK_NO_MONEY',
+                                   planned_volume=vol, retcode=check.retcode)
+            return False, 'NO_MONEY'
+        if check.retcode != 0:
+            self.blocked_signal_by_symbol[symbol] = signal_key
+            await self._log_reject('ORDER_CHECK_REJECT', symbol, reason='BROKER_REJECT',
+                                   retcode=check.retcode, comment=getattr(check, 'comment', ''),
+                                   volume=vol, risk_pct=actual_risk_pct)
+            notice_key = ('order_check_reject', symbol, check.retcode)
+            if notice_key not in self.execution_notice_once:
+                self.execution_notice_once.add(notice_key)
+                await self.notify(
+                    f'❌ رفض فحص الصفقة — {symbol}\nالكود: {check.retcode}\n'
+                    f'السبب: {getattr(check, "comment", "غير معروف")}\n'
+                    f'اللوت: {vol:g} | المخاطرة: {actual_risk_pct:.2f}%'
+                )
+            return False, 'BROKER_REJECT'
+
+        res = self.gw.send(request)
+        self.last_entry_by_symbol[symbol] = time.time()
+        if not res or res.retcode not in (mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_DONE_PARTIAL):
+            await self.notify(
+                f'❌ فشل تنفيذ الصفقة — {symbol}\nالكود: {getattr(res, "retcode", "لا يوجد")}\n'
+                f'السبب: {getattr(res, "comment", mt5.last_error())}\n'
+                f'اللوت: {vol:g} | المخاطرة: {actual_risk_pct:.2f}%'
+            )
+            await self._log_reject('ORDER_SEND_REJECT', symbol,
+                                   retcode=getattr(res, 'retcode', None),
+                                   comment=str(getattr(res, 'comment', '')))
+            return False, 'SEND_FAILED'
+
+        # A market order can partially fill at a worse price than requested.
+        # Reject-and-close if the realised fill breaks the risk budget.
+        fill_price = float(getattr(res, 'price', 0) or 0) or price
+        if abs(fill_price - price) > max(settings.max_slippage_points * float(info.point), 0.0):
+            await self.db.log('ENTRY_SLIPPAGE_WARNING', symbol,
+                              planned_price=price, fill_price=fill_price,
+                              slippage_points=abs(fill_price - price) / float(info.point),
+                              planned_risk_cash=risk_cash, volume=vol)
+
+        pos = None
+        for _ in range(150):
+            await asyncio.sleep(.1)
+            pos = self.gw.find_new_bot_position(symbol, before)
+            if pos:
+                break
+        if not pos:
+            self.running = False
+            await self.db.log('POSITION_LINK_FAILED', symbol, result=str(res),
+                              order=getattr(res, 'order', None), deal=getattr(res, 'deal', None),
+                              retcode=getattr(res, 'retcode', None), before_tickets=sorted(before))
+            await self.notify(f'🚨 نُفذت صفقة {symbol} لكن تعذر ربطها آلياً. أُوقف المحرك.')
+            return False, 'LINK_FAILED'
+        await self._register_position(symbol, pos, decision, side, account, signal_bar,
+                                      vol, risk_cash, tolerance)
+        self.daily_trades += 1
+        return True, 'OK'
+
+    async def _register_position(self, symbol, pos, decision, side, account, signal_bar,
+                                 vol, risk_cash, tolerance):
+        fill = float(pos.price_open or 0)
+        actual_stop = float(pos.sl or 0)
+        actual_target = float(pos.tp or 0)
+        initial_r = abs(fill - actual_stop)
+        if initial_r <= 0:
+            await self._close_untrackable_position(symbol, pos, reason='INVALID_INITIAL_R',
+                                                   entry=fill, sl=actual_stop)
+            return
+        management = decision.get('management') or {}
+        broker_open_msc = int(getattr(pos, 'time_msc', 0) or 0)
+        if broker_open_msc <= 0:
+            broker_open_sec = int(getattr(pos, 'time', 0) or 0)
+            broker_open_msc = broker_open_sec * 1000 if broker_open_sec > 0 else int(time.time() * 1000)
+        state = TradeState(
+            pos.ticket, symbol, side, fill, actual_stop, actual_target, initial_r, time.time(),
+            strategy=decision.get('strategy_id'), regime=str(decision.get('regime', '')),
+            confidence=float(decision.get('confidence', 0)),
+            reason=str(decision.get('reason', '')), volume=float(pos.volume or vol),
+            signal_bar=signal_bar,
+            protection_pct=float(management.get('protection_pct', decision.get('protection_pct', 40.0))),
+            trailing_trigger_pct=float(management.get('trailing_trigger_pct',
+                                                      decision.get('trailing_trigger_pct', 70.0))),
+            trailing_gap_pct=float(management.get('trailing_gap_pct',
+                                                  decision.get('trailing_gap_pct', self.trailing_gap_pct))),
+            tp1=float(decision.get('tp1') or 0.0),
+            tp2=float(decision.get('tp2') or 0.0),
+            tp1_close_pct=float(management.get('partial_at_tp1', 0.0) or 0.0),
+            tp1_lock_to_breakeven=bool(management.get('tp1_lock_to_breakeven', True)),
+            initial_volume=float(pos.volume or vol),
+            initial_sl=actual_stop,
+            max_hold_minutes=float(management.get('max_hold_minutes', 0) or 0),
+            symbol_class=symbol_class(symbol),
+            risk_cash=float(risk_cash),
+            opened_epoch=time.time(),
+            best_favorable_price=fill,
+            last_management_tick_msc=broker_open_msc,
+            last_caption_at=time.time(),
+            draw=decision.get('draw') or {},
+        )
+        state.risk_pct_actual = (state.risk_cash / float(getattr(account, 'equity', 1) or 1)) * 100.0
+
+        post_fill_loss = mt5.order_calc_profit(
+            mt5.ORDER_TYPE_BUY if side == Side.BUY else mt5.ORDER_TYPE_SELL,
+            symbol, state.volume, fill, actual_stop)
+        actual_risk_cash = abs(float(post_fill_loss)) if post_fill_loss else state.risk_cash
+        risk_drift_cash = actual_risk_cash - risk_cash
+        if abs(risk_drift_cash) > 0.01:
+            await self.db.log('POST_FILL_RISK_DRIFT', symbol, ticket=pos.ticket,
+                              planned_risk_cash=risk_cash, actual_risk_cash=actual_risk_cash,
+                              drift_cash=risk_drift_cash, planned_entry=float(decision.get('entry') or 0),
+                              actual_entry=fill, actual_sl=actual_stop, volume=state.volume)
+        if risk_drift_cash > 0.01 and risk_drift_cash > tolerance:
+            await self.db.log('POST_FILL_RISK_DRIFT_REJECT', symbol, ticket=pos.ticket,
+                              planned_risk_cash=risk_cash, actual_risk_cash=actual_risk_cash,
+                              drift_cash=risk_drift_cash, risk_pct=self.risk_pct)
+            await self._close_untrackable_position(symbol, pos, reason='POST_FILL_RISK_DRIFT_REJECT',
+                                                   entry=fill, sl=actual_stop)
+            return
+
+        self.trades[pos.ticket] = state
+        self.trade_alert_meta[pos.ticket] = {
+            'risk_cash': actual_risk_cash,
+            'risk_pct': state.risk_pct_actual,
+            'rr_actual': (abs(actual_target - fill) / initial_r) if initial_r > 0 else 0.0,
+            'planned_risk_cash': risk_cash,
+            'risk_drift_cash': risk_drift_cash,
+        }
+        self.execution_notice_once.discard(('min_risk', symbol))
+        self.risk.reset_spread_relaxation(symbol)
+        await self.db.log(
+            'OPEN', symbol, ticket=pos.ticket, entry=fill, sl=actual_stop, tp=actual_target,
+            tp1=state.tp1, tp2=state.tp2, volume=state.volume,
+            account_login=int(getattr(account, 'login', 0) or 0),
+            side=side.value, strategy=state.strategy, regime=state.regime,
+            symbol_class=state.symbol_class,
+            confidence=state.confidence, reason=state.reason,
+            risk_cash=actual_risk_cash, risk_pct=state.risk_pct_actual,
+            rr_actual=self.trade_alert_meta[pos.ticket]['rr_actual'],
+            protection_pct=state.protection_pct,
+            trailing_trigger_pct=state.trailing_trigger_pct,
+            trailing_gap_pct=state.trailing_gap_pct,
+            management=management,
+        )
+        asyncio.create_task(self._send_trade_chart(state, actual_risk_cash, state.risk_pct_actual))
+
+    # ==================================================================
+    # close / bookkeeping
+    # ==================================================================
+    async def _contact_risk(self, t, price=None):
+        return None
+
+    async def _close_untrackable_position(self, symbol, pos, reason, entry=None, sl=None):
+        close_res = self.gw.close(pos)
+        close_ok = (close_res is not None
+                    and getattr(close_res, 'retcode', None) in (mt5.TRADE_RETCODE_DONE,
+                                                                mt5.TRADE_RETCODE_DONE_PARTIAL))
+        remaining = self.gw.position_by_ticket(pos.ticket)
+        if close_ok:
+            for _ in range(50):
+                if remaining is None:
+                    break
+                await asyncio.sleep(.1)
+                remaining = self.gw.position_by_ticket(pos.ticket)
+        await self.db.log(f'{reason}_EXIT', symbol, ticket=pos.ticket,
+                          retcode=getattr(close_res, 'retcode', None),
+                          comment=(getattr(close_res, 'comment', '') if close_res is not None else ''),
+                          remaining_volume=(float(getattr(remaining, 'volume', 0) or 0)
+                                            if remaining is not None else 0.0),
+                          entry=entry, sl=sl)
+        if not close_ok or remaining is not None:
+            self.running = False
+            await self.notify(f'🚨 {symbol}: تعذر تأكيد الإغلاق الوقائي الكامل للمركز {pos.ticket} ({reason}).')
+            return False
+        await self.notify(f'⚠️ {symbol}: أُغلقت الصفقة {pos.ticket} حمايةً ({reason}).')
+        return True
+
+    async def _record_close_performance(self, t, pnl, r_multiple=None):
+        if self.registry.performance is None:
+            return
+        login = self._settings_login
+        if login is None:
+            account = self.gw.account()
+            login = int(getattr(account, 'login', 0) or 0) if account else None
+        try:
+            await self.registry.performance.record(t.strategy, t.symbol, t.regime, pnl,
+                                                   r_multiple=r_multiple, login=login)
+            await self.registry.refresh(login=login, force=True)
+        except Exception as exc:
+            await self.db.log('COMBO_STATS_ERROR', t.symbol, strategy=t.strategy, error=repr(exc))
+
+    async def _correlation_allows(self, symbol, side):
+        account = self.gw.account()
+        equity = float(getattr(account, 'equity', 0) or 0) if account else 0.0
+        allowed, reason, detail = account_guard.check(
+            symbol, side, self.trades.values(),
+            max_correlated_positions=self.max_correlated_positions,
+            risk_pct=self.risk_pct, equity=equity)
+        self._last_correlation_detail = {'reason': reason, **detail}
+        return allowed
+
+    # ==================================================================
+    # trade management
+    # ==================================================================
+    async def manage(self, t, tick, info):
+        account = self.gw.account()
+        account_login = int(getattr(account, 'login', 0) or 0) if account else 0
+        price = tick.bid if t.side == Side.BUY else tick.ask
+        best_observed_price = float(price)
+        try:
+            recent_ticks = self.gw.ticks(t.symbol, n=5000, minimum=200)
+        except Exception as exc:
+            recent_ticks = None
+            await self.db.log('MANAGEMENT_TICKS_UNAVAILABLE', t.symbol, ticket=t.ticket, error=repr(exc))
+        if recent_ticks is not None and len(recent_ticks):
+            cursor_msc = int(getattr(t, 'last_management_tick_msc', 0) or 0)
+            if 'time_msc' in recent_ticks.dtype.names:
+                window = recent_ticks[recent_ticks['time_msc'] >= cursor_msc]
+            else:
+                window = recent_ticks[recent_ticks['time'] >= int(cursor_msc / 1000)]
+            if len(window):
+                field = 'bid' if t.side == Side.BUY else 'ask'
+                values = window[field]
+                best_observed_price = float(max(values) if t.side == Side.BUY else min(values))
+                if 'time_msc' in window.dtype.names:
+                    t.last_management_tick_msc = int(window['time_msc'][-1])
+                else:
+                    t.last_management_tick_msc = int(window['time'][-1]) * 1000
+
+        favorable = (best_observed_price - t.entry) if t.side == Side.BUY else (t.entry - best_observed_price)
+        adverse = (price - t.entry) if t.side == Side.BUY else (t.entry - price)
+        if t.initial_r > 0:
+            t.mfe_r = max(t.mfe_r, favorable / t.initial_r)
+            t.mae_r = min(t.mae_r, adverse / t.initial_r)
+        # Update the strategy-aware caption at most every 5s (Telegram flood
+        # control / MT5 round-trips), while keeping risk management realtime.
+        now = time.time()
+        caption_due = (now - float(getattr(t, 'last_caption_at', 0) or 0)) >= 5.0
+        if caption_due:
+            t.last_caption_at = now
+        pos = self.gw.position_by_ticket(t.ticket)
+        if not pos:
+            # Confirm the position really is gone before booking the close;
+            # a transient empty position query must not orphan live trades.
+            t.missing_cycles = int(getattr(t, 'missing_cycles', 0) or 0) + 1
+            if t.missing_cycles < 3:
+                await asyncio.sleep(.15)
+                if self.gw.position_by_ticket(t.ticket):
+                    t.missing_cycles = 0
+                    return
+            if t.missing_cycles < 3:
+                return
+            return await self._handle_closed(t, account_login, info)
+        t.missing_cycles = 0
+
+        # Time-based exit: cap holding for strategies that declare it.
+        if t.max_hold_minutes > 0 and (time.time() - t.opened_epoch) > t.max_hold_minutes * 60:
+            await self._time_exit(t, pos, price)
+            return
+
+        await self._update_partials(t, pos, price, info)
+        await self._update_protection(t, pos, tick, info, favorable, best_observed_price)
+        await self._update_trailing(t, pos, tick, info, best_observed_price)
+        await self._update_break_even(t, pos, tick, info, favorable)
+
+        if caption_due:
+            caption = await self._trade_caption(t, current_price=float(price))
+            await self.notify(caption, trade_ticket=t.ticket, trade_update=True)
+
+    async def _time_exit(self, t, pos, price):
+        deviation = int(max(settings.max_slippage_points, settings.slippage_max_hard_cap))
+        res = self.gw.close(pos, deviation=deviation)
+        remaining = self.gw.position_by_ticket(t.ticket)
+        for _ in range(30):
+            if remaining is None:
+                break
+            await asyncio.sleep(.1)
+            remaining = self.gw.position_by_ticket(t.ticket)
+        await self.db.log('MAX_DURATION_EXIT', t.symbol, ticket=t.ticket,
+                          strategy=t.strategy, regime=t.regime, price=price,
+                          max_hold_minutes=t.max_hold_minutes,
+                          retcode=getattr(res, 'retcode', None),
+                          remaining_volume=(float(getattr(remaining, 'volume', 0) or 0)
+                                            if remaining is not None else 0.0))
+        if remaining is not None:
+            await self.notify(f'⚠️ تعذر تأكيد الخروج الزمني — {t.symbol} #{t.ticket}',
+                              trade_ticket=t.ticket, trade_update=True, event_type='trade_update')
+            return
+        await self.notify(f'⏱ خروج زمني — {t.symbol} ({t.strategy})', trade_ticket=t.ticket,
+                          trade_update=True, event_type='trade_update')
+
+    async def _update_break_even(self, t, pos, tick, info, favorable):
+        """Move the stop to the entry + spread once 1R of profit was reached.
+
+        This is a per-strategy management action: it only ever tightens the
+        stop toward a risk-free position, it never loosens it.
+        """
+        if not getattr(t, 'tp1', 0) and favorable >= t.initial_r and not t.be_done:
+            buffer = max(ctx_spread_buffer(t, tick, info),
+                         t.initial_r * 0.05)
+            candidate = t.entry + buffer if t.side == Side.BUY else t.entry - buffer
+            candidate = round(candidate, int(info.digits))
+            if t.side == Side.BUY and candidate <= t.sl:
+                return
+            if t.side == Side.SELL and candidate >= t.sl:
+                return
+            if await self._modify_stop(t, candidate, tag='BE'):
+                t.be_done = True
+
+    async def _update_partials(self, t, pos, price, info):
+        if not t.tp1 or t.tp1_close_pct <= 0 or t.tp1_hit:
+            return
+        reached = (price >= t.tp1) if t.side == Side.BUY else (price <= t.tp1)
+        if not reached:
+            return
+        volume = float(getattr(pos, 'volume', 0) or 0)
+        target_volume = _round_volume(volume * t.tp1_close_pct / 100.0, info)
+        if target_volume <= 0 or target_volume >= volume:
+            t.tp1_hit = True
+            await self.db.log('TP1_PARTIAL_SKIPPED', t.symbol, ticket=t.ticket,
+                              strategy=t.strategy, reason='VOLUME_STEP')
+            return
+        res = self.gw.close_partial(pos, target_volume)
+        ok = res and res.retcode in (mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_DONE_PARTIAL)
+        await self.db.log('TP1_PARTIAL', t.symbol, ticket=t.ticket, strategy=t.strategy,
+                          volume=target_volume, retcode=getattr(res, 'retcode', None),
+                          ok=bool(ok), tp1=t.tp1)
+        if ok:
+            t.tp1_hit = True
+            t.volume = max(0.0, volume - target_volume)
+            await self.notify(f'🎯 TP1 جزئي {target_volume:g} لوت — {t.symbol}', trade_ticket=t.ticket,
+                              trade_update=True, event_type='trade_update')
+            if t.tp1_lock_to_breakeven and t.initial_r > 0 and not t.be_done:
+                ltick = self.gw.tick(t.symbol)
+                if ltick is not None:
+                    buffer = max(ctx_spread_buffer(t, ltick, info), t.initial_r * 0.05)
+                    candidate = t.entry + buffer if t.side == Side.BUY else t.entry - buffer
+                    candidate = round(candidate, int(info.digits))
+                    if await self._modify_stop(t, candidate, tag='TP1_LOCK'):
+                        t.be_done = True
+
+    async def _update_protection(self, t, pos, tick, info, favorable, best_observed_price):
+        if t.protection_45_active:
+            return
+        target_distance = abs(t.tp - t.entry)
+        if target_distance <= 0:
+            return
+        progress = favorable / target_distance
+        if progress < t.protection_pct / 100.0:
+            return
+        buffer_points = max(3.0, ctx_spread_buffer(t, tick, info) / float(info.point))
+        protected = (t.entry - buffer_points * info.point if t.side == Side.BUY
+                     else t.entry + buffer_points * info.point)
+        protected = round(protected, int(info.digits))
+        if await self._modify_stop(t, protected, tag='PROTECTION'):
+            t.protection_45_active = True
+            t.best_favorable_price = best_observed_price
+            t.last_progress_at = time.time()
+            await self.db.log('PROTECTION_ACTIVATED', t.symbol, ticket=t.ticket,
+                              strategy=t.strategy, sl=protected, protection_pct=t.protection_pct)
+            await self.notify(f'🛡️ تم تفعيل حماية الربح • {t.symbol}', trade_ticket=t.ticket,
+                              event_type='profit_protection', symbol=t.symbol,
+                              side=t.side.value, t4bot_only=True)
+
+    async def _update_trailing(self, t, pos, tick, info, best_observed_price):
+        if not t.protection_45_active:
+            return
+        target_distance = abs(t.tp - t.entry)
+        if target_distance <= 0:
+            return
+        progress = ((best_observed_price - t.entry) if t.side == Side.BUY
+                    else (t.entry - best_observed_price)) / target_distance
+        if progress < t.trailing_trigger_pct / 100.0:
+            return
+        t.trailing = True
+        gap = target_distance * (t.trailing_gap_pct / 100.0)
+        candidate = (best_observed_price - gap if t.side == Side.BUY
+                     else best_observed_price + gap)
+        candidate = max(candidate, t.sl) if t.side == Side.BUY else min(candidate, t.sl)
+        candidate = round(candidate, int(info.digits))
+        if not t.trailing_moved:
+            candidate = candidate if t.side == Side.BUY else candidate
+        better = candidate > t.sl if t.side == Side.BUY else candidate < t.sl
+        if not better:
+            return
+        min_distance = max(int(getattr(info, 'trade_stops_level', 0) or 0),
+                           int(getattr(info, 'trade_freeze_level', 0) or 0)) * info.point
+        valid = (candidate <= tick.bid - min_distance) if t.side == Side.BUY \
+            else (candidate >= tick.ask + min_distance)
+        if not valid:
+            return
+        if await self._modify_stop(t, candidate, tag='TRAILING'):
+            t.trailing_moved = True
+            await self.db.log('TRAILING_PROTECTION', t.symbol, ticket=t.ticket,
+                              strategy=t.strategy, new_sl=candidate, best_price=best_observed_price)
+
+    async def _modify_stop(self, t, candidate, tag=''):
+        info = self.gw.info(t.symbol)
+        tick = self.gw.tick(t.symbol)
+        if not info or not tick:
+            return False
+        min_distance = max(int(getattr(info, 'trade_stops_level', 0) or 0),
+                           int(getattr(info, 'trade_freeze_level', 0) or 0)) * info.point
+        valid = (candidate <= tick.bid - min_distance) if t.side == Side.BUY \
+            else (candidate >= tick.ask + min_distance)
+        better = candidate > t.sl if t.side == Side.BUY else candidate < t.sl
+        if not valid or not better:
+            return False
+        res = self.gw.modify(t.ticket, t.symbol, candidate, t.tp)
+        if res and res.retcode == mt5.TRADE_RETCODE_DONE:
+            old = t.sl
+            t.sl = candidate
+            await self.db.log('SL_MODIFIED', t.symbol, ticket=t.ticket, tag=tag,
+                              old_sl=old, new_sl=candidate, strategy=t.strategy)
+            return True
+        await self.db.log('SL_MODIFY_FAILED', t.symbol, ticket=t.ticket, tag=tag,
+                          requested_sl=candidate, retcode=getattr(res, 'retcode', None),
+                          comment=str(getattr(res, 'comment', '')))
+        return False
+
+    async def _handle_closed(self, t, account_login, info):
+        # Re-entrancy guard: manage() is also driven by the engine loop, and a
+        # position can already be finalising in another coroutine.
+        if getattr(t, 'closing', False):
+            return
+        t.closing = True
+        deals = self.gw.history_deals_by_position(t.ticket)
+        exit_deals = [d for d in deals
+                      if getattr(d, 'entry', None) in (getattr(mt5, 'DEAL_ENTRY_OUT', 1),
+                                                       getattr(mt5, 'DEAL_ENTRY_OUT_BY', 3))]
+        if exit_deals:
+            reason = getattr(exit_deals[-1], 'reason', None)
+            pnl = sum(float(getattr(d, 'profit', 0) or 0)
+                      + float(getattr(d, 'swap', 0) or 0)
+                      + float(getattr(d, 'commission', 0) or 0)
+                      + float(getattr(d, 'fee', 0) or 0)
+                      for d in exit_deals)
+            exit_price = float(getattr(exit_deals[-1], 'price', 0) or 0)
+            if reason == mt5.DEAL_REASON_TP:
+                event, result_reason = 'TP', 'TP 🎯'
+            elif reason == mt5.DEAL_REASON_SL:
+                be_tolerance = max(float(getattr(info, 'point', 0) or 0) * 5.0, t.initial_r * 0.05)
+                near_entry = abs(exit_price - t.entry) <= be_tolerance
+                if t.tp1_hit and t.tp1_close_pct > 0:
+                    event, result_reason = 'TP1_PARTIAL_EXIT', 'TP1 جزئي 🎯'
+                elif t.trailing_moved:
+                    event, result_reason = 'TRAILING_EXIT', 'خروج بالتتبع 🛡️'
+                elif t.be_done or near_entry:
+                    event, result_reason = 'BREAKEVEN_EXIT', 'خروج قرب التعادل ⚖️'
+                elif t.protection_45_active:
+                    event, result_reason = 'PROTECTED_EXIT', 'خروج بالحماية 🛡️'
+                else:
+                    event, result_reason = 'SL', 'SL 🛑'
+            else:
+                event = 'POSITION_CLOSED'
+                result_reason = 'حماية ربح 🛡️' if pnl > 0 and t.protection_45_active else 'إغلاق 🏁'
+            if pnl < 0:
+                self.consecutive_losses += 1
+            elif pnl > 0:
+                self.consecutive_losses = 0
+            await self.save_setting('consecutive_losses', self.consecutive_losses)
+            r_multiple = None
+            if t.initial_r > 0:
+                r_multiple = ((exit_price - t.entry) if t.side == Side.BUY
+                              else (t.entry - exit_price)) / t.initial_r
+            # Prefer the money-truth multiple (includes commission/swap) for
+            # evidence aggregation; the price multiple stays as MFE/MAE basis.
+            if t.risk_cash > 0:
+                priced_r = r_multiple
+                r_multiple = pnl / t.risk_cash
+                if priced_r is not None:
+                    await self.db.log('R_MULTIPLE_DETAIL', t.symbol, ticket=t.ticket,
+                                      price_r=priced_r, money_r=r_multiple, pnl=pnl,
+                                      risk_cash=t.risk_cash, strategy=t.strategy)
+            await self.db.log(event, t.symbol, ticket=t.ticket, strategy=t.strategy,
+                              regime=t.regime, symbol_class=t.symbol_class,
+                              account_login=account_login, exit_price=exit_price, pnl=pnl,
+                              reason=reason, r_multiple=r_multiple,
+                              mfe_r=t.mfe_r, mae_r=t.mae_r)
+            await self._record_close_performance(t, pnl, r_multiple=r_multiple)
+            caption = await self._trade_caption(t, pnl=pnl, closed=True)
+            await self.notify(caption, trade_ticket=t.ticket, trade_update=True,
+                              trade_result=pnl, trade_result_reason=result_reason,
+                              event_type='trade_closed', symbol=t.symbol, side=t.side.value)
+        else:
+            await self.db.log('POSITION_CLOSED', t.symbol, ticket=t.ticket,
+                              strategy=t.strategy, reason='history_not_found')
+            caption = await self._trade_caption(t, pnl=None, closed=True)
+            await self.notify(caption, trade_ticket=t.ticket, trade_update=True,
+                              event_type='trade_closed', symbol=t.symbol, side=t.side.value)
+        self.last_close_by_symbol[t.symbol] = time.time()
+        self.blocked_signal_by_symbol[t.symbol] = (t.strategy, t.side.value, t.signal_bar)
+        self.trades.pop(t.ticket, None)
+        self.trade_alert_meta.pop(t.ticket, None)
+
+    # ==================================================================
+    # presentation
+    # ==================================================================
+    async def _trade_caption(self, t, current_price=None, pnl=None, closed=False):
+        info = self.gw.info(t.symbol)
+        digits = int(getattr(info, 'digits', 5) or 5)
+        side = 'شراء 🟢' if t.side == Side.BUY else 'بيع 🔴'
+        meta = self.trade_alert_meta.get(t.ticket, {})
+        risk_cash = float(meta.get('risk_cash', t.risk_cash) or 0)
+        risk_pct = float(meta.get('risk_pct', t.risk_pct_actual) or 0)
+        rr_actual = float(meta.get('rr_actual', 0) or 0)
+        if closed:
+            if pnl is None:
+                live_line = '🏁 النتيجة: مغلقة'
+            elif pnl >= 0:
+                live_line = f'🏁 النتيجة: +${pnl:.2f} 🟢'
+            else:
+                live_line = f'🏁 النتيجة: ${pnl:.2f} 🔴'
+        else:
+            pos = self.gw.position_by_ticket(t.ticket)
+            live_pnl = float(getattr(pos, 'profit', 0) or 0) if pos else 0.0
+            icon = '🟢' if live_pnl >= 0 else '🔴'
+            sign = '+' if live_pnl > 0 else ''
+            price_text = f'{current_price:.{digits}f}' if current_price is not None else 'جاري التحديث'
+            live_line = f'💹 السعر الآن: {price_text} ({sign}${live_pnl:.2f} {icon})'
+        tp_line = f'💰 الهدف: {t.tp:.{digits}f}'
+        if t.tp1:
+            tp_line += f' | TP1: {t.tp1:.{digits}f}'
+        return (
+            f'📊 {t.symbol} — {side}\n'
+            f'🧠 الاستراتيجية: {t.strategy}\n'
+            f'📈 النظام: {t.regime}\n'
+            f'🎯 الثقة: {t.confidence:.0f}%\n'
+            f'🎫 الصفقة: {t.ticket}\n'
+            f'📦 اللوت: {t.volume:g}\n'
+            f'⚠️ المخاطرة: {risk_pct:.2f}% (${risk_cash:.2f})\n'
+            f'➡️ الدخول: {t.entry:.{digits}f}\n'
+            f'🛑 الوقف: {t.sl:.{digits}f}\n'
+            f'{tp_line}\n'
+            f'{live_line}\n'
+            f'🛡 الحماية: {t.protection_pct:g}% | ⚖️ R:R 1:{rr_actual:.2f}\n'
+            f'📉 MFE/MAE: {t.mfe_r:.2f}R / {t.mae_r:.2f}R'
+        )
+
+    async def _send_trade_chart(self, t, actual_risk, actual_risk_pct):
+        try:
+            import os
+            import tempfile
+            import matplotlib
+            matplotlib.use('Agg')
+            import matplotlib.dates as mdates
+            import matplotlib.pyplot as plt
+            from datetime import datetime
+
+            rates = self.gw.rates_m5(t.symbol, 24)
+            if rates is None or len(rates) < 10:
+                await self.db.log('TRADE_CHART_FAILED', t.symbol, ticket=t.ticket,
+                                  error='not enough M5 candles')
+                return
+            xs = [datetime.fromtimestamp(int(r['time'])) for r in rates]
+            opens = [float(r['open']) for r in rates]
+            highs = [float(r['high']) for r in rates]
+            lows = [float(r['low']) for r in rates]
+            closes = [float(r['close']) for r in rates]
+            xnum = mdates.date2num(xs)
+            fig, ax = plt.subplots(figsize=(11, 6.2), dpi=130)
+            width = (5 / (24 * 60)) * 0.68
+            for x, o, h, l, cl in zip(xnum, opens, highs, lows, closes):
+                color = '#16a34a' if cl >= o else '#dc2626'
+                ax.vlines(x, l, h, color=color, linewidth=1)
+                ax.add_patch(plt.Rectangle((x - width / 2, min(o, cl)), width,
+                                           max(abs(cl - o), 1e-7), facecolor=color,
+                                           edgecolor=color, linewidth=.8))
+            ax.axhline(t.entry, color='#2563eb', linewidth=1.5, label=f'ENTRY {t.entry:g}')
+            ax.axhline(t.sl, color='#dc2626', linewidth=1.3, linestyle='--', label=f'SL {t.sl:g}')
+            ax.axhline(t.tp, color='#16a34a', linewidth=1.3, linestyle='--', label=f'TP {t.tp:g}')
+            if t.tp1:
+                ax.axhline(t.tp1, color='#0ea5e9', linewidth=1.1, linestyle='-.', label=f'TP1 {t.tp1:g}')
+            # Draw the strategy's own levels/zones/indicator anchors so the
+            # chart matches the plan that produced the trade.
+            draw = dict(getattr(t, 'draw', None) or {})
+            for zone in (draw.get('zones') or [])[:6]:
+                try:
+                    low = float(zone.get('low')); high = float(zone.get('high'))
+                except (TypeError, ValueError):
+                    continue
+                if high < low:
+                    low, high = high, low
+                ax.axhspan(low, high, color='#f59e0b', alpha=0.10, label=str(zone.get('kind') or 'ZONE'))
+            for level in (draw.get('levels') or [])[:10]:
+                try:
+                    price = float(level.get('price'))
+                except (TypeError, ValueError):
+                    continue
+                style = {'color': '#7c3aed', 'linewidth': 1.0, 'linestyle': ':'}
+                ax.axhline(price, label=str(level.get('label') or level.get('type') or 'LEVEL'), **style)
+            for item in (draw.get('indicators') or [])[:4]:
+                try:
+                    value = float(item.get('value'))
+                except (TypeError, ValueError):
+                    continue
+                ax.axhline(value, color='#0891b2', linewidth=0.9, linestyle=(0, (1, 3)),
+                           label=str(item.get('name') or 'IND'))
+            ax.set_title(f'{t.symbol}  {"BUY" if t.side == Side.BUY else "SELL"}  |  {t.strategy}  |  {t.regime}')
+            ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
+            ax.grid(alpha=.18)
+            ax.legend(loc='best', fontsize=8)
+            fig.autofmt_xdate()
+            fig.tight_layout()
+            fd, path = tempfile.mkstemp(prefix=f'mtbot_{t.symbol}_', suffix='.png')
+            os.close(fd)
+            fig.savefig(path, bbox_inches='tight')
+            plt.close(fig)
+            caption = await self._trade_caption(t, current_price=t.entry)
+            await self.notify(caption, photo_path=path, caption=caption, trade_ticket=t.ticket,
+                              pin=True, event_type='trade_opened', symbol=t.symbol, side=t.side.value)
+            await self.db.log('TRADE_CHART_SENT', t.symbol, ticket=t.ticket, strategy=t.strategy)
+        except Exception as exc:
+            await self.db.log('TRADE_CHART_FAILED', t.symbol, ticket=t.ticket, error=str(exc))
+
+    async def performance_summary(self, window=200):
+        return await self.db.strategy_performance(window=window)
+
+    async def strategy_report(self, login=None, window=60):
+        """Per strategy/symbol/regime metrics used by Telegram and T4Bot."""
+        rows = await self.db.closed_trade_metrics(login=login, window=window)
+        for row in rows:
+            strategy = row.get('strategy') or ''
+            symbol = row.get('symbol') or ''
+            regime = row.get('regime') or 'NO_TRADE'
+            exact, pooled = ComboPerformance.rows_for(
+                getattr(self.registry, '_cache', None), strategy, symbol, regime)
+            enabled, penalty, verdict, source = ComboPerformance.verdict_combined(exact, pooled)
+            row['combo_key'] = ComboPerformance.key(strategy, symbol, regime)
+            row['combo_class_key'] = ComboPerformance.class_key(strategy, symbol, regime)
+            row['combo_enabled'] = enabled
+            row['combo_penalty'] = penalty
+            row['combo_verdict'] = verdict
+            row['combo_evidence'] = source
+        return rows
+
+    def strategy_catalog(self):
+        return self.registry.describe()
+
+
+def _round_volume(volume, info):
+    step = float(getattr(info, 'volume_step', 0.01) or 0.01)
+    vmin = float(getattr(info, 'volume_min', 0.01) or 0.01)
+    steps = math.floor((volume - vmin) / step + 1e-9)
+    value = vmin + max(0, steps) * step
+    return round(max(0.0, value), 8)
+
+
+def ctx_spread_buffer(t, tick, info):
+    spread = max(0.0, float(tick.ask) - float(tick.bid))
+    return max(spread * 1.5, float(info.point) * 3.0)

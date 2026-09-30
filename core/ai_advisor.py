@@ -1,624 +1,206 @@
+"""Optional AI cross-check layer.
+
+Design decision: deterministic strategies own every entry, stop and target.
+The AI's only permitted role is to *optionally veto* a deterministic signal
+when an independent, data-only reading of the same supplied bars disagrees.
+It can never:
+
+  * create a trade on its own,
+  * move a stop or target,
+  * change position size or risk,
+  * see or request data that was not supplied by the engine.
+
+The layer is disabled unless ``AI_CROSSCHECK_ENABLED=true`` and a provider
+key are present, so a missing/broken provider can never block trading, and no
+network call is made in backtests.
+"""
+
 import asyncio
-import hashlib
 import json
+import math
 import os
 import re
 import time
 import urllib.error
 import urllib.request
 
-BASE_URL="https://integrate.api.nvidia.com/v1/chat/completions"
+from .config import settings
 
-# Primary model selected after MTbot contract/stress testing.
-FAST_MODEL="google/diffusiongemma-26b-a4b-it"
+SYSTEM = '''You are a conservative intraday risk screener for MetaTrader 5.
 
-# Keep the existing deep model available only for low-confidence escalation.
-DEEP_MODEL="nvidia/nemotron-3-super-120b-a12b"
-
-VALID_DECISIONS={"ALLOW","REJECT"}
-VALID_REGIMES={"TREND","RANGE","VOLATILE","MIXED","UNKNOWN"}
-
-SYSTEM="""You are the primary entry-quality judge for a very short-term MT5 scalping bot.
-
-Return ONLY one compact JSON object:
-{"decision":"ALLOW|REJECT","confidence":0,"regime":"TREND|RANGE|VOLATILE|MIXED|UNKNOWN","reason_code":"TOKEN","reason":"short reason"}
+You receive closed-bar market data and one already-validated deterministic setup
+(side, entry, stop loss, target). Your ONLY job is to decide whether that setup
+should be VETOED.
 
 Rules:
-- decision MUST be ALLOW or REJECT.
-- confidence MUST be integer 0..100.
-- Be conservative.
-- ALLOW only when the proposed entry has sufficient alignment NOW.
-- Penalize M15/H1 conflict.
-- Penalize abnormal spread.
-- Penalize late/chasing/extended entries.
-- Penalize weak momentum.
-- Penalize strategy/regime mismatch.
-- Reject unclear/risky setups.
-- Never change side or strategy.
-- Do not suggest volume, risk, SL, TP or leverage.
-- No markdown.
-- No explanation outside JSON."""
+- Use only the supplied data. Never invent prices, news, sentiment or volume.
+- VETO only for a concrete, observable contradiction in the supplied data,
+  e.g. price is already at/through the stop, the stated direction fights an
+  obvious dominant trend on the supplied M15 bars, or an extreme spread/ATR
+  ratio makes execution unsafe.
+- Do not veto merely because you would have chosen different levels. The
+  deterministic strategy owns entry, stop and target.
+- If the data is sufficient and no contradiction exists, do not veto.
+
+Return ONLY a JSON object:
+{"veto": true|false, "confidence": 0-100, "reason_code": "SHORT_TOKEN", "reason": "short rationale"}
+'''
 
 
 class AIAdvisor:
- def __init__(self,db):
-  self.db=db
-  self.api_key=os.getenv("NVIDIA_API_KEY","").strip()
-
-  self.fast_model=os.getenv(
-   "MTBOT_AI_FAST_MODEL",FAST_MODEL
-  ).strip() or FAST_MODEL
-
-  self.deep_model=os.getenv(
-   "MTBOT_AI_DEEP_MODEL",DEEP_MODEL
-  ).strip() or DEEP_MODEL
-
-  self.fast_timeout=float(
-   os.getenv("MTBOT_AI_FAST_TIMEOUT","10.0")
-  )
-
-  self.deep_timeout=float(
-   os.getenv("MTBOT_AI_DEEP_TIMEOUT","10.0")
-  )
-
-  self.fast_accept=int(
-   os.getenv("MTBOT_AI_FAST_ACCEPT_CONF","75")
-  )
-
-  self.deep_accept=int(
-   os.getenv("MTBOT_AI_DEEP_ACCEPT_CONF","65")
-  )
-
-  # One retry only for transient NVIDIA endpoint failures.
-  self.retry_delay=float(
-   os.getenv("MTBOT_AI_RETRY_DELAY","2.0")
-  )
-
-
- @property
- def enabled(self):
-  return bool(self.api_key)
-
-
- @staticmethod
- def _bars(rates,n=8):
-  if rates is None:
-   return []
-
-  out=[]
-
-  for r in rates[-n:]:
-   out.append({
-    "t":int(r["time"]),
-    "o":float(r["open"]),
-    "h":float(r["high"]),
-    "l":float(r["low"]),
-    "c":float(r["close"]),
-    "v":float(r["tick_volume"])
-      if "tick_volume" in rates.dtype.names else 0
-   })
-
-  return out
-
-
- def snapshot(
-  self,symbol,sig,reg,tick,info,
-  m1,m5,meta,strategy_performance
- ):
-  point=float(info.point)
-
-  spread=(
-   (float(tick.ask)-float(tick.bid))/point
-   if point else 0
-  )
-
-  return {
-   "symbol":symbol,
-   "side":sig.side.value,
-   "strategy":sig.strategy,
-   "strategy_confidence":round(
-    float(sig.confidence)*100,2
-   ),
-   "strategy_sl_points":round(
-    float(sig.sl_points),2
-   ),
-   "regime":getattr(reg,"value",str(reg)),
-   "bid":float(tick.bid),
-   "ask":float(tick.ask),
-   "spread_points":round(spread,2),
-   "candidates":
-    meta.get("strategy_selection",[]) or [],
-   "strategy_performance":
-    strategy_performance or {},
-   "m1_last8":self._bars(m1,8),
-   "m5_last8":self._bars(m5,8),
-  }
-
-
- @staticmethod
- def _validate_response(obj):
-  if not isinstance(obj,dict):
-   return None
-
-  decision=str(
-   obj.get("decision","")
-  ).strip().upper()
-
-  regime=str(
-   obj.get("regime","")
-  ).strip().upper()
-
-  confidence=obj.get("confidence")
-
-  # bool is a subclass of int in Python.
-  if isinstance(confidence,bool):
-   return None
-
-  if not isinstance(confidence,int):
-   return None
-
-  if decision not in VALID_DECISIONS:
-   return None
-
-  if regime not in VALID_REGIMES:
-   return None
-
-  if not 0 <= confidence <= 100:
-   return None
-
-  reason_code=str(
-   obj.get("reason_code","")
-  ).strip()
-
-  reason=str(
-   obj.get("reason","")
-  ).strip()
-
-  if not reason_code or not reason:
-   return None
-
-  return {
-   "decision":decision,
-   "confidence":confidence,
-   "regime":regime,
-   "reason_code":reason_code[:80],
-   "reason":reason[:160],
-  }
-
-
- @classmethod
- def _parse_response(cls,raw):
-  """
-  Conservative parser.
-
-  It may repair JSON punctuation around the known schema,
-  but it never invents a trading decision, confidence,
-  regime, reason code, or reason.
-  """
-
-  if not isinstance(raw,str):
-   raise ValueError("AI response is not text")
-
-  text=raw.strip()
-
-  if not text:
-   raise ValueError("empty AI response")
-
-  # Remove markdown fences only.
-  if text.startswith("```"):
-   text=re.sub(
-    r'^```(?:json)?\s*',
-    '',
-    text,
-    flags=re.I
-   )
-
-   text=re.sub(
-    r'\s*```$',
-    '',
-    text
-   ).strip()
-
-  # First: strict JSON.
-  try:
-   obj=cls._validate_response(
-    json.loads(text)
-   )
-
-   if obj:
-    return obj,"STRICT"
-
-  except (json.JSONDecodeError,TypeError,ValueError):
-   pass
-
-  repaired=text
-
-  # Known malformed pattern:
-  # decision":"ALLOW",...
-  if re.match(
-   r'^\s*decision"\s*:',
-   repaired,
-   re.I
-  ):
-   repaired='{"'+repaired
-
-  # Known malformed pattern:
-  # "decision":"ALLOW",...
-  elif re.match(
-   r'^\s*"decision"\s*:',
-   repaired,
-   re.I
-  ):
-   repaired="{"+repaired
-
-  # Known malformed pattern:
-  # decision:...
-  elif re.match(
-   r'^\s*decision\s*:',
-   repaired,
-   re.I
-  ):
-   pos=repaired.lower().find("decision")
-
-   repaired=(
-    '{"decision"'
-    +repaired[pos+len("decision"):]
-   )
-
-  if (
-   repaired.startswith("{")
-   and not repaired.rstrip().endswith("}")
-  ):
-   repaired=repaired.rstrip()+"}"
-
-  # Repair ONLY punctuation around known schema keys.
-  known_keys=(
-   "decision",
-   "confidence",
-   "regime",
-   "reason_code",
-   "reason",
-  )
-
-  for field in known_keys:
-
-   repaired=re.sub(
-    rf'(?P<prefix>[{{,])\s*{field}"\s*:',
-    lambda m,f=field:
-     m.group("prefix")+'"'+f+'":',
-    repaired,
-    flags=re.I
-   )
-
-   repaired=re.sub(
-    rf'(?P<prefix>[{{,])\s*{field}\s*:',
-    lambda m,f=field:
-     m.group("prefix")+'"'+f+'":',
-    repaired,
-    flags=re.I
-   )
-
-  # Quote only known enum values.
-  decisions="|".join(
-   sorted(
-    VALID_DECISIONS,
-    key=len,
-    reverse=True
-   )
-  )
-
-  regimes="|".join(
-   sorted(
-    VALID_REGIMES,
-    key=len,
-    reverse=True
-   )
-  )
-
-  repaired=re.sub(
-   rf'("decision"\s*:\s*)'
-   rf'({decisions})(?=\s*[,}}])',
-   lambda m:
-    m.group(1)+'"'
-    +m.group(2).upper()+'"',
-   repaired,
-   flags=re.I
-  )
-
-  repaired=re.sub(
-   rf'("regime"\s*:\s*)'
-   rf'({regimes})(?=\s*[,}}])',
-   lambda m:
-    m.group(1)+'"'
-    +m.group(2).upper()+'"',
-   repaired,
-   flags=re.I
-  )
-
-  # Try repaired JSON.
-  try:
-   obj=cls._validate_response(
-    json.loads(repaired)
-   )
-
-   if obj:
-    return obj,"REPAIRED"
-
-  except (json.JSONDecodeError,TypeError,ValueError):
-   pass
-
-  # Last conservative option:
-  # extract one complete {...} object.
-  start=repaired.find("{")
-  end=repaired.rfind("}")
-
-  if start >= 0 and end > start:
-   candidate=repaired[start:end+1]
-
-   try:
-    obj=cls._validate_response(
-     json.loads(candidate)
-    )
-
-    if obj:
-     return obj,"EXTRACTED"
-
-   except (json.JSONDecodeError,TypeError,ValueError):
-    pass
-
-  raise ValueError("invalid AI JSON/schema")
-
-
- def _request_once(self,model,snapshot,timeout):
-  payload=json.dumps({
-   "model":model,
-   "messages":[
-    {
-     "role":"system",
-     "content":SYSTEM
-    },
-    {
-     "role":"user",
-     "content":json.dumps(
-      snapshot,
-      separators=(",",":")
-     )
-    }
-   ],
-   "temperature":0.0,
-   "top_p":1.0,
-   "max_tokens":512,
-   "stream":False,
-  }).encode()
-
-  req=urllib.request.Request(
-   BASE_URL,
-   data=payload,
-   headers={
-    "Authorization":
-     f"Bearer {self.api_key}",
-    "Content-Type":
-     "application/json"
-   }
-  )
-
-  with urllib.request.urlopen(
-   req,
-   timeout=timeout
-  ) as r:
-   return json.loads(
-    r.read().decode()
-   )
-
-
- def _call_sync(
-  self,
-  model,
-  snapshot,
-  timeout
- ):
-  started=time.monotonic()
-
-  last_error=None
-
-  # At most 2 attempts total.
-  for attempt in (1,2):
-   try:
-    raw=self._request_once(
-     model,
-     snapshot,
-     timeout
-    )
-
-    choice=raw["choices"][0]["message"]
-
-    # Never parse reasoning_content.
-    text=(
-     choice.get("content") or ""
-    ).strip()
-
-    obj,parser_mode=self._parse_response(
-     text
-    )
-
-    latency_ms=int(
-     (time.monotonic()-started)*1000
-    )
-
-    obj["parser_mode"]=parser_mode
-    obj["attempt"]=attempt
-
-    return (
-     obj,
-     latency_ms,
-     raw.get("usage",{})
-    )
-
-   except urllib.error.HTTPError as ex:
-    last_error=ex
-
-    status=int(
-     getattr(ex,"code",0) or 0
-    )
-
-    # Retry only transient HTTP failures.
-    if (
-     attempt == 1
-     and (
-      status == 429
-      or 500 <= status <= 599
-     )
-    ):
-     time.sleep(
-      self.retry_delay
-     )
-     continue
-
-    raise
-
-   except (urllib.error.URLError, TimeoutError) as ex:
-    last_error=ex
-
-    if attempt == 1:
-     time.sleep(self.retry_delay)
-     continue
-
-    raise
-
-   except Exception as ex:
-    last_error=ex
-    raise
-
-  raise last_error or RuntimeError(
-   "AI request failed"
-  )
-
-
- async def _call(
-  self,
-  model,
-  snapshot,
-  timeout
- ):
-  # Allow room for one retry + retry delay.
-  outer_timeout=(
-   timeout*2
-   +self.retry_delay
-   +1.0
-  )
-
-  return await asyncio.wait_for(
-   asyncio.to_thread(
-    self._call_sync,
-    model,
-    snapshot,
-    timeout
-   ),
-   timeout=outer_timeout
-  )
-
-
- async def decide(
-  self,
-  symbol,
-  snapshot
- ):
-  if not self.enabled:
-   await self.db.log(
-    "AI_REJECT",
-    symbol,
-    reason="NVIDIA_API_KEY_MISSING"
-   )
-
-   return {
-    "decision":"REJECT",
-    "confidence":100,
-    "reason_code":"AI_UNAVAILABLE",
-    "reason":"NVIDIA_API_KEY missing",
-    "model":None
-   }
-
-  prompt_hash=hashlib.sha256(
-   json.dumps(
-    snapshot,
-    sort_keys=True,
-    separators=(",",":")
-   ).encode()
-  ).hexdigest()[:16]
-
-  started=time.monotonic()
-
-  try:
-   # DiffusionGemma primary.
-   fast,latency,usage=await self._call(
-    self.fast_model,
-    snapshot,
-    self.fast_timeout
-   )
-
-   fast.update({
-    "model":self.fast_model,
-    "latency_ms":latency,
-    "prompt_hash":prompt_hash
-   })
-
-   await self.db.log(
-    "AI_FAST_DECISION",
-    symbol,
-    **fast,
-    usage=usage
-   )
-
-   # High-confidence primary decisions are final.
-   if fast["confidence"] >= self.fast_accept:
-    return fast
-
-   # Low confidence escalates to deep model.
-   deep,latency2,usage2=await self._call(
-    self.deep_model,
-    snapshot,
-    self.deep_timeout
-   )
-
-   deep.update({
-    "model":self.deep_model,
-    "latency_ms":latency2,
-    "prompt_hash":prompt_hash,
-    "escalated_from":fast
-   })
-
-   await self.db.log(
-    "AI_DEEP_DECISION",
-    symbol,
-    **deep,
-    usage=usage2
-   )
-
-   # Deep uncertainty fails closed.
-   if deep["confidence"] < self.deep_accept:
-    deep["decision"]="REJECT"
-    deep["reason_code"]="AI_LOW_CONFIDENCE"
-    deep["reason"]="Deep AI confidence below acceptance threshold"
-
-   return deep
-
-  except Exception as ex:
-   await self.db.log(
-    "AI_ERROR",
-    symbol,
-    error=repr(ex),
-    prompt_hash=prompt_hash,
-    elapsed_ms=int(
-     (time.monotonic()-started)*1000
-    )
-   )
-
-   # Fail closed.
-   return {
-    "decision":"REJECT",
-    "confidence":100,
-    "reason_code":"AI_ERROR",
-    "reason":str(ex)[:160],
-    "model":None,
-    "prompt_hash":prompt_hash
-   }
+    def __init__(self, db=None, provider=None):
+        self.db = db
+        self.provider = provider
+        self.enabled = _env_flag('AI_CROSSCHECK_ENABLED', False)
+        self.api_key = (os.getenv('DEEPSEEK_API_KEY') or '').strip()
+        self.base_url = os.getenv('AI_CROSSCHECK_URL', 'https://api.deepseek.com/chat/completions').strip()
+        self.model = os.getenv('AI_CROSSCHECK_MODEL', 'deepseek-chat').strip()
+        self.timeout = float(os.getenv('AI_CROSSCHECK_TIMEOUT', '8.0') or 8.0)
+        self.min_veto_confidence = float(os.getenv('AI_CROSSCHECK_MIN_VETO_CONF', '80') or 80)
+        self.error_streak = 0
+        self.max_error_streak = 5
+        self.cooldown_until = 0.0
+
+    @property
+    def active(self):
+        return bool(self.enabled and self.api_key) and time.time() >= self.cooldown_until
+
+    # ------------------------------------------------------------------
+    def snapshot(self, ctx, decision):
+        """Data-only payload built from the same closed bars the strategy used."""
+        def bars(name, count):
+            out = []
+            for row in ctx.frame(name)[-count:]:
+                out.append({
+                    't': int(float(row.get('time') or 0)),
+                    'o': round(float(row.get('open') or 0), 6),
+                    'h': round(float(row.get('high') or 0), 6),
+                    'l': round(float(row.get('low') or 0), 6),
+                    'c': round(float(row.get('close') or 0), 6),
+                    'v': float(row.get('tick_volume') or 0),
+                })
+            return out
+        atr5 = ctx.atr('M5', 14)
+        return {
+            'symbol': ctx.symbol,
+            'symbol_class': getattr(ctx, 'symbol_class', '') or '',
+            'bid': ctx.bid,
+            'ask': ctx.ask,
+            'spread_points': round(ctx.spread_points, 2),
+            'regime': ctx.regime.value,
+            'regime_detail': {k: v for k, v in ctx.regime_detail.items() if not isinstance(v, dict)},
+            'setup': {
+                'strategy_id': decision.get('strategy_id'),
+                'side': decision.get('side'),
+                'entry': decision.get('entry'),
+                'stop_loss': decision.get('sl_price'),
+                'take_profit': decision.get('tp_price'),
+                'tp1': decision.get('tp1'),
+                'reason_code': decision.get('reason_code'),
+            },
+            'atr_m5': round(atr5[-1], 6) if atr5 and atr5[-1] else None,
+            'm1': bars('M1', 30),
+            'm5': bars('M5', 30),
+            'm15': bars('M15', 24),
+        }
+
+    # ------------------------------------------------------------------
+    async def review(self, ctx, decision):
+        """Return ``(allow, meta)``. Never raises; fails open (allow)."""
+        if not self.active:
+            return True, {'enabled': False}
+        payload = self.snapshot(ctx, decision)
+        try:
+            raw = await asyncio.to_thread(self._call_sync, payload)
+        except Exception as exc:
+            self._note_error()
+            await self._log(decision.get('symbol') or payload['symbol'],
+                            {'error': repr(exc), 'outcome': 'fail_open'})
+            return True, {'enabled': True, 'error': repr(exc)}
+        parsed = self._parse(raw)
+        if parsed is None:
+            self._note_error()
+            await self._log(payload['symbol'], {'error': 'parse_failed', 'raw': raw[:400],
+                                                'outcome': 'fail_open'})
+            return True, {'enabled': True, 'error': 'parse_failed'}
+        self.error_streak = 0
+        veto = bool(parsed.get('veto'))
+        confidence = float(parsed.get('confidence') or 0)
+        allowed = not (veto and confidence >= self.min_veto_confidence)
+        meta = {
+            'enabled': True, 'veto': veto, 'confidence': confidence,
+            'reason_code': parsed.get('reason_code'), 'reason': parsed.get('reason'),
+            'allowed': allowed,
+        }
+        await self._log(payload['symbol'], meta)
+        return allowed, meta
+
+    def _note_error(self):
+        self.error_streak += 1
+        if self.error_streak >= self.max_error_streak:
+            self.cooldown_until = time.time() + 300.0
+            self.error_streak = 0
+
+    async def _log(self, symbol, payload):
+        if self.db is None:
+            return
+        try:
+            await self.db.log('AI_CROSSCHECK', symbol, **payload)
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    def _call_sync(self, payload):
+        body = json.dumps({
+            'model': self.model,
+            'temperature': 0,
+            'messages': [
+                {'role': 'system', 'content': SYSTEM},
+                {'role': 'user', 'content': json.dumps(payload, ensure_ascii=False)},
+            ],
+        }).encode('utf-8')
+        request = urllib.request.Request(
+            self.base_url, data=body,
+            headers={'Content-Type': 'application/json',
+                     'Authorization': f'Bearer {self.api_key}'},
+        )
+        with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            data = json.loads(response.read().decode('utf-8'))
+        choices = data.get('choices') or []
+        if not choices:
+            raise RuntimeError('provider returned no choices')
+        return str(choices[0].get('message', {}).get('content') or '')
+
+    @staticmethod
+    def _parse(raw):
+        text = str(raw or '').strip()
+        if not text:
+            return None
+        match = re.search(r'\{.*\}', text, re.S)
+        if match:
+            text = match.group(0)
+        try:
+            obj = json.loads(text)
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(obj, dict) or 'veto' not in obj:
+            return None
+        out = {
+            'veto': bool(obj.get('veto')),
+            'confidence': 0.0,
+            'reason_code': str(obj.get('reason_code') or '')[:40],
+            'reason': str(obj.get('reason') or '')[:280],
+        }
+        try:
+            confidence = float(obj.get('confidence') or 0)
+        except (TypeError, ValueError):
+            confidence = 0.0
+        out['confidence'] = confidence if math.isfinite(confidence) else 0.0
+        return out
+
+
+def _env_flag(name, default=False):
+    raw = (os.getenv(name) or '').strip().lower()
+    if not raw:
+        return default
+    return raw in ('1', 'true', 'yes', 'on')

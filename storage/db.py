@@ -199,3 +199,105 @@ class DB:
     'reason':str(details.get('reason') or ''),
    })
   return list(reversed(closed[-limit:]))
+
+ CLOSE_EVENTS=('TP','SL','PROTECTED_EXIT','TRAILING_EXIT','BREAKEVEN_EXIT',
+               'TP1_PARTIAL_EXIT','MAX_DURATION_EXIT','POSITION_CLOSED','STOP_EXIT')
+
+ async def closed_trade_metrics(self,login=None,window=200):
+  """Aggregate realized performance by strategy x symbol x regime.
+
+  Rationale: strategy validation is per combination, not per strategy only.
+  MAE/MFE come from ``manage()`` bookkeeping on the closing audit row.
+  """
+  window=max(1,min(int(window),2000))
+  try: login=int(login) if login is not None else None
+  except (TypeError,ValueError): login=None
+  rows=[]
+  d=await self._connect()
+  try:
+   async with d.execute(
+    """SELECT id,ts,event,symbol,details FROM audit
+       WHERE event IN ('OPEN','TP','SL','PROTECTED_EXIT','TRAILING_EXIT','BREAKEVEN_EXIT',
+                       'TP1_PARTIAL_EXIT','MAX_DURATION_EXIT','POSITION_CLOSED','STOP_EXIT')
+       ORDER BY id DESC LIMIT ?""",
+    (min(60000,max(2000,window*20)),)
+   ) as cur:
+    async for row_id,ts,event,symbol,details in cur:
+     try: parsed=json.loads(details or '{}')
+     except (TypeError,json.JSONDecodeError): parsed={}
+     rows.append((int(row_id),float(ts or 0),str(event or ''),str(symbol or ''),parsed))
+  finally:
+   await d.close()
+  opens={}
+  groups={}
+  for row_id,ts,event,symbol,details in reversed(rows):
+   ticket=details.get('ticket')
+   try: ticket=int(ticket)
+   except (TypeError,ValueError): ticket=0
+   if event=='OPEN' and ticket:
+    tagged=details.get('account_login')
+    try: tagged=int(tagged) if tagged is not None else None
+    except (TypeError,ValueError): tagged=None
+    if login is None or tagged==login:
+     opens[ticket]=(symbol,details)
+    continue
+   if event not in self.CLOSE_EVENTS:
+    continue
+   # Only rows that carry a realized P/L represent a closed trade.  Auxiliary
+   # rows such as MAX_DURATION_EXIT or STOP_EXIT are bookkeeping and must not
+   # be counted as an extra zero-P/L trade for the same ticket.
+   if details.get('pnl') is None:
+    continue
+   if event=='STOP_EXIT':
+    if login is not None:
+     close_tag=details.get('account_login')
+     try: close_tag=int(close_tag) if close_tag is not None else None
+     except (TypeError,ValueError): close_tag=None
+     if close_tag is not None and close_tag!=login:
+      continue
+   opened=opens.get(ticket)
+   if login is not None and opened is None:
+    continue
+   open_details=(opened[1] if opened else {})
+   strategy=str(open_details.get('strategy') or details.get('strategy') or 'unknown')
+   regime=str(open_details.get('regime') or details.get('regime') or 'UNKNOWN').upper()
+   symbol=str(symbol or (opened[0] if opened else ''))
+   pnl=float(details.get('pnl') or 0)
+   key=(strategy,symbol,regime)
+   g=groups.setdefault(key,{'trades':0,'wins':0,'losses':0,'gross_win':0.0,
+                            'gross_loss':0.0,'net':0.0,'r_sum':0.0,'r_count':0,
+                            'mfe':[],'mae':[]})
+   g['trades']+=1
+   if pnl>0:
+    g['wins']+=1;g['gross_win']+=pnl
+   elif pnl<0:
+    g['losses']+=1;g['gross_loss']+=abs(pnl)
+   g['net']+=pnl
+   try:
+    r=details.get('r_multiple')
+    if r is not None:
+     g['r_sum']+=float(r);g['r_count']+=1
+   except (TypeError,ValueError): pass
+   try:
+    mfe=details.get('mfe_r');mae=details.get('mae_r')
+    if mfe is not None: g['mfe'].append(float(mfe))
+    if mae is not None: g['mae'].append(float(mae))
+   except (TypeError,ValueError): pass
+  out=[]
+  for (strategy,symbol,regime),g in groups.items():
+   trades=g['trades']
+   pf=(g['gross_win']/g['gross_loss']) if g['gross_loss']>0 else (999.0 if g['gross_win']>0 else 0.0)
+   out.append({
+    'strategy':strategy,'symbol':symbol,'regime':regime,
+    'trades':trades,'wins':g['wins'],'losses':g['losses'],
+    'win_rate':(g['wins']/trades*100.0) if trades else 0.0,
+    'net':g['net'],'profit_factor':pf,
+    'expectancy':(g['net']/trades) if trades else 0.0,
+    'avg_r':(g['r_sum']/g['r_count']) if g['r_count'] else None,
+    'avg_win':(g['gross_win']/g['wins']) if g['wins'] else 0.0,
+    'avg_loss':(g['gross_loss']/g['losses']) if g['losses'] else 0.0,
+    'avg_mfe_r':(sum(g['mfe'])/len(g['mfe'])) if g['mfe'] else None,
+    'avg_mae_r':(sum(g['mae'])/len(g['mae'])) if g['mae'] else None,
+   })
+  out.sort(key=lambda row:(row['net'],row['trades']),reverse=True)
+  return out[:window]

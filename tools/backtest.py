@@ -1,0 +1,473 @@
+"""Bar-replay backtester that shares the live strategy pipeline.
+
+Design goals
+------------
+* No look-ahead: every decision is produced from bars that are *closed* at the
+  decision instant.  Entries fill at the next bar's open.
+* Same brain: strategies, regime detector and registry are the production
+  classes; only the broker is simulated.
+* Realistic frictions: per-bar spread from MT5 history (fallback to a
+  configurable constant), half-spread crossing on entry and exit, SL before TP
+  when both are touched inside the same bar (conservative).
+* Walk-forward: trades are split into in-sample / out-of-sample by entry time.
+
+Run with the Wine Python that owns MetaTrader5::
+
+    python.exe tools\\backtest.py --symbols XAUUSD,EURUSD --days 400 --walk-forward 0.6
+
+The module is import-safe without MetaTrader5 so Linux unit tests can drive
+``replay_m1`` with synthetic bars.
+"""
+
+from __future__ import annotations
+
+import argparse
+import bisect
+import json
+import os
+import sys
+import time
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from core.models import Regime, Side
+from core.regime import RegimeDetector
+from core.strategy_base import MarketContext, session_of
+from core.strategy_registry import StrategyRegistry, symbol_class
+
+try:  # pragma: no cover - Windows/Wine only
+    import MetaTrader5 as mt5
+except Exception:  # pragma: no cover
+    mt5 = None
+
+TF_SECONDS = {'M1': 60, 'M5': 300, 'M15': 900, 'H1': 3600, 'H4': 14400, 'D1': 86400, 'W1': 604800}
+WINDOW = {'M1': 400, 'M5': 320, 'M15': 260, 'H1': 240, 'H4': 200, 'D1': 160, 'W1': 120}
+
+
+class _Tick:
+    __slots__ = ('bid', 'ask', 'time', 'time_msc', 'volume', 'volume_real')
+
+    def __init__(self, bid, ask, epoch):
+        self.bid = bid
+        self.ask = ask
+        self.time = epoch
+        self.time_msc = int(epoch * 1000)
+        self.volume = 0
+        self.volume_real = 0.0
+
+
+class _Info:
+    __slots__ = ('symbol', 'point', 'digits', 'spread', 'trade_stops_level',
+                 'trade_freeze_level', 'volume_min', 'volume_max', 'volume_step')
+
+    def __init__(self, symbol, point, digits, spread_points=0, stops_level=0):
+        self.symbol = symbol
+        self.point = point
+        self.digits = digits
+        self.spread = spread_points
+        self.trade_stops_level = stops_level
+        self.trade_freeze_level = stops_level
+        self.volume_min = 0.01
+        self.volume_max = 100.0
+        self.volume_step = 0.01
+
+
+def aggregate(m1, tf_seconds):
+    """Resample M1 bars into a higher timeframe using bucket starts."""
+    buckets = {}
+    order = []
+    for bar in m1:
+        t = int(bar['time'])
+        key = t - (t % tf_seconds)
+        row = buckets.get(key)
+        if row is None:
+            row = buckets[key] = {'time': key, 'open': bar['open'], 'high': bar['high'],
+                                  'low': bar['low'], 'close': bar['close'],
+                                  'tick_volume': bar.get('tick_volume', 0),
+                                  'spread': bar.get('spread', 0)}
+            order.append(key)
+        else:
+            row['high'] = max(row['high'], bar['high'])
+            row['low'] = min(row['low'], bar['low'])
+            row['close'] = bar['close']
+            row['tick_volume'] += bar.get('tick_volume', 0)
+            row['spread'] = bar.get('spread', row['spread'])
+    rows = [buckets[key] for key in order]
+    closes = [row['time'] + tf_seconds for row in rows]
+    return rows, closes
+
+
+def _frames_at(frames, ends, i, t):
+    """Return the frames dict with only bars closed at decision time."""
+    closed_at = t + 60  # the M1 bar that just closed
+    out = {}
+    for name, rows in frames.items():
+        if name == 'M1':
+            out[name] = list(rows[max(0, i + 1 - WINDOW[name]):i + 1])
+            continue
+        idx = bisect.bisect_right(ends[name], closed_at)
+        out[name] = list(rows[max(0, idx - WINDOW[name]):idx])
+    return out
+
+
+def replay_m1(symbol, m1, point, digits, default_spread_points=15.0,
+              regime_detector=None, registry=None, max_hold_guard_minutes=240.0,
+              commission_points=0.0, enforce_anti_chase=True, verbose=False):
+    """Replay a list of M1 dict bars. Returns (trades, scans)."""
+    frames = {'M1': m1}
+    ends = {}
+    for name in ('M5', 'M15', 'H1', 'H4', 'D1', 'W1'):
+        rows, closed = aggregate(m1, TF_SECONDS[name])
+        frames[name] = rows
+        ends[name] = closed
+    detector = regime_detector or RegimeDetector(None)
+    registry = registry or StrategyRegistry(None, None)
+    trades = []
+    scans = 0
+    i = 60
+    n = len(m1)
+    while i < n - 2:
+        bar = m1[i]
+        t = int(bar['time'])
+        ctx_frames = _frames_at(frames, ends, i, t)
+        if len(ctx_frames['M15']) < 60 or len(ctx_frames['M1']) < 30:
+            i += 1
+            continue
+        spread_points = float(bar.get('spread') or 0) or float(default_spread_points)
+        spread = spread_points * point
+        mid = float(bar['close'])
+        tick = _Tick(mid - spread / 2.0, mid + spread / 2.0, t + 60)
+        info = _Info(symbol, point, digits, spread_points)
+        ctx = MarketContext(symbol, tick, info, ctx_frames, session_of(t + 60), Regime.NO_TRADE, {})
+        result = detector.detect(ctx)
+        ctx.regime = result.regime
+        ctx.regime_detail = {**result.detail, 'direction': result.direction,
+                             'strength': result.strength, 'blocked': result.blocked}
+        scans += 1
+        if result.blocked:
+            i += 1
+            continue
+        try:
+            decision, _ = registry.evaluate(ctx)
+        except Exception:
+            i += 1
+            continue
+        if not decision or decision.get('decision') != 'SIGNAL':
+            i += 1
+            continue
+        trade = _simulate_trade(symbol, m1, i, decision, point, digits,
+                                spread_points, max_hold_guard_minutes,
+                                commission_points=commission_points,
+                                enforce_anti_chase=enforce_anti_chase)
+        if trade:
+            trades.append(trade)
+            i = max(i + 1, trade['exit_index'])
+        else:
+            i += 1
+    return trades, scans
+
+
+def _simulate_trade(symbol, m1, signal_index, decision, point, digits, spread_points,
+                    max_hold_guard_minutes, commission_points=0.0,
+                    enforce_anti_chase=True):
+    side = Side(str(decision['side']).upper())
+    sl = float(decision.get('sl_price') or 0)
+    tp = float(decision.get('tp_price') or 0)
+    tp1 = float(decision.get('tp1') or 0)
+    if sl <= 0 or tp <= 0 or signal_index + 1 >= len(m1):
+        return None
+    entry_bar = m1[signal_index + 1]
+    spread = (float(entry_bar.get('spread') or 0) or spread_points) * point
+    open_price = float(entry_bar['open'])
+    entry = open_price + spread / 2.0 if side == Side.BUY else open_price - spread / 2.0
+    risk = abs(entry - sl)
+    if risk <= 0:
+        return None
+    # Production anti-chase guard: the plan was built on the signal-bar close,
+    # so a committed open that has already run away from it is skipped.
+    planned = float(decision.get('entry') or 0)
+    if enforce_anti_chase and planned > 0:
+        drift = abs(entry - planned)
+        limit = max(spread * 6.0, point * 12.0, risk * 0.35)
+        if drift > limit:
+            return None
+    # Round-turn commission expressed in price points (entry+exit are paid).
+    cost_r = (2.0 * commission_points * point) / risk if risk > 0 else 0.0
+    management = decision.get('management') or {}
+    partial_pct = float(management.get('partial_at_tp1', 0.0) or 0.0)
+    lock_be = bool(management.get('tp1_lock_to_breakeven', True))
+    protection_pct = float(management.get('protection_pct', 40.0) or 0.0)
+    trail_trigger = float(management.get('trailing_trigger_pct', 70.0) or 0.0)
+    trail_gap = float(management.get('trailing_gap_pct', 8.0) or 0.0)
+    max_hold = float(management.get('max_hold_minutes', 0) or 0) or max_hold_guard_minutes
+    target_distance = abs(tp - entry)
+
+    stop = sl
+    remaining = 1.0
+    realized_r = 0.0
+    tp1_done = False
+    be_done = False
+    protection_done = False
+    trailing_done = False
+    best_price = entry
+    worst_price = entry
+    exit_index = signal_index + 1
+    exit_reason = 'MAX_DURATION'
+    mfe_r = 0.0
+    mae_r = 0.0
+    deadline = int(entry_bar['time']) + max_hold * 60
+
+    for j in range(signal_index + 1, len(m1)):
+        bar = m1[j]
+        high = float(bar['high'])
+        low = float(bar['low'])
+        close = float(bar['close'])
+        bar_spread = (float(bar.get('spread') or 0) or spread_points) * point
+        if side == Side.BUY:
+            best_price = max(best_price, high - bar_spread / 2.0)
+            worst_price = min(worst_price, low + bar_spread / 2.0)
+        else:
+            best_price = min(best_price, low + bar_spread / 2.0)
+            worst_price = max(worst_price, high - bar_spread / 2.0)
+        favorable = (best_price - entry) if side == Side.BUY else (entry - best_price)
+        adverse = (worst_price - entry) if side == Side.BUY else (entry - worst_price)
+        mfe_r = max(mfe_r, favorable / risk)
+        mae_r = min(mae_r, adverse / risk)
+
+        if tp1 and partial_pct > 0 and not tp1_done:
+            hit = high >= tp1 if side == Side.BUY else low <= tp1
+            if hit:
+                frac = min(0.9, max(0.0, partial_pct / 100.0))
+                realized_r += frac * (((tp1 - entry) if side == Side.BUY
+                                       else (entry - tp1)) / risk)
+                remaining -= frac
+                tp1_done = True
+                if lock_be:
+                    buffer = max(spread * 1.5, risk * 0.05)
+                    candidate = entry + buffer if side == Side.BUY else entry - buffer
+                    stop = max(stop, candidate) if side == Side.BUY else min(stop, candidate)
+                    be_done = True
+
+        progress = favorable / target_distance if target_distance > 0 else 0.0
+        if not protection_done and protection_pct > 0 and progress >= protection_pct / 100.0:
+            buffer = max(spread * 1.5, point * 3.0)
+            candidate = entry - buffer if side == Side.BUY else entry + buffer
+            stop = max(stop, candidate) if side == Side.BUY else min(stop, candidate)
+            protection_done = True
+        if not tp1 and not be_done and favorable >= risk:
+            buffer = max(spread * 1.5, risk * 0.05)
+            candidate = entry + buffer if side == Side.BUY else entry - buffer
+            stop = max(stop, candidate) if side == Side.BUY else min(stop, candidate)
+            be_done = True
+        if protection_done and progress >= trail_trigger / 100.0 and target_distance > 0:
+            gap = target_distance * (trail_gap / 100.0)
+            candidate = best_price - gap if side == Side.BUY else best_price + gap
+            stop = max(stop, candidate) if side == Side.BUY else min(stop, candidate)
+            trailing_done = True
+
+        stop_hit = low <= stop if side == Side.BUY else high >= stop
+        tp_hit = high >= tp if side == Side.BUY else low <= tp
+        if stop_hit:
+            exit_price = stop
+            exit_price = exit_price - bar_spread / 2.0 if side == Side.BUY else exit_price + bar_spread / 2.0
+            realized_r += remaining * (((exit_price - entry) if side == Side.BUY
+                                        else (entry - exit_price)) / risk)
+            remaining = 0.0
+            exit_index = j
+            if be_done and ((side == Side.BUY and stop >= entry) or (side == Side.SELL and stop <= entry)):
+                exit_reason = 'TRAILING_EXIT' if trailing_done else 'BREAKEVEN_EXIT'
+            elif trailing_done:
+                exit_reason = 'TRAILING_EXIT'
+            elif protection_done:
+                exit_reason = 'PROTECTED_EXIT'
+            else:
+                exit_reason = 'SL'
+            break
+        if tp_hit:
+            exit_price = tp
+            exit_price = exit_price - bar_spread / 2.0 if side == Side.BUY else exit_price + bar_spread / 2.0
+            realized_r += remaining * (((exit_price - entry) if side == Side.BUY
+                                        else (entry - exit_price)) / risk)
+            remaining = 0.0
+            exit_index = j
+            exit_reason = 'TP1_PARTIAL_EXIT' if tp1_done else 'TP'
+            break
+        if int(bar['time']) >= deadline:
+            exit_price = close - bar_spread / 2.0 if side == Side.BUY else close + bar_spread / 2.0
+            realized_r += remaining * (((exit_price - entry) if side == Side.BUY
+                                        else (entry - exit_price)) / risk)
+            remaining = 0.0
+            exit_index = j
+            exit_reason = 'MAX_DURATION'
+            break
+
+    if remaining > 0:
+        bar = m1[min(exit_index, len(m1) - 1)]
+        close = float(bar['close'])
+        bar_spread = (float(bar.get('spread') or 0) or spread_points) * point
+        exit_price = close - bar_spread / 2.0 if side == Side.BUY else close + bar_spread / 2.0
+        realized_r += remaining * (((exit_price - entry) if side == Side.BUY
+                                    else (entry - exit_price)) / risk)
+
+    return {
+        'symbol': symbol,
+        'strategy': decision.get('strategy_id'),
+        'symbol_class': symbol_class(symbol),
+        'regime': str(decision.get('regime') or 'UNKNOWN'),
+        'side': side.value,
+        'entry_time': int(entry_bar['time']),
+        'exit_time': int(m1[min(exit_index, len(m1) - 1)]['time']),
+        'entry': entry,
+        'sl': sl,
+        'tp': tp,
+        'tp1': tp1 or None,
+        'exit_reason': exit_reason,
+        'r_multiple': realized_r,
+        'r_multiple_net': realized_r - cost_r,
+        'cost_r': cost_r,
+        'mfe_r': mfe_r,
+        'mae_r': mae_r,
+        'confidence': float(decision.get('confidence', 0)),
+        'reason_code': decision.get('reason_code'),
+        'risk_price': risk,
+        'exit_index': exit_index,
+    }
+
+
+def _stats(trades, risk_cash=100.0):
+    n = len(trades)
+    if not n:
+        return {'trades': 0, 'wins': 0, 'losses': 0, 'win_rate': 0.0, 'net': 0.0,
+                'profit_factor': 0.0, 'expectancy': 0.0, 'avg_win': 0.0, 'avg_loss': 0.0,
+                'avg_r': 0.0, 'max_drawdown': 0.0, 'avg_mfe_r': 0.0, 'avg_mae_r': 0.0}
+    # Use net-of-commission R when the trade record carries it, so reported
+    # expectancy reflects trading costs.  Older records fall back to gross R.
+    rs = [float(t.get('r_multiple_net', t['r_multiple'])) for t in trades]
+    pnls = [r * risk_cash for r in rs]
+    wins = [r for r in rs if r > 0]
+    losses = [r for r in rs if r < 0]
+    gross_win = sum(r for r in rs if r > 0) * risk_cash
+    gross_loss = -sum(r for r in rs if r < 0) * risk_cash
+    equity = 0.0
+    peak = 0.0
+    max_dd = 0.0
+    for pnl in pnls:
+        equity += pnl
+        peak = max(peak, equity)
+        max_dd = max(max_dd, peak - equity)
+    return {
+        'trades': n,
+        'wins': len(wins),
+        'losses': len(losses),
+        'win_rate': len(wins) / n * 100.0,
+        'net': sum(pnls),
+        'profit_factor': (gross_win / gross_loss) if gross_loss > 0 else (999.0 if gross_win > 0 else 0.0),
+        'expectancy': sum(pnls) / n,
+        'avg_win': (sum(wins) / len(wins) * risk_cash) if wins else 0.0,
+        'avg_loss': (-sum(losses) / len(losses) * risk_cash) if losses else 0.0,
+        'avg_r': sum(rs) / n,
+        'max_drawdown': max_dd,
+        'avg_mfe_r': sum(t['mfe_r'] for t in trades) / n,
+        'avg_mae_r': sum(t['mae_r'] for t in trades) / n,
+    }
+
+
+def grouped_report(trades, risk_cash=100.0, min_trades=1):
+    groups = defaultdict(list)
+    for t in trades:
+        groups[(t['strategy'], t['symbol'], t['regime'])].append(t)
+    rows = []
+    for (strategy, symbol, regime), items in groups.items():
+        if len(items) < min_trades:
+            continue
+        row = _stats(items, risk_cash)
+        row.update({'strategy': strategy, 'symbol': symbol, 'regime': regime})
+        rows.append(row)
+    rows.sort(key=lambda r: (r['net'], r['trades']), reverse=True)
+    return rows
+
+
+def walk_forward_report(trades, fraction=0.6, risk_cash=100.0):
+    ordered = sorted(trades, key=lambda t: t['entry_time'])
+    split = int(len(ordered) * fraction)
+    is_trades, oos_trades = ordered[:split], ordered[split:]
+    return {
+        'in_sample': _stats(is_trades, risk_cash),
+        'out_of_sample': _stats(oos_trades, risk_cash),
+        'in_sample_count': len(is_trades),
+        'out_of_sample_count': len(oos_trades),
+    }
+
+
+def _load_m1(symbol, days):
+    if mt5 is None:
+        raise RuntimeError('MetaTrader5 is not importable in this interpreter')
+    if not mt5.initialize():
+        raise RuntimeError(f'MT5 initialize failed: {mt5.last_error()}')
+    if not mt5.symbol_select(symbol, True):
+        raise RuntimeError(f'symbol_select failed for {symbol}')
+    end = datetime.now(timezone.utc) + timedelta(minutes=5)
+    start = end - timedelta(days=int(days))
+    raw = mt5.copy_rates_range(symbol, mt5.TIMEFRAME_M1, start, end)
+    if raw is None or len(raw) == 0:
+        raise RuntimeError(f'no M1 rates for {symbol} ({mt5.last_error()})')
+    rows = [dict(zip(raw.dtype.names, row)) for row in raw]
+    info = mt5.symbol_info(symbol)
+    point = float(getattr(info, 'point', 0) or 0)
+    digits = int(getattr(info, 'digits', 5) or 5)
+    if point <= 0:
+        raise RuntimeError(f'invalid point size for {symbol}')
+    default_spread = float(getattr(info, 'spread', 0) or 0) or 15.0
+    return rows, point, digits, default_spread
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description='Mtbot deterministic strategy backtester')
+    parser.add_argument('--symbols', default='XAUUSD,EURUSD')
+    parser.add_argument('--days', type=int, default=400)
+    parser.add_argument('--walk-forward', type=float, default=0.6)
+    parser.add_argument('--risk-cash', type=float, default=100.0)
+    parser.add_argument('--commission-points', type=float, default=0.0,
+                        help='round-turn commission expressed in price points')
+    parser.add_argument('--min-trades', type=int, default=5)
+    parser.add_argument('--output', default='')
+    args = parser.parse_args(argv)
+
+    all_trades = []
+    per_symbol = {}
+    for symbol in [s.strip().upper() for s in args.symbols.split(',') if s.strip()]:
+        rows, point, digits, default_spread = _load_m1(symbol, args.days)
+        trades, scans = replay_m1(symbol, rows, point, digits,
+                                  default_spread_points=default_spread,
+                                  commission_points=args.commission_points)
+        per_symbol[symbol] = {'bars': len(rows), 'scans': scans, 'trades': len(trades),
+                              'stats': _stats(trades, args.risk_cash)}
+        all_trades.extend(trades)
+        print(f'{symbol}: bars={len(rows)} scans={scans} trades={len(trades)} '
+              f'net={per_symbol[symbol]["stats"]["net"]:.2f} '
+              f'PF={per_symbol[symbol]["stats"]["profit_factor"]:.2f}')
+
+    report = {
+        'generated_at': time.time(),
+        'days': args.days,
+        'risk_cash_per_trade': args.risk_cash,
+        'overall': _stats(all_trades, args.risk_cash),
+        'per_symbol': per_symbol,
+        'by_combo': grouped_report(all_trades, args.risk_cash, args.min_trades),
+        'walk_forward': walk_forward_report(all_trades, args.walk_forward, args.risk_cash),
+        'trades': all_trades,
+    }
+    if args.output:
+        with open(args.output, 'w', encoding='utf-8') as fh:
+            json.dump(report, fh, ensure_ascii=False, indent=2)
+        print(f'wrote {args.output}')
+    else:
+        print(json.dumps({k: v for k, v in report.items() if k != 'trades'},
+                         ensure_ascii=False, indent=2, default=str))
+    return report
+
+
+if __name__ == '__main__':  # pragma: no cover
+    main()

@@ -31,7 +31,7 @@ class Settings(BaseSettings):
     app_mode: str = 'DEMO'
 
     spread_sample_size: int = 60
-    max_spread_multiplier: float = 1.8
+    max_spread_multiplier: float = 2.5
     max_spread_points: float = 0.0
     max_slippage_points: int = 10
     slippage_atr_fraction: float = 0.15
@@ -40,15 +40,8 @@ class Settings(BaseSettings):
     poll_interval_ms: int = 150
     max_tick_age_seconds: float = 15.0
 
-    ai_max_error_streak: int = 8
-    ai_max_429_streak: int = 5
-    ai_429_cooldown_seconds: int = 90
-    ai_signal_ttl_seconds: int = 45
-    ai_min_gap_seconds: int = 20
-    ai_global_min_gap_seconds: int = 3
-    ai_self_consistency_low: int = 68
-    ai_self_consistency_high: int = 82
-    ai_provider_fallback_enabled: bool = True
+    # Optional AI cross-check (veto-only, disabled by default).
+    ai_crosscheck_enabled: bool = False
 
     execution_notice_max_entries: int = 2000
     reject_log_cache_size: int = 5000

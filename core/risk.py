@@ -18,7 +18,7 @@ class Risk:
 
   # Baseline uses recent spread history before the current tick.
   avg=(sum(q)/len(q)) if q else sp
-  base_lim=max(avg*settings.max_spread_multiplier,avg+1.0)
+  base_lim=max(avg*settings.max_spread_multiplier,avg+3.0)
 
   # Allow at most two 10% relaxations. Rejected quotes must not inflate the
   # baseline until an unusually wide spread becomes the new normal.

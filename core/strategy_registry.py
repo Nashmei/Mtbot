@@ -1,0 +1,400 @@
+"""Strategy x Symbol-Class x Regime selection and evidence-based gating.
+
+The registry owns three responsibilities:
+
+1. Instantiate the curated strategy pack.
+2. Filter candidates by ``StrategySpec`` eligibility (symbol/regime/timeframe)
+   and by the persisted per-combination evidence in :class:`ComboPerformance`.
+3. Select at most one entry per symbol by ranking eligible signals and
+   rejecting direction conflicts instead of guessing.
+
+Evidence is stored at two granularities:
+
+``strategy_id|SYMBOL|regime``      (exact symbol - authoritative)
+``strategy_id|SYMBOL_CLASS|regime`` (pooled class - fallback for new symbols)
+
+The exact-symbol row always wins when it has trades; the pooled class row only
+informs a symbol that has no evidence of its own yet.  A combination is
+disabled when it has enough closed trades and negative expectancy, or a poor
+profit factor and a meaningful sample.  Small samples only *penalise* ranking,
+never auto-disable.
+"""
+
+from __future__ import annotations
+
+import math
+import time
+
+from .strategy_pack import STRATEGY_CLASSES
+
+
+def symbol_class(symbol):
+    upper = str(symbol).upper()
+    if 'XAU' in upper or 'GOLD' in upper:
+        return 'GOLD'
+    if any(tag in upper for tag in ('US30', 'US100', 'NAS', 'SPX', 'GER', 'DAX', 'UK100', 'JP225',
+                                    'US500', 'USTEC', 'DE40', 'UK100')):
+        return 'INDEX'
+    return 'FX'
+
+
+class ComboPerformance:
+    """Persisted, account-scoped evidence for every strategy combination."""
+
+    def __init__(self, db):
+        self.db = db
+
+    @staticmethod
+    def key(strategy_id, symbol, regime):
+        return f'{strategy_id}|{str(symbol or "").upper()}|{str(regime or "NO_TRADE").upper()}'
+
+    @staticmethod
+    def class_key(strategy_id, symbol, regime):
+        return f'{strategy_id}|{symbol_class(symbol)}|{str(regime or "NO_TRADE").upper()}'
+
+    async def _all(self, login=None):
+        raw_key = 'combo_stats' if login is None else f'account:{int(login)}:combo_stats'
+        raw = await self.db.get(raw_key)
+        if not raw:
+            return {}
+        import json
+        try:
+            data = json.loads(raw)
+        except (TypeError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    @staticmethod
+    def _blank_row():
+        return {'trades': 0, 'wins': 0, 'losses': 0, 'gross_win': 0.0,
+                'gross_loss': 0.0, 'net': 0.0, 'sum_r': 0.0, 'r_count': 0}
+
+    @staticmethod
+    def _accumulate(row, pnl, r_multiple):
+        row['trades'] = int(row.get('trades', 0)) + 1
+        if pnl > 0:
+            row['wins'] = int(row.get('wins', 0)) + 1
+            row['gross_win'] = float(row.get('gross_win', 0.0)) + pnl
+        elif pnl < 0:
+            row['losses'] = int(row.get('losses', 0)) + 1
+            row['gross_loss'] = float(row.get('gross_loss', 0.0)) + abs(pnl)
+        row['net'] = float(row.get('net', 0.0)) + pnl
+        if r_multiple is not None:
+            try:
+                row['sum_r'] = float(row.get('sum_r', 0.0)) + float(r_multiple)
+                row['r_count'] = int(row.get('r_count', 0)) + 1
+            except (TypeError, ValueError):
+                pass
+        row['updated_at'] = time.time()
+        return row
+
+    async def record(self, strategy_id, symbol, regime, pnl, r_multiple=None, login=None):
+        import json
+        pnl = float(pnl or 0.0)
+        # The exact-symbol row is authoritative; the pooled class row is the
+        # fallback for symbols that have never traded this combination.
+        exact_key = self.key(strategy_id, symbol, regime)
+        class_key = self.class_key(strategy_id, symbol, regime)
+        # 1) account-scoped ledger (isolated per MT5 login)
+        stats = await self._all(login)
+        exact = self._accumulate(stats.get(exact_key) or self._blank_row(), pnl, r_multiple)
+        pooled = self._accumulate(stats.get(class_key) or self._blank_row(), pnl, r_multiple)
+        stats[exact_key] = exact
+        stats[class_key] = pooled
+        db_key = 'combo_stats' if login is None else f'account:{int(login)}:combo_stats'
+        await self.db.set(db_key, json.dumps(stats))
+        # 2) global research ledger: demo/backtest evidence follows the
+        # strategy, not the account, so a proven trial can be unlocked on a
+        # real account that has no history of its own yet.
+        if login is not None:
+            global_stats = await self._all(None)
+            g_exact = self._accumulate(global_stats.get(exact_key) or self._blank_row(),
+                                       pnl, r_multiple)
+            g_pooled = self._accumulate(global_stats.get(class_key) or self._blank_row(),
+                                        pnl, r_multiple)
+            global_stats[exact_key] = g_exact
+            global_stats[class_key] = g_pooled
+            await self.db.set('combo_stats', json.dumps(global_stats))
+        return exact
+
+    @staticmethod
+    def metrics(row):
+        trades = int((row or {}).get('trades', 0) or 0)
+        wins = int((row or {}).get('wins', 0) or 0)
+        gross_win = float((row or {}).get('gross_win', 0.0) or 0.0)
+        gross_loss = float((row or {}).get('gross_loss', 0.0) or 0.0)
+        net = float((row or {}).get('net', 0.0) or 0.0)
+        profit_factor = (gross_win / gross_loss) if gross_loss > 0 else (float('inf') if gross_win > 0 else 0.0)
+        expectancy = (net / trades) if trades else 0.0
+        win_rate = (wins / trades * 100.0) if trades else 0.0
+        r_count = int((row or {}).get('r_count', 0) or 0)
+        avg_r = (float((row or {}).get('sum_r', 0.0) or 0.0) / r_count) if r_count else None
+        return {
+            'trades': trades, 'wins': wins, 'win_rate': win_rate,
+            'net': net, 'profit_factor': profit_factor,
+            'expectancy': expectancy, 'avg_r': avg_r,
+        }
+
+    # -- gating --------------------------------------------------------
+    MIN_TRADES_DISABLE = 15
+    MIN_TRADES_PENALTY = 5
+    MIN_TRADES_WEAK_PF = 30
+    WEAK_PF = 1.15
+    DISABLE_PF = 1.05
+
+    TRADES_FIELD = 'trades'
+
+    @classmethod
+    def rows_for(cls, cache, strategy_id, symbol, regime):
+        """Return ``(exact_symbol_row, pooled_class_row)`` from a stats cache."""
+        cache = cache or {}
+        return (cache.get(cls.key(strategy_id, symbol, regime)),
+                cache.get(cls.class_key(strategy_id, symbol, regime)))
+
+    @classmethod
+    def _trades(cls, row):
+        try:
+            return int((row or {}).get(cls.TRADES_FIELD, 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    @classmethod
+    def effective_row(cls, exact, pooled):
+        """Pick the row that must be trusted for this exact symbol."""
+        if cls._trades(exact) > 0:
+            return exact, 'SYMBOL'
+        if cls._trades(pooled) > 0:
+            return pooled, 'SYMBOL_CLASS'
+        return None, 'NO_EVIDENCE'
+
+    @classmethod
+    def verdict_combined(cls, exact, pooled):
+        """Return ``(enabled, penalty, reason, source)``.
+
+        Symbol-level evidence is authoritative; pooled class evidence can
+        additionally *block* a combination (never unblock it) so a strategy
+        that fails across a whole asset class is not kept alive on a new
+        symbol by a lucky few trades.
+        """
+        penalty = 0.0
+        reason = 'NO_EVIDENCE'
+        enabled = True
+        source = 'NO_EVIDENCE'
+        for row, tag in ((exact, 'SYMBOL'), (pooled, 'SYMBOL_CLASS')):
+            if cls._trades(row) <= 0:
+                continue
+            row_enabled, row_penalty, row_reason = cls.verdict(row)
+            penalty = max(penalty, row_penalty)
+            if not row_enabled:
+                return False, penalty, f'{row_reason}@{tag}', tag
+            enabled, reason, source = True, f'{row_reason}@{tag}', tag
+        return enabled, penalty, reason, source
+    @classmethod
+    def verdict(cls, row):
+        """Return ``(enabled, penalty_points, reason)``."""
+        metrics = cls.metrics(row)
+        trades = metrics['trades']
+        if trades == 0:
+            return True, 0.0, 'NO_EVIDENCE'
+        if trades >= cls.MIN_TRADES_DISABLE:
+            if metrics['expectancy'] <= 0:
+                return False, 0.0, 'NEGATIVE_EXPECTANCY'
+            if metrics['profit_factor'] < cls.DISABLE_PF:
+                return False, 0.0, 'PROFIT_FACTOR_BELOW_DISABLE'
+        if trades >= cls.MIN_TRADES_WEAK_PF and metrics['profit_factor'] < cls.WEAK_PF:
+            return False, 0.0, 'WEAK_EDGE_LARGE_SAMPLE'
+        if trades >= cls.MIN_TRADES_PENALTY:
+            if metrics['expectancy'] <= 0:
+                return True, 12.0, 'NEGATIVE_EARLY'
+            if metrics['profit_factor'] < cls.WEAK_PF:
+                return True, 6.0, 'WEAK_EDGE'
+        return True, 0.0, 'OK'
+
+    @classmethod
+    def confidence_floor(cls, row):
+        """Per-combination confidence floor implied by observed evidence."""
+        trades = cls._trades(row)
+        if trades <= 0:
+            return 0.0
+        metrics = cls.metrics(row)
+        if metrics['expectancy'] <= 0:
+            return 8.0 if trades < cls.MIN_TRADES_DISABLE else 0.0
+        if metrics['profit_factor'] < cls.WEAK_PF:
+            return 4.0
+        return 0.0
+
+
+class StrategyRegistry:
+    # Tier floors: strategies with the strongest structural rationale (A) need
+    # slightly less confidence than the weakest (C).
+    TIER_MIN_CONFIDENCE = {'A': 62.0, 'B': 65.0, 'C': 68.0}
+    # Candidate (trial) strategies stay disabled until this many closed trades
+    # exist on the exact strategy x symbol-class x regime combination and the
+    # combination is profitable.
+    TRIAL_MIN_TRADES = 10
+    TRIAL_MIN_PROFIT_FACTOR = 1.15
+
+    def __init__(self, settings=None, db=None):
+        self.settings = settings
+        self.strategies = [cls(settings) for cls in STRATEGY_CLASSES]
+        self.by_id = {s.spec.id: s for s in self.strategies}
+        self.performance = ComboPerformance(db) if db is not None else None
+        self._cache = {}
+        self._cache_at = 0.0
+        self._cache_ttl = 60.0
+        # Trial (candidate) strategies may run on demo/backtest to collect the
+        # evidence that then unlocks them for real accounts.  The engine
+        # clears this flag on real accounts.
+        self.allow_trials = True
+
+    # -- evidence cache ------------------------------------------------
+    async def refresh(self, login=None, force=False):
+        if self.performance is None:
+            return
+        now = time.time()
+        if not force and (now - self._cache_at) < self._cache_ttl:
+            return
+        self._cache = await self.performance._all(login)
+        self._cache_at = now
+
+    def combo_enabled(self, strategy, ctx):
+        trial = bool(getattr(strategy.spec, 'trial', False))
+        if self.performance is None or not self._cache:
+            # Approved A/B strategies may trade with no evidence yet;
+            # candidates only run where trials are allowed.
+            return (not trial) or self.allow_trials
+        exact, pooled = ComboPerformance.rows_for(
+            self._cache, strategy.spec.id, ctx.symbol, ctx.regime.value)
+        enabled, _, _, _ = ComboPerformance.verdict_combined(exact, pooled)
+        if not enabled:
+            return False
+        if trial:
+            row, _ = ComboPerformance.effective_row(exact, pooled)
+            metrics = ComboPerformance.metrics(row)
+            proven = (metrics['trades'] >= self.TRIAL_MIN_TRADES
+                      and metrics['expectancy'] > 0
+                      and metrics['profit_factor'] >= self.TRIAL_MIN_PROFIT_FACTOR)
+            if not proven:
+                return self.allow_trials
+        return True
+
+    def combo_penalty(self, strategy, ctx):
+        if self.performance is None or not self._cache:
+            return 0.0
+        exact, pooled = ComboPerformance.rows_for(
+            self._cache, strategy.spec.id, ctx.symbol, ctx.regime.value)
+        _, penalty, _, _ = ComboPerformance.verdict_combined(exact, pooled)
+        return penalty
+
+    def evidence_floor(self, strategy, ctx):
+        """Extra confidence a *marginal* combination must clear to trade.
+
+        This is the mechanism that lets a combination the evidence is
+        unimpressed by keep shrinking its own exposure instead of being
+        force-disabled from one lucky/unlucky batch.
+        """
+        if self.performance is None or not self._cache:
+            return 0.0
+        exact, pooled = ComboPerformance.rows_for(
+            self._cache, strategy.spec.id, ctx.symbol, ctx.regime.value)
+        row, _ = ComboPerformance.effective_row(exact, pooled)
+        return ComboPerformance.confidence_floor(row)
+    def combo_row(self, strategy_id, symbol, regime):
+        exact, pooled = ComboPerformance.rows_for(self._cache, strategy_id, symbol, regime)
+        row, source = ComboPerformance.effective_row(exact, pooled)
+        if row is None:
+            return None
+        out = dict(row)
+        out['evidence_source'] = source
+        return out
+
+    # -- candidate evaluation -----------------------------------------
+    def evaluate(self, ctx):
+        """Return ``(decision, candidates)`` for one symbol.
+
+        ``decision`` is the winning SIGNAL decision (or ``None``) and
+        ``candidates`` is the full diagnostic list.
+        """
+        evaluated = []
+        signals = []
+        for strategy in self.strategies:
+            ok, reason = strategy.eligible(ctx, self)
+            if not ok:
+                evaluated.append({'strategy': strategy.spec.id, 'decision': 'SKIP', 'reason_code': reason})
+                continue
+            try:
+                decision = strategy.analyze(ctx)
+            except Exception as exc:  # a broken strategy must never kill the engine
+                evaluated.append({'strategy': strategy.spec.id, 'decision': 'ERROR',
+                                  'reason_code': 'STRATEGY_EXCEPTION', 'reason': repr(exc)})
+                continue
+            decision.setdefault('strategy_id', strategy.spec.id)
+            decision['symbol_class'] = symbol_class(ctx.symbol)
+            if decision.get('decision') == 'SIGNAL':
+                # A strategy owns its own minimum quality bar.  Signals below
+                # the spec threshold are never entered even if the account
+                # threshold is lower.
+                required = max(float(strategy.spec.min_confidence),
+                               self.TIER_MIN_CONFIDENCE.get(strategy.spec.tier, 65.0))
+                if float(decision.get('confidence', 0)) < required:
+                    decision['decision'] = 'WAIT'
+                    decision['reason_code'] = 'BELOW_STRATEGY_CONFIDENCE'
+                    decision['required_confidence'] = required
+                    decision['side'] = 'NONE'
+                    evaluated.append(decision)
+                    continue
+                penalty = self.combo_penalty(strategy, ctx)
+                floor = self.evidence_floor(strategy, ctx)
+                confidence = float(decision.get('confidence', 0)) - penalty
+                decision['confidence_raw'] = float(decision.get('confidence', 0))
+                decision['combo_penalty'] = penalty
+                decision['evidence_floor'] = floor
+                if confidence < floor:
+                    decision['decision'] = 'WAIT'
+                    decision['reason_code'] = 'COMBO_EVIDENCE_FLOOR'
+                    decision['required_confidence'] = floor
+                    decision['side'] = 'NONE'
+                    decision['confidence'] = max(0.0, confidence)
+                    evaluated.append(decision)
+                    continue
+                decision['confidence'] = max(0.0, confidence)
+                if 'signal_bar' not in decision:
+                    last_bar = ctx.last_closed('M1') or {}
+                    try:
+                        decision['signal_bar'] = int(float(last_bar.get('time') or 0)) // 60
+                    except (TypeError, ValueError):
+                        decision['signal_bar'] = 0
+                if 'bar_time' not in decision:
+                    last_bar = ctx.last_closed('M1') or {}
+                    try:
+                        decision['bar_time'] = int(float(last_bar.get('time') or 0))
+                    except (TypeError, ValueError):
+                        decision['bar_time'] = 0
+                signals.append((strategy, decision))
+            evaluated.append(decision)
+
+        if not signals:
+            return None, evaluated
+
+        signals.sort(key=lambda item: float(item[1].get('confidence', 0)), reverse=True)
+        top_confidence = float(signals[0][1].get('confidence', 0))
+        # Correlated opposite-direction conflict at equal confidence -> stand down.
+        tied = [s for s in signals if abs(float(s[1].get('confidence', 0)) - top_confidence) < 1e-9]
+        directions = {s[1].get('side') for s in tied}
+        if len(directions) > 1:
+            return {'decision': 'WAIT', 'reason_code': 'TOP_CONFIDENCE_DIRECTION_TIE',
+                    'reason': 'Conflicting strategies at equal confidence',
+                    'confidence': top_confidence,
+                    'sources': [s[0].spec.id for s in tied]}, evaluated
+        return signals[0][1], evaluated
+
+    def describe(self):
+        return [
+            {
+                'id': s.spec.id, 'name': s.spec.name, 'family': s.spec.family,
+                'tier': s.spec.tier, 'symbols': list(s.spec.symbols),
+                'regimes': list(s.spec.regimes), 'forbidden': list(s.spec.forbidden),
+                'timeframes': list(s.spec.timeframes), 'indicators': list(s.spec.indicators),
+            }
+            for s in self.strategies
+        ]

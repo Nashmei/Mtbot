@@ -137,7 +137,20 @@ class MT5Gateway:
         }
 
     def tick(self, s):
-        return mt5.symbol_info_tick(s)
+        # MT5/Wine may transiently return None/zero quotes even while the
+        # terminal is connected. Hydrate/select once and absorb short gaps
+        # here so every caller gets the same validated quote behaviour.
+        last = None
+        for attempt in range(5):
+            x = mt5.symbol_info_tick(s)
+            if x is not None:
+                last = x
+                if float(getattr(x, 'bid', 0) or 0) > 0 and float(getattr(x, 'ask', 0) or 0) > float(getattr(x, 'bid', 0) or 0):
+                    return x
+            if attempt == 0:
+                mt5.symbol_select(s, True)
+            time.sleep(0.08)
+        return last
 
     def info(self, s):
         x = mt5.symbol_info(s)
@@ -196,6 +209,15 @@ class MT5Gateway:
 
     def rates_h1(self, s, count=200):
         return self.rates(s, mt5.TIMEFRAME_H1, count)
+
+    def rates_h4(self, s, count=200):
+        return self.rates(s, mt5.TIMEFRAME_H4, count)
+
+    def rates_d1(self, s, count=200):
+        return self.rates(s, mt5.TIMEFRAME_D1, count)
+
+    def rates_w1(self, s, count=200):
+        return self.rates(s, mt5.TIMEFRAME_W1, count)
 
     def symbols(self):
         return mt5.symbols_get() or ()
@@ -260,7 +282,32 @@ class MT5Gateway:
     def modify(self, ticket, symbol, sl, tp):
         return mt5.order_send({'action': mt5.TRADE_ACTION_SLTP, 'position': ticket, 'symbol': symbol, 'sl': sl, 'tp': tp})
 
-    def close(self, p):
+    def close_partial(self, p, volume, deviation=None):
+        t = self.tick(p.symbol)
+        info = self.info(p.symbol)
+        filling = self.filling_for(info) if info else None
+        if not t or not info or filling is None:
+            return None
+        volume = float(volume)
+        if volume <= 0 or volume >= float(p.volume):
+            return None
+        side = mt5.ORDER_TYPE_SELL if p.type == mt5.POSITION_TYPE_BUY else mt5.ORDER_TYPE_BUY
+        price = t.bid if side == mt5.ORDER_TYPE_SELL else t.ask
+        return mt5.order_send({
+            'action': mt5.TRADE_ACTION_DEAL,
+            'position': p.ticket,
+            'symbol': p.symbol,
+            'volume': volume,
+            'type': side,
+            'price': price,
+            'deviation': int(deviation if deviation is not None else settings.max_slippage_points),
+            'magic': 4009,
+            'comment': 'TGSCALP_TP1',
+            'type_time': mt5.ORDER_TIME_GTC,
+            'type_filling': filling
+        })
+
+    def close(self, p, deviation=None):
         t = self.tick(p.symbol)
         info = self.info(p.symbol)
         filling = self.filling_for(info) if info else None
@@ -275,7 +322,7 @@ class MT5Gateway:
             'volume': p.volume,
             'type': side,
             'price': price,
-            'deviation': settings.max_slippage_points,
+            'deviation': int(deviation if deviation is not None else settings.max_slippage_points),
             'magic': 4009,
             'comment': 'TGSCALP_CLOSE',
             'type_time': mt5.ORDER_TIME_GTC,
