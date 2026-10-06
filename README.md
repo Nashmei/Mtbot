@@ -13,8 +13,9 @@ Equity، تنفيذ أوامر مع فحوص الوسيط، إدارة صفقة 
 ## 1. المعمارية الحالية
 
 - نمط القرار: **حتمي بالكامل** — الاستراتيجيات تملك Entry/SL/TP، والـ AI اختياري veto-only ومعطل افتراضيًا.
-- لا يوجد مسار AI-native ولا Strategy-52/55/56/57/58. تم حذفها.
-- `AI_MARKET_ANALYSIS` لم تعد مصدر دخول؛ لا يوجد `ai_native_only`.
+- لا يوجد مسار AI-native ولا `AI_MARKET_ANALYSIS` كمصدر دخول؛ الـ AI الاختياري يعمل veto-only فقط.
+- حزمة الاستراتيجيات القديمة المرقمة 52/55/56/57/58 ليست هي المعمارية الحالية.
+- يوجد **Kronos K-line Forecast** كاستراتيجية مستقلة تعتمد ملف forecast مولد خارج حلقة التنفيذ، وتعمل على XAUUSD/EURUSD.
 - الأنظمة: `TREND | RANGE | BREAKOUT | VOLATILE | NO_TRADE` (من `core/regime.py`).
 - الاختيار: `Strategy × Symbol-Class(GOLD/INDEX/FX) × Regime` عبر `core/strategy_registry.py`.
 - إدارة المخاطرة: المستخدم يضبط Risk %؛ المحرك يحسب اللوت من مسافة SL الفعلية. لا يتم تشويه SL لإجبار R:R.
@@ -36,7 +37,7 @@ closed bars (M1..W1)
         -> MarketContext (core/strategy_base.py)
         -> RegimeDetector (core/regime.py)
         -> StrategyRegistry: eligibility (symbol/regime) + combo evidence gate
-        -> 25 deterministic strategy.analyze(ctx)
+        -> 35 strategies: 34 deterministic + Kronos forecast
         -> confidence gate (max(min_confidence, min_entry_confidence))
         -> optional AI veto (data-only, disabled by default, fails open)
         -> anti-chase + correlation + spread re-check
@@ -44,7 +45,7 @@ closed bars (M1..W1)
         -> TradeState (per-strategy management) -> MT5 truth -> DB -> Telegram/T4Bot
 ```
 
-## 3. الاستراتيجيات (25)
+## 3. الاستراتيجيات الحالية (35)
 
 | id | family | symbols | regimes |
 |---|---|---|---|
@@ -73,6 +74,23 @@ closed bars (M1..W1)
 | gold_asia_range_breakout | breakout | XAUUSD | BREAKOUT, TREND |
 | inside_bar_breakout (trial) | breakout | XAU/FX/INDEX | BREAKOUT, TREND, RANGE |
 | two_bar_reversal_volume (trial) | reversal | XAU/FX/INDEX | RANGE, TREND, VOLATILE |
+
+ويضاف إلى الجدول أعلاه حالياً:
+
+| id | family | symbols | regimes |
+|---|---|---|---|
+| fast_micro_reversal | reversal | XAUUSD/EURUSD/GBPUSD | جميع الأنظمة |
+| ha_doji_box_continuation | trend | XAUUSD | جميع الأنظمة |
+| qima_chart_pattern_breakout | breakout | XAUUSD | حسب StrategySpec |
+| qima_nr4_breakout | breakout | XAUUSD | حسب StrategySpec |
+| qima_sr_bounce | reversal | XAUUSD | حسب StrategySpec |
+| qima_gap_continuation | continuation | XAUUSD | حسب StrategySpec |
+| qima_trend_following | trend | XAUUSD | TREND |
+| qima_macd_crossover | momentum | XAUUSD | TREND |
+| qima_fibonacci_retracement | trend | XAUUSD | TREND |
+| kronos_forecast | foundation_model | XAUUSD/EURUSD | جميع الأنظمة |
+
+وبذلك السجل الحالي يحتوي **35 استراتيجية**: 34 من `strategy_pack.py` + استراتيجية Kronos.
 
 كل استراتيجية تعرّف أيضاً `forbidden` regimes و`timeframes` و`indicators` الدقيقة وقواعد SL هيكلية
 و TP/TP1/TP2 و`management` (protection/trailing/partial/max_hold) وanti-chase، وتُرسم على الشارت من
@@ -121,7 +139,7 @@ core/
   regime.py              # deterministic market regime
   indicators.py          # dependency-free causal TA
   strategy_base.py       # StrategySpec + MarketContext + shared geometry
-  strategy_pack.py       # the 25 machine-executable strategies
+  strategy_pack.py       # 34 machine-executable deterministic strategies
   strategy_registry.py   # reward/penalty + combo gating + selection
   ai_advisor.py          # optional veto-only AI cross-check
   models.py, config.py, mt5_gateway.py, risk.py
@@ -131,3 +149,61 @@ storage/ db.py
 tools/ backtest.py
 tests/ test_engine.py
 ```
+
+## 7. Fast Micro Reversal
+
+`fast_micro_reversal` استراتيجية انعكاس سريعة لـ M1/M5 على XAUUSD وEURUSD وGBPUSD. تبحث عن rejection/impulse على M5 ثم تؤكد التحول بواسطة EMA5/EMA9 وكسر micro-structure على M1. الوقف هيكلي ومقيد بـ ATR، والهدف لا يقل عن 1.8R. إعداد الإدارة الافتراضي للاستراتيجية: protection 30%، trailing trigger 55%، trailing gap 7%، وmax hold 90 دقيقة.
+
+## 8. Heikin-Ashi Doji Box
+
+`ha_doji_box_continuation` للذهب: يحدد اتجاه H1 بواسطة Heikin-Ashi، ثم يبحث على M5 عن long-wick doji وصندوق تصحيح مع إغلاقين للتأكيد. الوقف عند منتصف الصندوق والهدف 2.5× ارتفاع الصندوق. الإدارة: protection 35%، trailing 60%، gap 8%، max hold 240 دقيقة.
+
+## 9. Kronos Forecast
+
+`kronos_forecast` يستخدم forecast خارجي لـ M5 على XAUUSD/EURUSD. يحتاج 80 شمعة M5، ويقبل forecast حديثاً حتى 30 دقيقة وبثقة لا تقل عن 68%. الوقف هيكلي والهدف مأخوذ من expected high/low، ولا يقبل هندسة أقل من 1.5R. inference منفصل عن حلقة MT5 عبر `kronos_runtime/` حتى لا يحجب المحرك.
+
+ملفات التشغيل الرئيسية: `kronos_runtime/daemon.py`, `worker.py`, `export_m5.py`, `run_once.sh`, `start_daemon.sh`. ملفات `data/` و`signals/` هي runtime artifacts وتتغير أثناء التشغيل.
+
+## 10. مراقب فرص الذهب — Alert Only
+
+`core/gold_alert_monitor.py` مراقب **قراءة فقط** لـ XAUUSD. يعمل كل 5 ثوانٍ افتراضياً، ويقرأ M1/M5/M15/H1 ويحسب EMA/ATR ودعم/مقاومة ديناميكية. يبحث عن breakout مؤكد أو rejection متوافق مع الاتجاه، ثم يرسل دخولاً مرجعياً وSL وTP1=1.8R وTP2=2.8R إلى Telegram/T4Bot.
+
+المراقب **لا يرسل أي أمر إلى MT5**؛ التنفيذ يدوي. يوجد cooldown افتراضي 300 ثانية لمنع تكرار نفس التنبيه. يبدأ تلقائياً من `main.py` كـ asyncio task مستقلة.
+
+## 11. إدارة المخاطرة والتنفيذ
+
+- `risk_pct` هو **حد أقصى للمخاطرة** وليس هدفاً يجب استهلاكه بالكامل.
+- اللوت يحسب من Equity ومسافة SL، ثم يطبّق قيود min/max/step الخاصة بالوسيط.
+- إذا كان أقل لوت لدى الوسيط يتجاوز حد المخاطرة، يرفض المحرك الصفقة بدلاً من فرض مخاطرة أعلى.
+- بعد التنفيذ يعاد حساب الخطر الفعلي من fill الحقيقي ويُسجل `POST_FILL_RISK_DRIFT` عند وجود انحراف.
+- الحساب الحقيقي له `real_trading_enabled` lock مستقل.
+- الحمايات تشمل حد خسارة Equity يومي، حد عدد الصفقات اليومية، حد المراكز المترابطة، وحد ربح الجلسة.
+- إدارة المركز تدعم protection، trailing، break-even، partial TP1 عند طلب الاستراتيجية، وmax hold عندما تكون قيمته أكبر من صفر.
+
+## 12. التخزين والحسابات
+
+الإعدادات التداولية مخزنة **لكل حساب MT5** داخل `storage/bot.db`. قاعدة البيانات تحفظ الإعدادات، سجل الأحداث، الصفقات، وإحصاءات الأداء/التركيبات. النسخ الاحتياطي للـDB مدعوم دورياً من الإعدادات.
+
+`storage/bot.db` وملفات SQLite و`.env` وملف بيانات دخول MT5 ليست ملفات يفترض نشرها في Git. بيانات اعتماد MT5 المحفوظة تكون خارج المستودع في `~/.mt5bot_credentials.json`.
+
+## 13. التشغيل على الخادم
+
+بيئة الإنتاج الحالية مبنية لتشغيل Python/MetaTrader5 داخل Wine. نقطة الدخول هي:
+
+```bash
+python.exe -u main.py
+```
+
+وفي الخادم الحالي تتم إدارة العملية بواسطة `mtbot.service`. عند الإقلاع: تهيئة DB → MT5 Gateway → Control API إن كان مفعلاً → Telegram → استعادة حساب MT5 المحفوظ في الخلفية → تشغيل Gold Alert Monitor.
+
+## 14. متغيرات البيئة
+
+ابدأ من `.env.example`. أهم مجموعات الإعدادات: Telegram، Control API، مسار MT5/Wine، حدود spread/slippage/tick freshness، DB، والـ AI cross-check الاختياري. لا تضع tokens/passwords داخل README أو Git.
+
+## 15. ملاحظات النقل والاستعادة
+
+GitHub يحفظ الكود والتاريخ، لكنه ليس بديلاً كاملاً عن نسخة runtime. عند نقل الخادم تحتاج بصورة منفصلة إلى: قاعدة `storage/bot.db` المتسقة، بيانات دخول MT5 الآمنة، ملف `.env` الحقيقي، بيئة Wine/MT5، واعتماديات Kronos/model إن كانت مخزنة خارج Git. لا تنسخ DB وهي في حالة كتابة بدون snapshot/backup صحيح.
+
+## 16. حالة المشروع
+
+README هذا يصف بنية فرع `AIplus` الحالية وقت آخر تحديث. المصدر النهائي للحقيقة هو الكود نفسه و`StrategySpec` لكل استراتيجية؛ ملفات `.bak` هي نسخ تاريخية وليست مسار الإنتاج.
