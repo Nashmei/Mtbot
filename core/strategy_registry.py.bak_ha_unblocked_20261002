@@ -26,9 +26,6 @@ import math
 import time
 
 from .strategy_pack import STRATEGY_CLASSES
-from .strategy_kronos import KronosForecastStrategy
-
-STRATEGY_CLASSES = [KronosForecastStrategy] + list(STRATEGY_CLASSES)
 
 
 def symbol_class(symbol):
@@ -321,16 +318,11 @@ class StrategyRegistry:
         evaluated = []
         signals = []
         for strategy in self.strategies:
+            ok, reason = strategy.eligible(ctx, self)
+            if not ok:
+                evaluated.append({'strategy': strategy.spec.id, 'decision': 'SKIP', 'reason_code': reason})
+                continue
             try:
-                eligible = getattr(strategy, 'eligible', None)
-                if callable(eligible):
-                    ok, reason = eligible(ctx, self)
-                    if not ok:
-                        decision = strategy.wait(ctx, reason, 'Strategy combination not eligible')
-                        decision.setdefault('strategy_id', strategy.spec.id)
-                        decision['symbol_class'] = symbol_class(ctx.symbol)
-                        evaluated.append(decision)
-                        continue
                 decision = strategy.analyze(ctx)
             except Exception as exc:  # a broken strategy must never kill the engine
                 evaluated.append({'strategy': strategy.spec.id, 'decision': 'ERROR',
@@ -342,12 +334,29 @@ class StrategyRegistry:
                 # A strategy owns its own minimum quality bar.  Signals below
                 # the spec threshold are never entered even if the account
                 # threshold is lower.
-                penalty = 0.0
-                floor = 0.0
-                confidence = float(decision.get('confidence', 0))
+                required = max(float(strategy.spec.min_confidence),
+                               self.TIER_MIN_CONFIDENCE.get(strategy.spec.tier, 65.0))
+                if float(decision.get('confidence', 0)) < required:
+                    decision['decision'] = 'WAIT'
+                    decision['reason_code'] = 'BELOW_STRATEGY_CONFIDENCE'
+                    decision['required_confidence'] = required
+                    decision['side'] = 'NONE'
+                    evaluated.append(decision)
+                    continue
+                penalty = self.combo_penalty(strategy, ctx)
+                floor = self.evidence_floor(strategy, ctx)
+                confidence = float(decision.get('confidence', 0)) - penalty
                 decision['confidence_raw'] = float(decision.get('confidence', 0))
                 decision['combo_penalty'] = penalty
                 decision['evidence_floor'] = floor
+                if confidence < floor:
+                    decision['decision'] = 'WAIT'
+                    decision['reason_code'] = 'COMBO_EVIDENCE_FLOOR'
+                    decision['required_confidence'] = floor
+                    decision['side'] = 'NONE'
+                    decision['confidence'] = max(0.0, confidence)
+                    evaluated.append(decision)
+                    continue
                 decision['confidence'] = max(0.0, confidence)
                 if 'signal_bar' not in decision:
                     last_bar = ctx.last_closed('M1') or {}
@@ -368,6 +377,22 @@ class StrategyRegistry:
             return None, evaluated
 
         signals.sort(key=lambda item: float(item[1].get('confidence', 0)), reverse=True)
+        top_confidence = float(signals[0][1].get('confidence', 0))
+        # Do not enter when another qualified strategy has a credible opposite
+        # setup.  Requiring an exact confidence tie was too weak: on fast gold
+        # moves a liquidity-reversal signal can appear a few points below a
+        # lagging momentum signal and the engine would still chase the move.
+        # A 10-point conflict band preserves clear consensus while standing
+        # down on genuinely ambiguous direction.
+        conflict_band = 10.0
+        opposing = [s for s in signals[1:]
+                    if s[1].get('side') != signals[0][1].get('side')
+                    and float(s[1].get('confidence', 0)) >= top_confidence - conflict_band]
+        if opposing:
+            sources = [signals[0][0].spec.id] + [s[0].spec.id for s in opposing]
+            return {'decision': 'WAIT', 'reason_code': 'OPPOSING_SIGNAL_CONFLICT',
+                    'reason': 'Qualified opposite-direction setup within confidence conflict band',
+                    'confidence': top_confidence, 'sources': sources}, evaluated
         return signals[0][1], evaluated
 
     def describe(self):

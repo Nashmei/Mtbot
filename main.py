@@ -8,6 +8,7 @@ from bot.telegram_app import TelegramUI
 from core.config import settings
 from core.engine import Engine
 from core.mt5_gateway import MT5Gateway
+from core.gold_alert_monitor import GoldAlertMonitor
 from storage.db import DB
 
 
@@ -203,11 +204,15 @@ async def main():
    print('MT5: saved login error:',ex)
 
  mt5_restore_task=asyncio.create_task(restore_mt5())
+ # Read-only XAU monitor: alerts Telegram/T4Bot, never sends MT5 orders.
+ gold_alert_task=asyncio.create_task(GoldAlertMonitor(gw,notify).run())
 
  try:
   while True:
    await asyncio.sleep(3600)
  finally:
+  if gold_alert_task and not gold_alert_task.done():
+   gold_alert_task.cancel()
   if mt5_restore_task and not mt5_restore_task.done():
    mt5_restore_task.cancel()
   if telegram_app:

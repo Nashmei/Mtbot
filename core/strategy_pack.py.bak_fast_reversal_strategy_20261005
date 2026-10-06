@@ -2309,42 +2309,6 @@ class QIMAFibonacciRetracement(BaseStrategy):
 
 
 # =====================================================================
-# 34. Fast micro reversal (M1/M5)
-# =====================================================================
-class FastMicroReversal(BaseStrategy):
-    spec = StrategySpec(id='fast_micro_reversal', name='Fast M1/M5 reversal shift', family='reversal',
-        timeframes=('M5','M1'), symbols=('XAUUSD','EURUSD','GBPUSD'),
-        regimes=('TREND','BREAKOUT','RANGE','VOLATILE','NO_TRADE'), forbidden=(),
-        indicators=('M5 rejection/exhaustion','M1 EMA5/9 shift','M1 structure break','ATR14 M5'),
-        tier='A', min_confidence=68.0)
-
-    def analyze(self, ctx):
-        m5,m1=ctx.frame('M5'),ctx.frame('M1')
-        if len(m5)<40 or len(m1)<60:return self.wait(ctx,'INSUFFICIENT_HISTORY','Need M5/M1 history')
-        ok,reason=self.base_gates(ctx,'M5',14,max_spread_atr_frac=.22)
-        if not ok:return self.wait(ctx,reason,'Fast reversal volatility/spread gate')
-        atr5=_at(ctx.atr('M5',14)); b=[ta.candle(x) for x in m5]; last,prev=b[-1],b[-2]
-        c1=ta.closes(m1); e5=ta.ema(c1,5); e9=ta.ema(c1,9)
-        if None in (e5[-1],e9[-1],e5[-2],e9[-2]):return self.wait(ctx,'NO_EMA','M1 EMA unavailable')
-        recent_hi=max(ta.highs(m1[-8:-2])); recent_lo=min(ta.lows(m1[-8:-2])); lc=ta.candle(m1[-1])
-        impulse_up=(last['bull'] and last['body']>=atr5*.45) or (prev['lower_wick']>=prev['range']*.45 and last['bull'])
-        impulse_dn=(last['bear'] and last['body']>=atr5*.45) or (prev['upper_wick']>=prev['range']*.45 and last['bear'])
-        buy=impulse_up and e5[-1]>e9[-1] and e5[-1]>e5[-2] and lc['close']>recent_hi
-        sell=impulse_dn and e5[-1]<e9[-1] and e5[-1]<e5[-2] and lc['close']<recent_lo
-        if not (buy or sell):return self.wait(ctx,'WAIT_FAST_SHIFT','Waiting for M5 reversal impulse + M1 EMA/structure shift')
-        side=Side.BUY if buy else Side.SELL; price=ctx.price_for(side)
-        extreme=min(ta.lows(m5[-3:])) if buy else max(ta.highs(m5[-3:]))
-        st=structural_stop(ctx,side,price,extreme,buffer_points=4.0,min_atr_frac=.18,atr_frame='M5',max_atr_mult=1.35)
-        if not st:return self.wait(ctx,'STOP_TOO_WIDE','Fast reversal structural stop too wide')
-        stop,risk=st; target=atr_target(ctx,side,price,risk,atr_mult=1.5,floor_r=1.8,atr_frame='M5')
-        conf=confidence_score(70,5 if last['body']>=atr5*.6 else 2,4 if abs(e5[-1]-e9[-1])>ctx.spread else 0)
-        return signal_decision(self.spec,ctx,side,price,stop,target,conf,
-            'M5 rejection/impulse confirmed by M1 EMA5/9 momentum and micro-structure break',
-            management={'protection_pct':30.0,'trailing_trigger_pct':55.0,'trailing_gap_pct':7.0,'max_hold_minutes':90},
-            draw=self.chart(ctx,levels=[{'type':'ENTRY','price':price},{'type':'SL','price':stop},{'type':'TP','price':target}]),regime=ctx.regime.value)
-
-
-# =====================================================================
 # Registry assembly
 # =====================================================================
 class HADojiBoxContinuation(BaseStrategy):
@@ -2390,7 +2354,6 @@ class HADojiBoxContinuation(BaseStrategy):
 
 
 STRATEGY_CLASSES = [
-    FastMicroReversal,
     HADojiBoxContinuation,
     TrendEMAPullback,
     TrendBreakRetest,

@@ -477,29 +477,6 @@ class Engine:
                 'W1': mt5.TIMEFRAME_W1,
             }[name]
             frames[name] = to_rows(self.gw.rates(symbol, tf, count))
-        # Kronos runs natively outside Wine/PyTorch. Export the already-fetched
-        # closed M5 bars so the sidecar never opens a second MT5 terminal.
-        try:
-            m5 = frames.get('M5') or []
-            if len(m5) >= 80:
-                import csv
-                safe = ''.join(c for c in symbol if c.isalnum() or c in '._-')
-                outdir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'kronos_runtime', 'data')
-                os.makedirs(outdir, exist_ok=True)
-                path = os.path.join(outdir, safe + '_M5.csv')
-                tmp = path + '.tmp'
-                with open(tmp, 'w', newline='', encoding='utf-8') as fh:
-                    w = csv.writer(fh); w.writerow(['timestamps','open','high','low','close','volume'])
-                    for r in m5[-300:]:
-                        w.writerow([int(float(r.get('time',0) or 0)), r.get('open'), r.get('high'), r.get('low'), r.get('close'), r.get('tick_volume', r.get('real_volume',0))])
-                os.replace(tmp, path)
-        except Exception as exc:
-            # Export failures must be visible; silently swallowing this is what
-            # previously left Kronos data/signals empty.
-            try:
-                print(f'KRONOS_EXPORT_ERROR {symbol}: {exc!r}', flush=True)
-            except Exception:
-                pass
         return frames
 
     def _build_context(self, symbol, tick, info, frames):
@@ -586,23 +563,6 @@ class Engine:
         self.loss_limit_notified = False
         if not self.symbols:
             return
-
-        # Resolve broker symbols before feeding Kronos.  Config may contain base
-        # names (XAUUSD/EURUSD) while the connected broker exposes suffixes.
-        kronos_symbols = []
-        for _base in ('XAUUSD', 'EURUSD'):
-            _resolved = self.gw.resolve_symbol(_base) if hasattr(self.gw, 'resolve_symbol') else _base
-            if _resolved and _resolved not in kronos_symbols:
-                kronos_symbols.append(_resolved)
-
-        # Refresh normal market frames first. Besides keeping strategy data warm,
-        # this feeds the native Kronos sidecar even when another signal source
-        # returns early or a symbol later fails tick/spread gates.
-        for _kronos_symbol in kronos_symbols:
-            try:
-                self._closed_frames(_kronos_symbol)
-            except Exception as exc:
-                await self._log_reject('KRONOS_EXPORT_REJECT', _kronos_symbol, error=repr(exc))
 
         if await self._auto_trendview_signal(account):
             return
@@ -1226,9 +1186,6 @@ class Engine:
             symbol, state.volume, fill, actual_stop)
         actual_risk_cash = abs(float(post_fill_loss)) if post_fill_loss else state.risk_cash
         risk_drift_cash = actual_risk_cash - risk_cash
-        # Runtime/evidence R must use the actual post-fill cash risk.
-        state.risk_cash = actual_risk_cash
-        state.risk_pct_actual = (actual_risk_cash / float(getattr(account, 'equity', 1) or 1)) * 100.0
         if abs(risk_drift_cash) > 0.01:
             await self.db.log('POST_FILL_RISK_DRIFT', symbol, ticket=pos.ticket,
                               planned_risk_cash=risk_cash, actual_risk_cash=actual_risk_cash,
@@ -1459,9 +1416,11 @@ class Engine:
     async def _update_protection(self, t, pos, tick, info, favorable, best_observed_price):
         if t.protection_45_active:
             return
-        # Universal protection rule: arm once the trade has achieved +1R.
-        # This is intentionally independent of TP distance and strategy-specific percentages.
-        if t.initial_r <= 0 or favorable < t.initial_r:
+        target_distance = abs(t.tp - t.entry)
+        if target_distance <= 0:
+            return
+        progress = favorable / target_distance
+        if progress < t.protection_pct / 100.0:
             return
         buffer_points = max(3.0, ctx_spread_buffer(t, tick, info) / float(info.point))
         protected = (t.entry - buffer_points * info.point if t.side == Side.BUY
@@ -1480,13 +1439,15 @@ class Engine:
     async def _update_trailing(self, t, pos, tick, info, best_observed_price):
         if not t.protection_45_active:
             return
-        # Once +1R protection is active, trail continuously with price.
-        # Gap is based on the original risk (R), not the TP distance, so a far
-        # target cannot leave a large open profit unprotected.
-        if t.initial_r <= 0:
+        target_distance = abs(t.tp - t.entry)
+        if target_distance <= 0:
+            return
+        progress = ((best_observed_price - t.entry) if t.side == Side.BUY
+                    else (t.entry - best_observed_price)) / target_distance
+        if progress < t.trailing_trigger_pct / 100.0:
             return
         t.trailing = True
-        gap = t.initial_r * max(0.10, t.trailing_gap_pct / 100.0)
+        gap = target_distance * (t.trailing_gap_pct / 100.0)
         candidate = (best_observed_price - gap if t.side == Side.BUY
                      else best_observed_price + gap)
         candidate = max(candidate, t.sl) if t.side == Side.BUY else min(candidate, t.sl)

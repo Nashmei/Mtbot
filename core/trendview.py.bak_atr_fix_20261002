@@ -1,0 +1,119 @@
+import json
+import os
+import time
+import urllib.parse
+import urllib.request
+
+from . import indicators as ta
+
+
+def _secret(name):
+    value = os.getenv(name, '').strip()
+    if value:
+        return value
+    path = '/home/ubuntu/.config/mtbot/trendview.env'
+    try:
+        for line in open(path, encoding='utf-8'):
+            if line.startswith(name + '='):
+                return line.split('=', 1)[1].strip()
+    except OSError:
+        pass
+    return ''
+
+
+def _fetch_json(url, timeout=8):
+    req = urllib.request.Request(url, headers={'User-Agent': 'MTBOT-trendView/1.0'})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.load(r)
+
+
+def twelve_confirm(side, api_key):
+    if not api_key:
+        return False, {'reason': 'TWELVE_KEY_MISSING'}
+    params = urllib.parse.urlencode({
+        'symbol': 'XAU/USD', 'interval': '5min',
+        'outputsize': 60, 'apikey': api_key,
+    })
+    data = _fetch_json('https://api.twelvedata.com/time_series?' + params)
+    values = data.get('values') or []
+    if len(values) < 30:
+        return False, {'reason': 'TWELVE_DATA_SHORT', 'rows': len(values)}
+    closes = [float(x['close']) for x in reversed(values)]
+    ema9 = ta.ema(closes, 9)
+    ema21 = ta.ema(closes, 21)
+    if not ema9 or not ema21:
+        return False, {'reason': 'TWELVE_EMA_WARMUP'}
+    bullish = ema9[-1] > ema21[-1] and closes[-1] > ema9[-1]
+    bearish = ema9[-1] < ema21[-1] and closes[-1] < ema9[-1]
+    ok = bullish if side == 'BUY' else bearish
+    return ok, {
+        'reason': 'TWELVE_CONFIRM' if ok else 'TWELVE_DIRECTION_MISMATCH',
+        'close': closes[-1], 'ema9': ema9[-1], 'ema21': ema21[-1],
+    }
+
+
+def mt5_confirm(ctx, side):
+    m5 = ctx.frame('M5')
+    m15 = ctx.frame('M15')
+    if len(m5) < 30 or len(m15) < 30:
+        return False, {'reason': 'MT5_DATA_SHORT'}
+    c5 = ta.closes(m5)
+    c15 = ta.closes(m15)
+    e9_5, e21_5 = ta.ema(c5, 9), ta.ema(c5, 21)
+    e9_15, e21_15 = ta.ema(c15, 9), ta.ema(c15, 21)
+    if not all((e9_5, e21_5, e9_15, e21_15)):
+        return False, {'reason': 'MT5_EMA_WARMUP'}
+    bullish = e9_5[-1] > e21_5[-1] and e9_15[-1] > e21_15[-1]
+    bearish = e9_5[-1] < e21_5[-1] and e9_15[-1] < e21_15[-1]
+    ok = bullish if side == 'BUY' else bearish
+    return ok, {
+        'reason': 'MT5_CONFIRM' if ok else 'MT5_DIRECTION_MISMATCH',
+        'm5_ema9': e9_5[-1], 'm5_ema21': e21_5[-1],
+        'm15_ema9': e9_15[-1], 'm15_ema21': e21_15[-1],
+    }
+
+
+
+def free_source_signal(ctx):
+    """Free replacement for TradingView: independent M5/M15 trend vote from MT5."""
+    m5, m15 = ctx.frame('M5'), ctx.frame('M15')
+    if len(m5) < 30 or len(m15) < 30:
+        return None, {'reason': 'FREE_SOURCE_DATA_SHORT'}
+    c5, c15 = ta.closes(m5), ta.closes(m15)
+    e9_5, e21_5 = ta.ema(c5, 9), ta.ema(c5, 21)
+    e9_15, e21_15 = ta.ema(c15, 9), ta.ema(c15, 21)
+    buy = e9_5[-1] > e21_5[-1] and e9_15[-1] > e21_15[-1] and c5[-1] > e9_5[-1]
+    sell = e9_5[-1] < e21_5[-1] and e9_15[-1] < e21_15[-1] and c5[-1] < e9_5[-1]
+    if buy == sell:
+        return None, {'reason': 'FREE_SOURCE_NO_CONSENSUS'}
+    side = 'BUY' if buy else 'SELL'
+    return {'id': f'free-{side}-{int(time.time() // 300)}', 'side': side, 'confidence': 75}, {'reason': 'FREE_SOURCE_SIGNAL'}
+
+def build_decision(ctx, payload, api_key=None):
+    side = str(payload.get('side') or payload.get('action') or '').upper()
+    if side not in ('BUY', 'SELL'):
+        return None, {'reason': 'INVALID_SIDE'}
+    if not ctx.is_gold:
+        return None, {'reason': 'NOT_GOLD'}
+    ok5, d5 = mt5_confirm(ctx, side)
+    if not ok5:
+        return None, d5
+    atr = ctx.atr('M5', 14)
+    if not atr or atr <= 0:
+        return None, {'reason': 'ATR_WARMUP'}
+    entry = ctx.ask if side == 'BUY' else ctx.bid
+    stop_dist = max(float(atr) * 1.15, ctx.spread * 8.0)
+    sl = entry - stop_dist if side == 'BUY' else entry + stop_dist
+    tp = entry + stop_dist * 1.8 if side == 'BUY' else entry - stop_dist * 1.8
+    confidence = float(payload.get('confidence') or 75.0)
+    confidence = min(95.0, max(65.0, confidence))
+    now = time.time()
+    return {
+        'decision': 'SIGNAL', 'strategy_id': 'trendView', 'side': side,
+        'confidence': confidence, 'entry': entry,
+        'sl_price': sl, 'tp_price': tp,
+        'signal_bar': int(now // 60), 'bar_time': now,
+        'regime': 'EXTERNAL', 'reason_code': 'FREE_SOURCE_MT5_CONFIRM',
+        'reason': 'Free source signal confirmed by MT5',
+        '_external': True,
+    }, {'mt5': d5}

@@ -35,52 +35,38 @@ class RegimeResult:
 
 
 def _classify(adx_value, slope, ema_fast, ema_slow, atr_v, atr_pct, width_pct,
-              bar_range_ratio, breakout_up, breakout_dn, range_slope, h1_direction='NONE'):
+              bar_range_ratio, breakout_up, breakout_dn, range_slope):
     if atr_v is None or atr_v <= 0:
         return Regime.NO_TRADE, 'NONE', 0.0, 'no_atr'
 
-    # Direction and volatility are separate dimensions. ATR/ATR percentile
-    # measures movement magnitude, not direction. M15 supplies the tactical
-    # trend; H1 is a causal higher-timeframe confirmation/fallback.
-    m15_up = (ema_fast is not None and ema_slow is not None
-              and ema_fast > ema_slow and slope > 0)
-    m15_dn = (ema_fast is not None and ema_slow is not None
-              and ema_fast < ema_slow and slope < 0)
-    trend_up = bool(adx_value is not None and adx_value >= 22 and m15_up)
-    trend_dn = bool(adx_value is not None and adx_value >= 22 and m15_dn)
-    directional_up = trend_up or (m15_up and h1_direction == 'UP')
-    directional_dn = trend_dn or (m15_dn and h1_direction == 'DOWN')
+    trend_up = (adx_value is not None and adx_value >= 22
+                and ema_fast is not None and ema_slow is not None
+                and ema_fast > ema_slow and slope > 0)
+    trend_dn = (adx_value is not None and adx_value >= 22
+                and ema_fast is not None and ema_slow is not None
+                and ema_fast < ema_slow and slope < 0)
 
     # Compression followed by an impulsive close outside the prior boundary.
     if breakout_up and width_pct is not None and width_pct <= 0.60:
-        return Regime.BREAKOUT, 'UP', 0.6 + min(0.35, max(0.0, (bar_range_ratio - 1.4) * 0.25)), 'breakout_up'
+        return Regime.BREAKOUT, 'UP', 0.6 + min(0.35, (bar_range_ratio - 1.4) * 0.25), 'breakout_up'
     if breakout_dn and width_pct is not None and width_pct <= 0.60:
-        return Regime.BREAKOUT, 'DOWN', 0.6 + min(0.35, max(0.0, (bar_range_ratio - 1.4) * 0.25)), 'breakout_down'
+        return Regime.BREAKOUT, 'DOWN', 0.6 + min(0.35, (bar_range_ratio - 1.4) * 0.25), 'breakout_down'
 
-    # High volatility is a state, not a direction eraser. Preserve a causal
-    # UP/DOWN bias when M15 structure agrees with H1 (or ADX confirms it).
+    # Violent expansion without directional agreement = untradable noise.
     if atr_pct is not None and atr_pct >= 0.85:
-        if directional_up:
-            return Regime.TREND, 'UP', 0.60 if trend_up else 0.52, 'high_vol_directional_up'
-        if directional_dn:
-            return Regime.TREND, 'DOWN', 0.60 if trend_dn else 0.52, 'high_vol_directional_down'
-        return Regime.VOLATILE, h1_direction if h1_direction in ('UP','DOWN') else 'NONE', 0.5, 'volatility_expansion'
+        if trend_up:
+            return Regime.TREND, 'UP', 0.6, 'high_vol_trend_up'
+        if trend_dn:
+            return Regime.TREND, 'DOWN', 0.6, 'high_vol_trend_down'
+        return Regime.VOLATILE, 'NONE', 0.5, 'volatility_expansion'
 
-    if bar_range_ratio >= 2.5 and not (directional_up or directional_dn):
-        return Regime.VOLATILE, h1_direction if h1_direction in ('UP','DOWN') else 'NONE', 0.4, 'single_bar_spike'
+    if bar_range_ratio >= 2.5 and not (trend_up or trend_dn):
+        return Regime.VOLATILE, 'NONE', 0.4, 'single_bar_spike'
 
     if trend_up:
         return Regime.TREND, 'UP', min(0.95, 0.5 + (adx_value - 22) / 40.0), 'adx_trend_up'
     if trend_dn:
         return Regime.TREND, 'DOWN', min(0.95, 0.5 + (adx_value - 22) / 40.0), 'adx_trend_down'
-
-    # Borderline ADX (20-22) should not become NO_TRADE solely because of a
-    # hard threshold when M15 and H1 structure agree.
-    if adx_value is not None and adx_value >= 20:
-        if m15_up and h1_direction == 'UP':
-            return Regime.TREND, 'UP', 0.48, 'borderline_adx_h1_up'
-        if m15_dn and h1_direction == 'DOWN':
-            return Regime.TREND, 'DOWN', 0.48, 'borderline_adx_h1_down'
 
     if adx_value is not None and adx_value < 20 and abs(range_slope) <= 0.12:
         return Regime.RANGE, 'NONE', min(0.85, 0.5 + (20 - adx_value) / 30.0), 'flat_adx_range'
@@ -148,17 +134,6 @@ class RegimeDetector:
                            and bar_range_ratio >= 1.4)
 
         h1_closes = ta.closes(h1)
-        h1_fast = ta.ema(h1_closes, 20)
-        h1_slow = ta.ema(h1_closes, 50)
-        h1_slope = ta.linreg_slope(h1_closes[-30:], 20) or 0.0
-        h1_fast_v = h1_fast[-1]
-        h1_slow_v = h1_slow[-1]
-        if h1_fast_v is not None and h1_slow_v is not None and h1_fast_v > h1_slow_v and h1_slope > 0:
-            h1_direction = 'UP'
-        elif h1_fast_v is not None and h1_slow_v is not None and h1_fast_v < h1_slow_v and h1_slope < 0:
-            h1_direction = 'DOWN'
-        else:
-            h1_direction = 'NONE'
         range_slope = 0.0
         if prior_high and prior_low and atr_v:
             range_slope = abs(ema_fast_v - ema_slow_v) / max(atr_v, 1e-12) if (
@@ -166,7 +141,7 @@ class RegimeDetector:
 
         regime, direction, strength, code = _classify(
             adx_value, slope, ema_fast_v, ema_slow_v, atr_v, atr_pct, width_pct,
-            bar_range_ratio, breakout_up, breakout_dn, range_slope, h1_direction,
+            bar_range_ratio, breakout_up, breakout_dn, range_slope,
         )
 
         detail = {
@@ -177,11 +152,6 @@ class RegimeDetector:
             'ema50_m15': ema_fast_v,
             'ema200_m15': ema_slow_v,
             'slope_m15': slope,
-            'h1_ema20': h1_fast_v,
-            'h1_ema50': h1_slow_v,
-            'h1_slope': h1_slope,
-            'h1_direction': h1_direction,
-            'direction': direction,
             'bar_range_ratio': bar_range_ratio,
             'prior_range_m15': prior_range,
             'regime_code': code,

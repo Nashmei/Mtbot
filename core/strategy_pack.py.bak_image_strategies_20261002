@@ -2169,8 +2169,8 @@ class QIMANR4Breakout(BaseStrategy):
         family='breakout',
         timeframes=('M15', 'M5'),
         symbols=('XAUUSD', 'EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD', 'USDCAD', 'NZDUSD'),
-        regimes=('TREND',),
-        forbidden=('BREAKOUT', 'RANGE', 'VOLATILE', 'NO_TRADE'),
+        regimes=('BREAKOUT', 'RANGE', 'TREND'),
+        forbidden=('VOLATILE', 'NO_TRADE'),
         indicators=('M5 NR4', 'M5 breakout close', 'M15 EMA21 bias', 'ATR14 M5'),
         tier='B',
         min_confidence=66.0,
@@ -2223,175 +2223,10 @@ class QIMANR4Breakout(BaseStrategy):
         )
 
 
-class QIMASupportResistanceBounce(BaseStrategy):
-    spec = StrategySpec(id='qima_sr_bounce', name='QIMA support/resistance bounce', family='mean_reversion', timeframes=('M15','M5'), symbols=('XAUUSD',), regimes=('RANGE','TREND'), forbidden=('VOLATILE','NO_TRADE'), indicators=('M15 swing S/R','M5 reversal','RSI14','volume'), tier='B', min_confidence=66.0)
-    def analyze(self, ctx):
-        m15,m5=ctx.frame('M15'),ctx.frame('M5')
-        if len(m15)<70 or len(m5)<40:return self.wait(ctx,'INSUFFICIENT_HISTORY','Need S/R history')
-        ok,reason=self.base_gates(ctx,'M5',14,max_spread_atr_frac=.22)
-        if not ok:return self.wait(ctx,reason,'Volatility/spread gate')
-        sp=ta.swing_points(m15[-70:],2,2); hi=[x['price'] for x in sp if x['type']=='HIGH']; lo=[x['price'] for x in sp if x['type']=='LOW']
-        if len(hi)<2 or len(lo)<2:return self.wait(ctx,'NO_SR','Need repeated historical S/R')
-        atr=_at(ctx.atr('M5',14)); last=ta.candle(m5[-1]); prev=ta.candle(m5[-2]); price=ctx.ask
-        support=min(lo[-4:]); resistance=max(hi[-4:]); tol=atr*.35
-        c=ta.closes(m5); rsi=_at(ta.rsi(c,14)); vols=ta.volumes(m5); avgv=sum(vols[-21:-1])/20 if len(vols)>=21 else 0; volok=avgv<=0 or vols[-1]>=avgv
-        bull=(last['bull'] and (last['close']>prev['high'] or last['lower_wick']>last['body']))
-        bear=(last['bear'] and (last['close']<prev['low'] or last['upper_wick']>last['body']))
-        buy=abs(last['low']-support)<=tol and bull and rsi is not None and rsi<=38 and volok
-        sell=abs(last['high']-resistance)<=tol and bear and rsi is not None and rsi>=62 and volok
-        if not (buy or sell):return self.wait(ctx,'WAIT_SR_CONFIRM','Waiting for S/R + reversal + RSI + volume confirmation')
-        side=Side.BUY if buy else Side.SELL; price=ctx.price_for(side); anchor=last['low'] if buy else last['high']
-        st=structural_stop(ctx,side,price,anchor,5,.12,'M5',1.8)
-        if not st:return self.wait(ctx,'STOP_TOO_WIDE','S/R stop too wide')
-        stop,risk=st; natural=resistance if buy else support; fallback=atr_target(ctx,side,price,risk,1.7,1.5,'M5'); target=natural if rr_of(price,stop,natural)>=1.4 else fallback
-        return signal_decision(self.spec,ctx,side,price,stop,target,confidence_score(68,4 if volok else 0), 'QIMA S/R bounce confirmed by reversal, RSI and volume', management={'protection_pct':35.,'trailing_trigger_pct':60.,'trailing_gap_pct':8.,'max_hold_minutes':180}, regime=ctx.regime.value)
-
-class QIMAGapContinuation(BaseStrategy):
-    spec=StrategySpec(id='qima_gap_continuation',name='QIMA gap continuation',family='breakout',timeframes=('H1','M15'),symbols=('XAUUSD',),regimes=('TREND','BREAKOUT'),forbidden=('RANGE','VOLATILE','NO_TRADE'),indicators=('H1 gap','M15 pullback','EMA21'),tier='B',min_confidence=66.)
-    def analyze(self,ctx):
-        h1,m15=ctx.frame('H1'),ctx.frame('M15')
-        if len(h1)<40 or len(m15)<40:return self.wait(ctx,'INSUFFICIENT_HISTORY','Need H1/M15 history')
-        atr=_at(ctx.atr('M15',14)); a,b=ta.candle(h1[-2]),ta.candle(h1[-1]); gapup=b['low']>a['high']+atr*.35; gapdn=b['high']<a['low']-atr*.35
-        if not(gapup or gapdn):return self.wait(ctx,'NO_GAP','No material gold session gap')
-        side=Side.BUY if gapup else Side.SELL; c=ta.closes(m15); e21=ta.ema(c,21); last=ta.candle(m15[-1]); trend=(side==Side.BUY and c[-1]>=e21[-1]) or (side==Side.SELL and c[-1]<=e21[-1])
-        pull=(side==Side.BUY and last['low']<=e21[-1]+atr*.25 and last['bull']) or (side==Side.SELL and last['high']>=e21[-1]-atr*.25 and last['bear'])
-        if not(trend and pull):return self.wait(ctx,'WAIT_GAP_PULLBACK','Gap exists; waiting for continuation pullback')
-        price=ctx.price_for(side); anchor=last['low'] if side==Side.BUY else last['high']; st=structural_stop(ctx,side,price,anchor,5,.12,'M15',1.8)
-        if not st:return self.wait(ctx,'STOP_TOO_WIDE','Gap stop too wide')
-        stop,risk=st; target=atr_target(ctx,side,price,risk,1.8,1.6,'M15')
-        return signal_decision(self.spec,ctx,side,price,stop,target,70.,'QIMA gap continuation after pullback with trend',management={'protection_pct':35.,'trailing_trigger_pct':60.,'trailing_gap_pct':8.,'max_hold_minutes':240},regime=ctx.regime.value)
-
-class QIMATrendFollowing(BaseStrategy):
-    spec=StrategySpec(id='qima_trend_following',name='QIMA trend following pullback',family='trend',timeframes=('H1','M15'),symbols=('XAUUSD',),regimes=('TREND',),forbidden=('RANGE','VOLATILE','NO_TRADE'),indicators=('H1 EMA20/50/200','M15 pullback/reversal'),tier='B',min_confidence=67.)
-    def analyze(self,ctx):
-        h1,m15=ctx.frame('H1'),ctx.frame('M15')
-        if len(h1)<220 or len(m15)<50:return self.wait(ctx,'INSUFFICIENT_HISTORY','Need EMA200 history')
-        c=ta.closes(h1); e20,e50,e200=ta.ema(c,20),ta.ema(c,50),ta.ema(c,200); up=c[-1]>e20[-1]>e50[-1]>e200[-1]; dn=c[-1]<e20[-1]<e50[-1]<e200[-1]
-        if not(up or dn):return self.wait(ctx,'NO_MA_STACK','20/50/200 trend stack not aligned')
-        side=Side.BUY if up else Side.SELL; atr=_at(ctx.atr('M15',14)); last=ta.candle(m15[-1]); cm=ta.closes(m15); em20=ta.ema(cm,20); near=abs(last['low' if up else 'high']-em20[-1])<=atr*.45; rev=last['bull'] if up else last['bear']
-        if not(near and rev):return self.wait(ctx,'WAIT_MA_PULLBACK','Waiting for pullback and positive reversal candle')
-        price=ctx.price_for(side); anchor=last['low'] if up else last['high']; st=structural_stop(ctx,side,price,anchor,5,.12,'M15',1.8)
-        if not st:return self.wait(ctx,'STOP_TOO_WIDE','Trend stop too wide')
-        stop,risk=st; target=atr_target(ctx,side,price,risk,2.0,1.8,'M15')
-        return signal_decision(self.spec,ctx,side,price,stop,target,72.,'QIMA MA20/50/200 trend + pullback reversal',management={'protection_pct':35.,'trailing_trigger_pct':60.,'trailing_gap_pct':8.,'max_hold_minutes':240},regime=ctx.regime.value)
-
-class QIMAMACDCrossover(BaseStrategy):
-    spec=StrategySpec(id='qima_macd_crossover',name='QIMA MACD crossover',family='momentum',timeframes=('H1','M15'),symbols=('XAUUSD',),regimes=('TREND',),forbidden=('RANGE','VOLATILE','NO_TRADE'),indicators=('H1 MACD 12/26/9','EMA50','volume'),tier='B',min_confidence=67.)
-    def analyze(self,ctx):
-        h1=ctx.frame('H1')
-        if len(h1)<80:return self.wait(ctx,'INSUFFICIENT_HISTORY','Need MACD history')
-        c=ta.closes(h1); m=ta.macd(c); line,sig=m['line'],m['signal']; e50=ta.ema(c,50); vols=ta.volumes(h1); avgv=sum(vols[-21:-1])/20
-        if None in (line[-1],line[-2],sig[-1],sig[-2],e50[-1]):return self.wait(ctx,'MACD_WARMUP','MACD warmup')
-        bull=line[-2]<=sig[-2] and line[-1]>sig[-1] and line[-1]<0 and c[-1]>e50[-1]; bear=line[-2]>=sig[-2] and line[-1]<sig[-1] and line[-1]>0 and c[-1]<e50[-1]
-        if not(bull or bear) or vols[-1]<avgv:return self.wait(ctx,'WAIT_MACD_CONFIRM','Waiting for crossover + trend + elevated volume')
-        side=Side.BUY if bull else Side.SELL; price=ctx.price_for(side); atr=_at(ctx.atr('M15',14)); anchor=price-atr if bull else price+atr; st=structural_stop(ctx,side,price,anchor,4,.15,'M15',1.7)
-        if not st:return self.wait(ctx,'STOP_TOO_WIDE','MACD stop too wide')
-        stop,risk=st; target=atr_target(ctx,side,price,risk,2.,1.8,'M15')
-        return signal_decision(self.spec,ctx,side,price,stop,target,70.,'QIMA MACD crossover confirmed by trend and volume',management={'protection_pct':35.,'trailing_trigger_pct':60.,'trailing_gap_pct':8.,'max_hold_minutes':360},regime=ctx.regime.value)
-
-class QIMAFibonacciRetracement(BaseStrategy):
-    spec=StrategySpec(id='qima_fibonacci_retracement',name='QIMA Fibonacci retracement',family='trend',timeframes=('H1','M15'),symbols=('XAUUSD',),regimes=('TREND',),forbidden=('RANGE','VOLATILE','NO_TRADE'),indicators=('H1 swing','38.2/61.8 retracement','M15 reversal','volume'),tier='B',min_confidence=67.)
-    def analyze(self,ctx):
-        h1,m15=ctx.frame('H1'),ctx.frame('M15')
-        if len(h1)<80 or len(m15)<40:return self.wait(ctx,'INSUFFICIENT_HISTORY','Need swing history')
-        sp=ta.swing_points(h1[-70:],2,2)
-        if len(sp)<2:return self.wait(ctx,'NO_SWING','No usable swing')
-        a,b=sp[-2],sp[-1]
-        if a['type']==b['type']:return self.wait(ctx,'NO_SWING','Need low-high or high-low swing')
-        up=a['type']=='LOW' and b['type']=='HIGH'; low=min(a['price'],b['price']); high=max(a['price'],b['price']); span=high-low
-        if span<=0:return self.wait(ctx,'NO_SWING','Invalid swing')
-        f38=high-span*.382 if up else low+span*.382; f62=high-span*.618 if up else low+span*.618; last=ta.candle(m15[-1]); atr=_at(ctx.atr('M15',14)); px=last['close']; near=min(abs(px-f38),abs(px-f62))<=atr*.35; rev=last['bull'] if up else last['bear']; vols=ta.volumes(m15); volok=vols[-1]>=sum(vols[-21:-1])/20
-        if not(near and rev and volok):return self.wait(ctx,'WAIT_FIB_CONFIRM','Waiting for 38.2/61.8 retracement + reversal + volume')
-        side=Side.BUY if up else Side.SELL; price=ctx.price_for(side); anchor=last['low'] if up else last['high']; st=structural_stop(ctx,side,price,anchor,5,.12,'M15',1.8)
-        if not st:return self.wait(ctx,'STOP_TOO_WIDE','Fib stop too wide')
-        stop,risk=st; natural=high if up else low; target=natural if rr_of(price,stop,natural)>=1.4 else atr_target(ctx,side,price,risk,1.8,1.5,'M15')
-        return signal_decision(self.spec,ctx,side,price,stop,target,70.,'QIMA Fibonacci 38.2/61.8 retracement confirmed by reversal and volume',management={'protection_pct':35.,'trailing_trigger_pct':60.,'trailing_gap_pct':8.,'max_hold_minutes':240},regime=ctx.regime.value)
-
-
-# =====================================================================
-# 34. Fast micro reversal (M1/M5)
-# =====================================================================
-class FastMicroReversal(BaseStrategy):
-    spec = StrategySpec(id='fast_micro_reversal', name='Fast M1/M5 reversal shift', family='reversal',
-        timeframes=('M5','M1'), symbols=('XAUUSD','EURUSD','GBPUSD'),
-        regimes=('TREND','BREAKOUT','RANGE','VOLATILE','NO_TRADE'), forbidden=(),
-        indicators=('M5 rejection/exhaustion','M1 EMA5/9 shift','M1 structure break','ATR14 M5'),
-        tier='A', min_confidence=68.0)
-
-    def analyze(self, ctx):
-        m5,m1=ctx.frame('M5'),ctx.frame('M1')
-        if len(m5)<40 or len(m1)<60:return self.wait(ctx,'INSUFFICIENT_HISTORY','Need M5/M1 history')
-        ok,reason=self.base_gates(ctx,'M5',14,max_spread_atr_frac=.22)
-        if not ok:return self.wait(ctx,reason,'Fast reversal volatility/spread gate')
-        atr5=_at(ctx.atr('M5',14)); b=[ta.candle(x) for x in m5]; last,prev=b[-1],b[-2]
-        c1=ta.closes(m1); e5=ta.ema(c1,5); e9=ta.ema(c1,9)
-        if None in (e5[-1],e9[-1],e5[-2],e9[-2]):return self.wait(ctx,'NO_EMA','M1 EMA unavailable')
-        recent_hi=max(ta.highs(m1[-8:-2])); recent_lo=min(ta.lows(m1[-8:-2])); lc=ta.candle(m1[-1])
-        impulse_up=(last['bull'] and last['body']>=atr5*.45) or (prev['lower_wick']>=prev['range']*.45 and last['bull'])
-        impulse_dn=(last['bear'] and last['body']>=atr5*.45) or (prev['upper_wick']>=prev['range']*.45 and last['bear'])
-        buy=impulse_up and e5[-1]>e9[-1] and e5[-1]>e5[-2] and lc['close']>recent_hi
-        sell=impulse_dn and e5[-1]<e9[-1] and e5[-1]<e5[-2] and lc['close']<recent_lo
-        if not (buy or sell):return self.wait(ctx,'WAIT_FAST_SHIFT','Waiting for M5 reversal impulse + M1 EMA/structure shift')
-        side=Side.BUY if buy else Side.SELL; price=ctx.price_for(side)
-        extreme=min(ta.lows(m5[-3:])) if buy else max(ta.highs(m5[-3:]))
-        st=structural_stop(ctx,side,price,extreme,buffer_points=4.0,min_atr_frac=.18,atr_frame='M5',max_atr_mult=1.35)
-        if not st:return self.wait(ctx,'STOP_TOO_WIDE','Fast reversal structural stop too wide')
-        stop,risk=st; target=atr_target(ctx,side,price,risk,atr_mult=1.5,floor_r=1.8,atr_frame='M5')
-        conf=confidence_score(70,5 if last['body']>=atr5*.6 else 2,4 if abs(e5[-1]-e9[-1])>ctx.spread else 0)
-        return signal_decision(self.spec,ctx,side,price,stop,target,conf,
-            'M5 rejection/impulse confirmed by M1 EMA5/9 momentum and micro-structure break',
-            management={'protection_pct':30.0,'trailing_trigger_pct':55.0,'trailing_gap_pct':7.0,'max_hold_minutes':90},
-            draw=self.chart(ctx,levels=[{'type':'ENTRY','price':price},{'type':'SL','price':stop},{'type':'TP','price':target}]),regime=ctx.regime.value)
-
-
 # =====================================================================
 # Registry assembly
 # =====================================================================
-class HADojiBoxContinuation(BaseStrategy):
-    spec = StrategySpec(id='ha_doji_box_continuation', name='Heikin-Ashi H1 Doji Box Continuation', family='trend', timeframes=('H1','M5'), symbols=('XAUUSD',), regimes=('TREND','BREAKOUT','RANGE','VOLATILE','NO_TRADE'), forbidden=(), indicators=('H1 Heikin-Ashi','M5 long-wick doji','two-close box confirmation'), tier='B', min_confidence=66.0)
-    @staticmethod
-    def _ha(rows):
-        out=[]; po=pc=None
-        for r in rows:
-            o,h,l,c=map(float,(r['open'],r['high'],r['low'],r['close'])); hc=(o+h+l+c)/4; ho=(o+c)/2 if po is None else (po+pc)/2
-            out.append({'open':ho,'close':hc}); po,pc=ho,hc
-        return out
-    def analyze(self,ctx):
-        h1,m5=ctx.frame('H1'),ctx.frame('M5')
-        if len(h1)<30 or len(m5)<40:return self.wait(ctx,'INSUFFICIENT_HISTORY','Need H1/M5 history')
-        ok,reason=self.base_gates(ctx,'M5',14,max_spread_atr_frac=.22)
-        if not ok:return self.wait(ctx,reason,'Gold volatility/spread gate')
-        ha=self._ha(h1[-30:]); r=ha[-3:]; bull=sum(x['close']>x['open'] for x in r); bear=sum(x['close']<x['open'] for x in r)
-        if bull>=2 and r[-1]['close']>r[-2]['close']:side=Side.BUY
-        elif bear>=2 and r[-1]['close']<r[-2]['close']:side=Side.SELL
-        else:return self.wait(ctx,'HA_H1_NO_TREND','H1 Heikin-Ashi direction is not clean')
-        bars=[ta.candle(x) for x in m5]; d,b1,b2=bars[-3],bars[-2],bars[-1]
-        if d['body_ratio']>.28:return self.wait(ctx,'NO_LONG_WICK_DOJI','M5 anchor body is too large')
-        wick=max(d['upper_wick'],d['lower_wick'])
-        if wick<max(d['body']*2,d['range']*.45):return self.wait(ctx,'DOJI_WICK_TOO_SHORT','M5 anchor needs a long rejection wick')
-        look=bars[-8:-2]
-        if side==Side.BUY:
-            if d['lower_wick']<d['upper_wick']:return self.wait(ctx,'WRONG_DOJI_WICK','BUY needs lower rejection wick')
-            lo=min(x['low'] for x in look+[d]); hi=max(d['open'],d['close'])
-            if not(b1['close']>hi and b1['bull']):return self.wait(ctx,'WAIT_BOX_BREAK','First close not above box')
-            if not(b2['close']>hi and b2['close']>=b1['open']):return self.wait(ctx,'WAIT_BOX_CONFIRM','Second close not confirmed')
-        else:
-            if d['upper_wick']<d['lower_wick']:return self.wait(ctx,'WRONG_DOJI_WICK','SELL needs upper rejection wick')
-            hi=max(x['high'] for x in look+[d]); lo=min(d['open'],d['close'])
-            if not(b1['close']<lo and b1['bear']):return self.wait(ctx,'WAIT_BOX_BREAK','First close not below box')
-            if not(b2['close']<lo and b2['close']<=b1['open']):return self.wait(ctx,'WAIT_BOX_CONFIRM','Second close not confirmed')
-        height=hi-lo
-        if height<=0:return self.wait(ctx,'INVALID_BOX','Invalid correction box')
-        price=ctx.price_for(side); stop=(lo+hi)/2
-        if abs(price-stop)<=ctx.spread*2:return self.wait(ctx,'BOX_STOP_TOO_TIGHT','Mid-box stop inside noise')
-        target=price+height*2.5 if side==Side.BUY else price-height*2.5
-        conf=confidence_score(68,min(8,wick/max(d['body'],ctx.point)/3))
-        return signal_decision(self.spec,ctx,side,price,stop,target,conf,'H1 HA trend + M5 doji box + two-close confirmation',management={'protection_pct':35.0,'trailing_trigger_pct':60.0,'trailing_gap_pct':8.0,'max_hold_minutes':240},draw=self.chart(ctx,zones=[{'kind':'HA_DOJI_BOX','low':lo,'high':hi}],levels=[{'type':'ENTRY','price':price},{'type':'SL','price':stop},{'type':'TP','price':target}]),regime=ctx.regime.value)
-
-
 STRATEGY_CLASSES = [
-    FastMicroReversal,
-    HADojiBoxContinuation,
     TrendEMAPullback,
     TrendBreakRetest,
     TrendMomentumResume,
@@ -2419,11 +2254,6 @@ STRATEGY_CLASSES = [
     TwoBarReversalVolume,
     QIMAChartPatternBreakout,
     QIMANR4Breakout,
-    QIMASupportResistanceBounce,
-    QIMAGapContinuation,
-    QIMATrendFollowing,
-    QIMAMACDCrossover,
-    QIMAFibonacciRetracement,
 ]
 
 # Every concrete strategy inherits from BaseStrategy through the pack.

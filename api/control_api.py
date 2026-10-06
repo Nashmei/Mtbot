@@ -48,6 +48,15 @@ class LoginPayload(BaseModel):
     password: SecretStr = Field(min_length=1, max_length=256)
 
 
+class TrendViewPayload(BaseModel):
+    model_config = ConfigDict(extra='allow')
+    id: str = Field(min_length=1, max_length=160)
+    side: str = Field(min_length=3, max_length=4)
+    confidence: float | None = Field(default=75, ge=0, le=100)
+    symbol: str | None = Field(default='XAUUSD', max_length=40)
+    token: str = Field(min_length=8, max_length=256)
+
+
 class ControlAPI:
     """Authenticated API façade over the existing Mtbot engine.
 
@@ -91,6 +100,35 @@ class ControlAPI:
     def _install_routes(self):
         app = self.app
         auth = self._authorize
+
+        @app.post('/v1/trendview/webhook')
+        async def trendview_webhook(payload: TrendViewPayload):
+            expected = os.getenv('TRENDVIEW_WEBHOOK_TOKEN', '').strip()
+            if not expected:
+                try:
+                    for line in open('/home/ubuntu/.config/mtbot/trendview.env', encoding='utf-8'):
+                        if line.startswith('TRENDVIEW_WEBHOOK_TOKEN='):
+                            expected = line.split('=', 1)[1].strip()
+                            break
+                except OSError:
+                    pass
+            if not expected or not hmac.compare_digest(payload.token.strip(), expected):
+                raise HTTPException(status_code=401, detail='Unauthorized')
+            account = self.gateway.account()
+            if not account or getattr(account, 'trade_mode', None) != mt5.ACCOUNT_TRADE_MODE_DEMO:
+                raise HTTPException(status_code=409, detail='trendView يعمل على DEMO فقط.')
+            side = payload.side.strip().upper()
+            if side not in ('BUY', 'SELL'):
+                raise HTTPException(status_code=422, detail='side must be BUY or SELL')
+            symbol = (payload.symbol or 'XAUUSD').upper().replace('/', '')
+            if 'XAU' not in symbol and 'GOLD' not in symbol:
+                raise HTTPException(status_code=422, detail='trendView مخصص للذهب فقط.')
+            self.engine.trendview_signal = {
+                'id': payload.id, 'side': side, 'confidence': payload.confidence or 75,
+                'symbol': symbol, 'received_at': time.time(),
+            }
+            await self.db.log('TRENDVIEW_WEBHOOK_RECEIVED', symbol, signal_id=payload.id, side=side, confidence=payload.confidence)
+            return {'ok': True, 'queued': True, 'strategy': 'trendView'}
 
         @app.get('/v1/health')
         async def health(_=Depends(auth)):

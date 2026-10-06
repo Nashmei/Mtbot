@@ -15,13 +15,13 @@ Pipeline per symbol, per cycle:
 import asyncio
 import json
 import math
-import os
 import time
 import traceback
 
 import MetaTrader5 as mt5
 
 from .config import settings
+from .ai_advisor import AIAdvisor
 from . import account_guard
 from .indicators import rows as to_rows
 from .models import Regime, Side, Signal, TradeState
@@ -39,6 +39,7 @@ DETERMINISTIC_PREFIXES = (
     'vwap_', 'london_', 'double_', 'failed_', 'rsi_', 'ema_', 'ny_',
     'index_', 'round_', 'three_', 'inside_', 'two_bar_',
 )
+AI_STRATEGY_ID = 'ai_market_analysis'
 
 
 def is_deterministic(strategy_id):
@@ -82,18 +83,13 @@ class Engine:
         # ---- strategy brain --------------------------------------------
         self.regime_detector = RegimeDetector(settings)
         self.registry = StrategyRegistry(settings, db)
+        self.ai_advisor = AIAdvisor(db)
 
         # ---- runtime state ---------------------------------------------
         self.trades = {}
         self.trade = None
         self.last_entry_by_symbol = {}
         self.last_analysis_by_symbol = {}
-        self.external_signal_file = os.getenv('OCTOBOT_SIGNAL_FILE', '/home/ubuntu/octobot-test/mtbot_signal.json')
-        self.external_signal_seen = None
-        self.external_signal_max_age = float(os.getenv('OCTOBOT_SIGNAL_MAX_AGE', '180'))
-        self.trendview_signal = None
-        self.trendview_signal_seen = None
-        self.trendview_last_auto_bar = None
         self.last_close_by_symbol = {}
         self.blocked_signal_by_symbol = {}
         self.last_regime_by_symbol = {}
@@ -477,29 +473,6 @@ class Engine:
                 'W1': mt5.TIMEFRAME_W1,
             }[name]
             frames[name] = to_rows(self.gw.rates(symbol, tf, count))
-        # Kronos runs natively outside Wine/PyTorch. Export the already-fetched
-        # closed M5 bars so the sidecar never opens a second MT5 terminal.
-        try:
-            m5 = frames.get('M5') or []
-            if len(m5) >= 80:
-                import csv
-                safe = ''.join(c for c in symbol if c.isalnum() or c in '._-')
-                outdir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'kronos_runtime', 'data')
-                os.makedirs(outdir, exist_ok=True)
-                path = os.path.join(outdir, safe + '_M5.csv')
-                tmp = path + '.tmp'
-                with open(tmp, 'w', newline='', encoding='utf-8') as fh:
-                    w = csv.writer(fh); w.writerow(['timestamps','open','high','low','close','volume'])
-                    for r in m5[-300:]:
-                        w.writerow([int(float(r.get('time',0) or 0)), r.get('open'), r.get('high'), r.get('low'), r.get('close'), r.get('tick_volume', r.get('real_volume',0))])
-                os.replace(tmp, path)
-        except Exception as exc:
-            # Export failures must be visible; silently swallowing this is what
-            # previously left Kronos data/signals empty.
-            try:
-                print(f'KRONOS_EXPORT_ERROR {symbol}: {exc!r}', flush=True)
-            except Exception:
-                pass
         return frames
 
     def _build_context(self, symbol, tick, info, frames):
@@ -587,161 +560,11 @@ class Engine:
         if not self.symbols:
             return
 
-        # Resolve broker symbols before feeding Kronos.  Config may contain base
-        # names (XAUUSD/EURUSD) while the connected broker exposes suffixes.
-        kronos_symbols = []
-        for _base in ('XAUUSD', 'EURUSD'):
-            _resolved = self.gw.resolve_symbol(_base) if hasattr(self.gw, 'resolve_symbol') else _base
-            if _resolved and _resolved not in kronos_symbols:
-                kronos_symbols.append(_resolved)
-
-        # Refresh normal market frames first. Besides keeping strategy data warm,
-        # this feeds the native Kronos sidecar even when another signal source
-        # returns early or a symbol later fails tick/spread gates.
-        for _kronos_symbol in kronos_symbols:
-            try:
-                self._closed_frames(_kronos_symbol)
-            except Exception as exc:
-                await self._log_reject('KRONOS_EXPORT_REJECT', _kronos_symbol, error=repr(exc))
-
-        if await self._auto_trendview_signal(account):
-            return
-        if await self._consume_trendview_signal(account):
-            return
-        if await self._consume_external_signal(account):
-            return
-
         await self.registry.refresh(login=int(getattr(account, 'login', 0) or 0))
         for symbol in list(self.symbols):
             if len(self.trades) >= self.max_positions:
                 break
             await self._scan_symbol(symbol, account)
-
-    async def _auto_trendview_signal(self, account):
-        if getattr(account, 'trade_mode', None) != mt5.ACCOUNT_TRADE_MODE_DEMO:
-            return False
-        symbol = next((s for s in self.symbols if 'XAU' in s.upper() or 'GOLD' in s.upper()), None)
-        if not symbol:
-            return False
-        info, tick = self.gw.info(symbol), self.gw.tick(symbol)
-        if not info or not tick:
-            return False
-        context, _ = self._build_context(symbol, tick, info, self._closed_frames(symbol))
-        try:
-            from .trendview import free_source_signal
-            payload, detail = free_source_signal(context)
-        except Exception as exc:
-            await self._log_reject('TRENDVIEW_AUTO_REJECT', symbol, reason='SOURCE_ERROR', error=repr(exc))
-            return False
-        if not payload:
-            await self._log_reject('TRENDVIEW_AUTO_REJECT', symbol, **detail)
-            return False
-        side = str(payload.get('side') or '')
-        if side == getattr(self, 'trendview_last_auto_side', None):
-            return False
-        self.trendview_last_auto_side = side
-        payload['id'] = f'free-{side}-{int(time.time())}'
-        self.trendview_signal = payload
-        await self.db.log('TRENDVIEW_AUTO_SIGNAL', symbol, signal_id=payload['id'], side=side, source='free_mt5_continuous')
-        return await self._consume_trendview_signal(account)
-
-    async def _consume_trendview_signal(self, account):
-        payload = self.trendview_signal
-        if not isinstance(payload, dict):
-            return False
-        signal_id = str(payload.get('id') or payload.get('signal_id') or '')
-        if not signal_id or signal_id == self.trendview_signal_seen:
-            return False
-        self.trendview_signal_seen = signal_id
-        if getattr(account, 'trade_mode', None) != mt5.ACCOUNT_TRADE_MODE_DEMO:
-            await self._log_reject('TRENDVIEW_REJECT', 'XAUUSD', reason='DEMO_ONLY')
-            return False
-        symbol = next((s for s in self.symbols if 'XAU' in s.upper() or 'GOLD' in s.upper()), None)
-        if not symbol:
-            await self._log_reject('TRENDVIEW_REJECT', 'XAUUSD', reason='GOLD_NOT_ENABLED')
-            return False
-        info = self.gw.info(symbol)
-        tick = self.gw.tick(symbol)
-        if not info or not tick:
-            await self._log_reject('TRENDVIEW_REJECT', symbol, reason='INVALID_MARKET_DATA')
-            return False
-        frames = self._closed_frames(symbol)
-        context, _ = self._build_context(symbol, tick, info, frames)
-        try:
-            from .trendview import build_decision
-            decision, detail = await asyncio.to_thread(
-                build_decision, context, payload, None
-            )
-        except Exception as exc:
-            await self._log_reject('TRENDVIEW_REJECT', symbol, reason='CONFIRMATION_ERROR', error=repr(exc))
-            return False
-        if not decision:
-            await self._log_reject('TRENDVIEW_REJECT', symbol, **detail)
-            return False
-        await self.db.log('TRENDVIEW_SIGNAL_ACCEPTED', symbol, signal_id=signal_id,
-                          side=decision.get('side'), confidence=decision.get('confidence'), detail=detail)
-        result = await self._enter(symbol, decision, account)
-        return bool(result)
-
-    async def _consume_external_signal(self, account):
-        """Consume one OctoBot-produced signal without bypassing MTBOT risk/execution guards."""
-        path = self.external_signal_file
-        try:
-            with open(path, 'r', encoding='utf-8') as fh:
-                payload = json.load(fh)
-        except FileNotFoundError:
-            return False
-        except Exception as exc:
-            await self._log_reject('EXTERNAL_SIGNAL_REJECT', 'UNKNOWN', reason='INVALID_JSON', error=repr(exc))
-            return False
-        signal_id = str(payload.get('id') or payload.get('signal_id') or '')
-        if not signal_id or signal_id == self.external_signal_seen:
-            return False
-        self.external_signal_seen = signal_id
-        symbol = str(payload.get('symbol') or '').upper().replace('/', '')
-        if symbol not in self.symbols:
-            await self._log_reject('EXTERNAL_SIGNAL_REJECT', symbol or 'UNKNOWN', reason='SYMBOL_NOT_ENABLED')
-            return False
-        try:
-            created_at = float(payload.get('timestamp') or payload.get('created_at') or 0)
-        except (TypeError, ValueError):
-            created_at = 0
-        if created_at <= 0 or time.time() - created_at > self.external_signal_max_age or created_at > time.time() + 30:
-            await self._log_reject('EXTERNAL_SIGNAL_REJECT', symbol, reason='STALE_SIGNAL', created_at=created_at)
-            return False
-        side = str(payload.get('side') or payload.get('action') or '').upper()
-        if side not in ('BUY', 'SELL'):
-            await self._log_reject('EXTERNAL_SIGNAL_REJECT', symbol, reason='INVALID_SIDE', side=side)
-            return False
-        try:
-            entry = float(payload.get('entry') or 0)
-            sl = float(payload.get('sl') or payload.get('sl_price') or 0)
-            tp = float(payload.get('tp') or payload.get('tp_price') or 0)
-            confidence = float(payload.get('confidence', 100))
-        except (TypeError, ValueError):
-            await self._log_reject('EXTERNAL_SIGNAL_REJECT', symbol, reason='INVALID_NUMERIC_FIELDS')
-            return False
-        if confidence <= 1:
-            confidence *= 100.0
-        if not (0 <= confidence <= 100) or sl <= 0 or tp <= 0:
-            await self._log_reject('EXTERNAL_SIGNAL_REJECT', symbol, reason='INVALID_PLAN')
-            return False
-        threshold = max(float(self.min_confidence), float(self.min_entry_confidence))
-        if confidence < threshold:
-            await self._log_reject('EXTERNAL_SIGNAL_REJECT', symbol, reason='LOW_CONFIDENCE', confidence=confidence)
-            return False
-        decision = {
-            'decision': 'SIGNAL', 'strategy_id': 'octobot_external', 'side': side,
-            'confidence': confidence, 'entry': entry, 'sl_price': sl, 'tp_price': tp,
-            'signal_bar': int(created_at // 60), 'bar_time': created_at,
-            'regime': 'EXTERNAL', 'reason_code': 'OCTOBOT_SIGNAL',
-            'reason': str(payload.get('reason') or 'OctoBot external signal'),
-            '_external': True,
-        }
-        await self.db.log('EXTERNAL_SIGNAL_ACCEPTED', symbol, signal_id=signal_id, side=side,
-                          confidence=confidence, entry=entry, sl=sl, tp=tp, source='octobot')
-        result = await self._enter(symbol, decision, account)
-        return bool(result)
 
     async def _log_reject(self, event, symbol, **details):
         key = (event, symbol, details.get('reason', ''))
@@ -757,15 +580,12 @@ class Engine:
         info = self.gw.info(symbol)
         tick = self.gw.tick(symbol)
         if not info or not tick or not info.point or tick.bid <= 0 or tick.ask <= tick.bid:
-            await self._log_reject(
-                'SCAN_REJECT', symbol, reason='INVALID_MARKET_DATA',
-                info_available=bool(info), point=float(getattr(info, 'point', 0) or 0) if info else 0.0,
-                tick_available=bool(tick),
-                bid=float(getattr(tick, 'bid', 0) or 0) if tick else 0.0,
-                ask=float(getattr(tick, 'ask', 0) or 0) if tick else 0.0,
-                mt5_error=repr(mt5.last_error()),
-            )
-            return
+            await asyncio.sleep(.2)
+            info = self.gw.info(symbol)
+            tick = self.gw.tick(symbol)
+            if not info or not tick or not info.point or tick.bid <= 0 or tick.ask <= tick.bid:
+                await self._log_reject('SCAN_REJECT', symbol, reason='INVALID_MARKET_DATA')
+                return
 
         ticks = self.gw.ticks(symbol)
         if ticks is None or len(ticks) < 40:
@@ -830,6 +650,18 @@ class Engine:
                           side=decision.get('side'), decision='SIGNAL',
                           confidence=confidence, regime=decision.get('regime'),
                           reason_code=decision.get('reason_code'))
+        # Optional, data-only AI cross-check. It may only veto; it can never
+        # create a trade or modify levels, and it fails open on provider issues.
+        if self.ai_advisor is not None and getattr(self.ai_advisor, 'active', False):
+            allowed, meta = await self.ai_advisor.review(context, decision)
+            if not allowed:
+                await self.db.log('AI_CROSSCHECK_VETO', symbol,
+                                  strategy=decision.get('strategy_id'),
+                                  side=decision.get('side'), **meta)
+                await self._log_reject('AI_VETO', symbol,
+                                       reason=meta.get('reason_code') or 'AI_VETO',
+                                       strategy=decision.get('strategy_id'))
+                return
         await self._enter(symbol, decision, account)
 
     async def _audit_strategies(self, symbol, regime_result, evaluated, decision):
@@ -1101,7 +933,7 @@ class Engine:
             await self._log_reject('ORDER_REJECT', symbol, reason='NO_SUPPORTED_FILLING_MODE')
             return False, 'FILLING'
         strategy_id = decision.get('strategy_id')
-        if not decision.get('_external') and not self.registry.by_id.get(strategy_id):
+        if not self.registry.by_id.get(strategy_id):
             await self._log_reject('STRATEGY_PLAN_REJECT', symbol, reason='UNKNOWN_STRATEGY_ID',
                                    strategy=strategy_id)
             return
@@ -1226,14 +1058,18 @@ class Engine:
             symbol, state.volume, fill, actual_stop)
         actual_risk_cash = abs(float(post_fill_loss)) if post_fill_loss else state.risk_cash
         risk_drift_cash = actual_risk_cash - risk_cash
-        # Runtime/evidence R must use the actual post-fill cash risk.
-        state.risk_cash = actual_risk_cash
-        state.risk_pct_actual = (actual_risk_cash / float(getattr(account, 'equity', 1) or 1)) * 100.0
         if abs(risk_drift_cash) > 0.01:
             await self.db.log('POST_FILL_RISK_DRIFT', symbol, ticket=pos.ticket,
                               planned_risk_cash=risk_cash, actual_risk_cash=actual_risk_cash,
                               drift_cash=risk_drift_cash, planned_entry=float(decision.get('entry') or 0),
                               actual_entry=fill, actual_sl=actual_stop, volume=state.volume)
+        if risk_drift_cash > 0.01 and risk_drift_cash > tolerance:
+            await self.db.log('POST_FILL_RISK_DRIFT_REJECT', symbol, ticket=pos.ticket,
+                              planned_risk_cash=risk_cash, actual_risk_cash=actual_risk_cash,
+                              drift_cash=risk_drift_cash, risk_pct=self.risk_pct)
+            await self._close_untrackable_position(symbol, pos, reason='POST_FILL_RISK_DRIFT_REJECT',
+                                                   entry=fill, sl=actual_stop)
+            return
 
         self.trades[pos.ticket] = state
         self.trade_alert_meta[pos.ticket] = {
@@ -1459,9 +1295,11 @@ class Engine:
     async def _update_protection(self, t, pos, tick, info, favorable, best_observed_price):
         if t.protection_45_active:
             return
-        # Universal protection rule: arm once the trade has achieved +1R.
-        # This is intentionally independent of TP distance and strategy-specific percentages.
-        if t.initial_r <= 0 or favorable < t.initial_r:
+        target_distance = abs(t.tp - t.entry)
+        if target_distance <= 0:
+            return
+        progress = favorable / target_distance
+        if progress < t.protection_pct / 100.0:
             return
         buffer_points = max(3.0, ctx_spread_buffer(t, tick, info) / float(info.point))
         protected = (t.entry - buffer_points * info.point if t.side == Side.BUY
@@ -1480,13 +1318,15 @@ class Engine:
     async def _update_trailing(self, t, pos, tick, info, best_observed_price):
         if not t.protection_45_active:
             return
-        # Once +1R protection is active, trail continuously with price.
-        # Gap is based on the original risk (R), not the TP distance, so a far
-        # target cannot leave a large open profit unprotected.
-        if t.initial_r <= 0:
+        target_distance = abs(t.tp - t.entry)
+        if target_distance <= 0:
+            return
+        progress = ((best_observed_price - t.entry) if t.side == Side.BUY
+                    else (t.entry - best_observed_price)) / target_distance
+        if progress < t.trailing_trigger_pct / 100.0:
             return
         t.trailing = True
-        gap = t.initial_r * max(0.10, t.trailing_gap_pct / 100.0)
+        gap = target_distance * (t.trailing_gap_pct / 100.0)
         candidate = (best_observed_price - gap if t.side == Side.BUY
                      else best_observed_price + gap)
         candidate = max(candidate, t.sl) if t.side == Side.BUY else min(candidate, t.sl)

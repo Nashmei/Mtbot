@@ -1,0 +1,10 @@
+class DirectSignalPayload(BaseModel):
+    model_config = ConfigDict(extra='forbid', allow_inf_nan=False)
+    id: str = Field(min_length=1, max_length=120)
+    symbol: str = Field(min_length=1, max_length=40)
+    side: str = Field(pattern=r'^(?i:BUY|SELL)$')
+    entry: float = Field(gt=0)
+    sl: float = Field(gt=0)
+    tp: float = Field(gt=0)
+    confidence: float = Field(default=100, ge=0, le=100)
+    reason: str = Field(default='ChatGPT direct signal', max_length=500)

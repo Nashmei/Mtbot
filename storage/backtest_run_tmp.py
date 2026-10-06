@@ -250,9 +250,8 @@ def _simulate_trade(symbol, m1, signal_index, decision, point, digits, spread_po
                     stop = max(stop, candidate) if side == Side.BUY else min(stop, candidate)
                     be_done = True
 
-        # Production parity: protection/trailing thresholds are R-based.
-        progress_r = favorable / risk if risk > 0 else 0.0
-        if not protection_done and protection_pct > 0 and progress_r >= protection_pct / 100.0:
+        progress = favorable / target_distance if target_distance > 0 else 0.0
+        if not protection_done and protection_pct > 0 and progress >= protection_pct / 100.0:
             buffer = max(spread * 1.5, point * 3.0)
             candidate = entry - buffer if side == Side.BUY else entry + buffer
             stop = max(stop, candidate) if side == Side.BUY else min(stop, candidate)
@@ -262,8 +261,8 @@ def _simulate_trade(symbol, m1, signal_index, decision, point, digits, spread_po
             candidate = entry + buffer if side == Side.BUY else entry - buffer
             stop = max(stop, candidate) if side == Side.BUY else min(stop, candidate)
             be_done = True
-        if protection_done and progress_r >= trail_trigger / 100.0 and risk > 0:
-            gap = risk * (trail_gap / 100.0)
+        if protection_done and progress >= trail_trigger / 100.0 and target_distance > 0:
+            gap = target_distance * (trail_gap / 100.0)
             candidate = best_price - gap if side == Side.BUY else best_price + gap
             stop = max(stop, candidate) if side == Side.BUY else min(stop, candidate)
             trailing_done = True
@@ -407,15 +406,12 @@ def _load_m1(symbol, days):
         raise RuntimeError('MetaTrader5 is not importable in this interpreter')
     if not mt5.initialize():
         raise RuntimeError(f'MT5 initialize failed: {mt5.last_error()}')
-    info = mt5.symbol_info(symbol)
-    if info is None:
-        raise RuntimeError(f'symbol_info failed for {symbol}: {mt5.last_error()}')
-    # MT5/Wine can return ERR_NO_MEMORY from symbol_select even when the symbol
-    # is already selected/visible and fully usable. Only select when necessary.
-    if not bool(getattr(info, 'visible', False)):
+    info0 = mt5.symbol_info(symbol)
+    if info0 is None:
+        raise RuntimeError(f'symbol_info failed for {symbol} ({mt5.last_error()})')
+    if not bool(getattr(info0, 'select', False)):
         if not mt5.symbol_select(symbol, True):
-            raise RuntimeError(f'symbol_select failed for {symbol}: {mt5.last_error()}')
-        info = mt5.symbol_info(symbol)
+            raise RuntimeError(f'symbol_select failed for {symbol} ({mt5.last_error()})')
     end = datetime.now(timezone.utc) + timedelta(minutes=5)
     start = end - timedelta(days=int(days))
     raw = mt5.copy_rates_range(symbol, mt5.TIMEFRAME_M1, start, end)
